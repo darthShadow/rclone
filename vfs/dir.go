@@ -233,11 +233,19 @@ func (d *Dir) invalidateDir(absPath string) {
 //
 // if entryType is a directory it invalidates the parent of the directory too.
 func (d *Dir) changeNotify(relativePath string, entryType fs.EntryType) {
-	defer log.Trace(d.path, "relativePath=%q, type=%v", relativePath, entryType)("")
 	d.mu.RLock()
 	absPath := path.Join(d.path, relativePath)
 	d.mu.RUnlock()
+
+	defer log.Trace(d.path, "relativePath=%q, absPath=%q, type=%v", relativePath, absPath,
+		entryType)("")
+
+	/*
+		TODO: Check why this is necessary. Ideally, this should happen only if the
+		entryType is fs.EntryObject and not for fs.EntryDirectory.
+	*/
 	d.invalidateDir(vfscommon.FindParent(absPath))
+
 	if entryType == fs.EntryDirectory {
 		d.invalidateDir(absPath)
 	}
