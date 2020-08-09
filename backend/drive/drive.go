@@ -49,6 +49,7 @@ import (
 	"golang.org/x/oauth2/google"
 	drive_v2 "google.golang.org/api/drive/v2"
 	drive "google.golang.org/api/drive/v3"
+	"google.golang.org/api/driveactivity/v2"
 	"google.golang.org/api/googleapi"
 	"google.golang.org/api/option"
 )
@@ -187,6 +188,8 @@ func driveScopes(scopesString string) (scopes []string) {
 		scope = strings.TrimSpace(scope)
 		scopes = append(scopes, scopePrefix+scope)
 	}
+	// The minimal read-only scope for activities should be sufficient
+	scopes = append(scopes, scopePrefix+"drive.activity.readonly")
 	return scopes
 }
 
@@ -816,21 +819,23 @@ type Options struct {
 
 // Fs represents a remote drive server
 type Fs struct {
-	name             string             // name of this remote
-	root             string             // the path we are working on
-	opt              Options            // parsed options
-	ci               *fs.ConfigInfo     // global config
-	features         *fs.Features       // optional features
-	svc              *drive.Service     // the connection to the drive server
-	v2Svc            *drive_v2.Service  // used to create download links for the v2 api
-	client           *http.Client       // authorized client
-	rootFolderID     string             // the id of the root folder
-	dirCache         *dircache.DirCache // Map of directory path to directory id
-	lastQuery        string             // Last query string to check in unit tests
-	pacer            *fs.Pacer          // To pace the API calls
-	exportExtensions []string           // preferred extensions to download docs
-	importMimeTypes  []string           // MIME types to convert to docs
-	isTeamDrive      bool               // true if this is a team drive
+	name             string                 // name of this remote
+	root             string                 // the path we are working on
+	opt              Options                // parsed options
+	ci               *fs.ConfigInfo         // global config
+	features         *fs.Features           // optional features
+	svc              *drive.Service         // the connection to the drive server
+	v2Svc            *drive_v2.Service      // used to create download links for the v2 api
+	activitySvc      *driveactivity.Service // used for fetching the drive activities
+	client           *http.Client           // authorized client
+	rootFolderID     string                 // the id of the root folder
+	dirCache         *dircache.DirCache     // Map of directory path to directory id
+	lastQuery        string                 // Last query string to check in unit tests
+	pacer            *fs.Pacer              // To pace the API calls
+	exportExtensions []string               // preferred extensions to download docs
+	importMimeTypes  []string               // MIME types to convert to docs
+	isTeamDrive      bool                   // true if this is a team drive
+	fileFields       googleapi.Field        // fields to fetch file info with
 	m                configmap.Mapper
 	grouping         int32                        // number of IDs to search at once in ListR - read with atomic
 	listRmu          *sync.Mutex                  // protects listRempties
@@ -913,8 +918,8 @@ func (f *Fs) shouldRetry(ctx context.Context, err error) (bool, error) {
 	}
 	switch gerr := err.(type) {
 	case *googleapi.Error:
-		if gerr.Code >= 500 && gerr.Code < 600 {
-			// All 5xx errors should be retried
+		if gerr.Code == 429 || (gerr.Code >= 500 && gerr.Code < 600) {
+			// All 429 or 5xx errors should be retried
 			return true, err
 		}
 		if len(gerr.Errors) > 0 {
@@ -1403,6 +1408,11 @@ func newFs(ctx context.Context, name, path string, m configmap.Mapper) (*Fs, err
 	f.svc, err = drive.NewService(context.Background(), option.WithHTTPClient(f.client))
 	if err != nil {
 		return nil, fmt.Errorf("couldn't create Drive client: %w", err)
+	}
+
+	f.activitySvc, err = driveactivity.NewService(context.Background(), option.WithHTTPClient(f.client))
+	if err != nil {
+		return nil, fmt.Errorf("couldn't create Drive Activity client: %w", err)
 	}
 
 	if f.opt.V2DownloadMinSize >= 0 {
@@ -3144,10 +3154,12 @@ func (f *Fs) ChangeNotify(ctx context.Context, notifyFunc func(string, fs.EntryT
 		// get the StartPageToken early so all changes from now on get processed
 		startPageToken, err := f.changeNotifyStartPageToken(ctx)
 		if err != nil {
-			fs.Infof(f, "Failed to get StartPageToken: %s", err)
+			fs.Infof(f, "Failed to get changeNotify StartPageToken: %v", err)
 		}
-		var ticker *time.Ticker
-		var tickerC <-chan time.Time
+		var (
+			ticker  *time.Ticker
+			tickerC <-chan time.Time
+		)
 		for {
 			select {
 			case pollInterval, ok := <-pollIntervalChan:
@@ -3169,120 +3181,19 @@ func (f *Fs) ChangeNotify(ctx context.Context, notifyFunc func(string, fs.EntryT
 				if startPageToken == "" {
 					startPageToken, err = f.changeNotifyStartPageToken(ctx)
 					if err != nil {
-						fs.Infof(f, "Failed to get StartPageToken: %s", err)
+						fs.Infof(f, "Failed to get changeNotify StartPageToken: %v", err)
 						continue
 					}
 				}
 				fs.Debugf(f, "Checking for changes on remote")
 				startPageToken, err = f.changeNotifyRunner(ctx, notifyFunc, startPageToken)
 				if err != nil {
-					fs.Infof(f, "Change notify listener failure: %s", err)
+					fs.Errorf(f, "Change notify listener failure: %v", err)
 				}
+				// f.changeActivityRunner(ctx, fromTime, toTime, notifyFunc)
 			}
 		}
 	}()
-}
-func (f *Fs) changeNotifyStartPageToken(ctx context.Context) (pageToken string, err error) {
-	var startPageToken *drive.StartPageToken
-	err = f.pacer.Call(func() (bool, error) {
-		changes := f.svc.Changes.GetStartPageToken().SupportsAllDrives(true)
-		if f.isTeamDrive {
-			changes.DriveId(f.opt.TeamDriveID)
-		}
-		startPageToken, err = changes.Context(ctx).Do()
-		return f.shouldRetry(ctx, err)
-	})
-	if err != nil {
-		return
-	}
-	return startPageToken.StartPageToken, nil
-}
-
-func (f *Fs) changeNotifyRunner(ctx context.Context, notifyFunc func(string, fs.EntryType), startPageToken string) (newStartPageToken string, err error) {
-	pageToken := startPageToken
-	for {
-		var changeList *drive.ChangeList
-
-		err = f.pacer.Call(func() (bool, error) {
-			changesCall := f.svc.Changes.List(pageToken).
-				Fields("nextPageToken,newStartPageToken,changes(fileId,file(name,parents,mimeType))")
-			if f.opt.ListChunk > 0 {
-				changesCall.PageSize(f.opt.ListChunk)
-			}
-			changesCall.SupportsAllDrives(true)
-			changesCall.IncludeItemsFromAllDrives(true)
-			if f.isTeamDrive {
-				changesCall.DriveId(f.opt.TeamDriveID)
-			}
-			// If using appDataFolder then need to add Spaces
-			if f.rootFolderID == "appDataFolder" {
-				changesCall.Spaces("appDataFolder")
-			}
-			changesCall.RestrictToMyDrive(!f.opt.SharedWithMe)
-			changeList, err = changesCall.Context(ctx).Do()
-			return f.shouldRetry(ctx, err)
-		})
-		if err != nil {
-			return
-		}
-
-		type entryType struct {
-			path      string
-			entryType fs.EntryType
-		}
-		var pathsToClear []entryType
-		for _, change := range changeList.Changes {
-			// find the previous path
-			if path, ok := f.dirCache.GetInv(change.FileId); ok {
-				if change.File != nil && change.File.MimeType != driveFolderType {
-					pathsToClear = append(pathsToClear, entryType{path: path, entryType: fs.EntryObject})
-				} else {
-					pathsToClear = append(pathsToClear, entryType{path: path, entryType: fs.EntryDirectory})
-				}
-			}
-
-			// find the new path
-			if change.File != nil {
-				change.File.Name = f.opt.Enc.ToStandardName(change.File.Name)
-				changeType := fs.EntryDirectory
-				if change.File.MimeType != driveFolderType {
-					changeType = fs.EntryObject
-				}
-
-				// translate the parent dir of this object
-				if len(change.File.Parents) > 0 {
-					for _, parent := range change.File.Parents {
-						if parentPath, ok := f.dirCache.GetInv(parent); ok {
-							// and append the drive file name to compute the full file name
-							newPath := path.Join(parentPath, change.File.Name)
-							// this will now clear the actual file too
-							pathsToClear = append(pathsToClear, entryType{path: newPath, entryType: changeType})
-						}
-					}
-				} else { // a true root object that is changed
-					pathsToClear = append(pathsToClear, entryType{path: change.File.Name, entryType: changeType})
-				}
-			}
-		}
-
-		visitedPaths := make(map[string]struct{})
-		for _, entry := range pathsToClear {
-			if _, ok := visitedPaths[entry.path]; ok {
-				continue
-			}
-			visitedPaths[entry.path] = struct{}{}
-			notifyFunc(entry.path, entry.entryType)
-		}
-
-		switch {
-		case changeList.NewStartPageToken != "":
-			return changeList.NewStartPageToken, nil
-		case changeList.NextPageToken != "":
-			pageToken = changeList.NextPageToken
-		default:
-			return
-		}
-	}
 }
 
 // DirCacheFlush resets the directory cache - used in testing as an
@@ -3317,21 +3228,26 @@ func (f *Fs) changeServiceAccountFile(ctx context.Context, file string) (err err
 	if file == f.opt.ServiceAccountFile {
 		return nil
 	}
+
 	oldSvc := f.svc
+	oldActivitySvc := f.activitySvc
 	oldv2Svc := f.v2Svc
 	oldOAuthClient := f.client
 	oldFile := f.opt.ServiceAccountFile
 	oldCredentials := f.opt.ServiceAccountCredentials
+
 	defer func() {
-		// Undo all the changes instead of doing selective undo's
+		// Undo all the changes instead of doing selective undo
 		if err != nil {
 			f.svc = oldSvc
+			f.activitySvc = oldActivitySvc
 			f.v2Svc = oldv2Svc
 			f.client = oldOAuthClient
 			f.opt.ServiceAccountFile = oldFile
 			f.opt.ServiceAccountCredentials = oldCredentials
 		}
 	}()
+
 	f.opt.ServiceAccountFile = file
 	f.opt.ServiceAccountCredentials = ""
 	oAuthClient, err := createOAuthClient(ctx, &f.opt, f.name, f.m)
@@ -3343,12 +3259,17 @@ func (f *Fs) changeServiceAccountFile(ctx context.Context, file string) (err err
 	if err != nil {
 		return fmt.Errorf("couldn't create Drive client: %w", err)
 	}
+	f.activitySvc, err = driveactivity.NewService(context.Background(), option.WithHTTPClient(f.client))
+	if err != nil {
+		return fmt.Errorf("couldn't create Drive Activity client: %w", err)
+	}
 	if f.opt.V2DownloadMinSize >= 0 {
 		f.v2Svc, err = drive_v2.NewService(context.Background(), option.WithHTTPClient(f.client))
 		if err != nil {
 			return fmt.Errorf("couldn't create Drive v2 client: %w", err)
 		}
 	}
+
 	return nil
 }
 
