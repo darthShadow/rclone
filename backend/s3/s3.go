@@ -2672,6 +2672,33 @@ func (f *Fs) CleanUp(ctx context.Context) (err error) {
 	return f.cleanUp(ctx, 24*time.Hour)
 }
 
+// ChangeNotify calls the passed function with a path that has had changes.
+// If the implementation uses polling, it should adhere to the given interval.
+//
+// Automatically restarts itself in case of unexpected behavior of the remote.
+//
+// Close the returned channel to stop being notified.
+func (f *Fs) ChangeNotify(ctx context.Context, notifyFunc func(string, fs.EntryType), pollIntervalChan <-chan time.Duration) {
+	if f.opt.Provider == "Minio" {
+		go f.minioChangeNotify(ctx, notifyFunc, pollIntervalChan)
+	} else {
+		// Dummy notify handler
+		go func() {
+			for {
+				select {
+				case pollInterval, ok := <-pollIntervalChan:
+					if !ok {
+						return
+					}
+					if pollInterval != 0 {
+					}
+				}
+			}
+
+		}()
+	}
+}
+
 // ------------------------------------------------------------
 
 // Fs returns the parent Fs
@@ -3320,14 +3347,15 @@ func (o *Object) GetTier() string {
 
 // Check the interfaces are satisfied
 var (
-	_ fs.Fs          = &Fs{}
-	_ fs.Copier      = &Fs{}
-	_ fs.PutStreamer = &Fs{}
-	_ fs.ListRer     = &Fs{}
-	_ fs.Commander   = &Fs{}
-	_ fs.CleanUpper  = &Fs{}
-	_ fs.Object      = &Object{}
-	_ fs.MimeTyper   = &Object{}
-	_ fs.GetTierer   = &Object{}
-	_ fs.SetTierer   = &Object{}
+	_ fs.Fs             = &Fs{}
+	_ fs.Copier         = &Fs{}
+	_ fs.PutStreamer    = &Fs{}
+	_ fs.ListRer        = &Fs{}
+	_ fs.Commander      = &Fs{}
+	_ fs.CleanUpper     = &Fs{}
+	_ fs.ChangeNotifier = &Fs{}
+	_ fs.Object         = &Object{}
+	_ fs.MimeTyper      = &Object{}
+	_ fs.GetTierer      = &Object{}
+	_ fs.SetTierer      = &Object{}
 )

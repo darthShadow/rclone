@@ -20,6 +20,7 @@ require (
 	github.com/calebcase/tmpfile v1.0.2 // indirect
 	github.com/coreos/go-semver v0.3.0
 	github.com/dropbox/dropbox-sdk-go-unofficial v5.6.0+incompatible
+	github.com/eclipse/paho.mqtt.golang v1.2.0
 	github.com/gabriel-vasile/mimetype v1.1.1
 	github.com/gogo/protobuf v1.3.1 // indirect
 	github.com/google/go-querystring v1.0.0 // indirect
@@ -33,6 +34,7 @@ require (
 	github.com/koofr/go-koofrclient v0.0.0-20190724113126-8e5366da203a
 	github.com/mattn/go-colorable v0.1.8
 	github.com/mattn/go-runewidth v0.0.9
+	github.com/minio/minio-go/v7 v7.0.5
 	github.com/mitchellh/go-homedir v1.1.0
 	github.com/ncw/go-acd v0.0.0-20201019170801-fe55f33415b1
 	github.com/ncw/swift v1.0.52
