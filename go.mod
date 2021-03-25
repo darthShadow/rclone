@@ -168,6 +168,7 @@ require (
 	github.com/klauspost/cpuid/v2 v2.2.8 // indirect
 	github.com/kr/fs v0.1.0 // indirect
 	github.com/kylelemons/godebug v1.1.0 // indirect
+	github.com/libp2p/go-buffer-pool v0.1.0 // indirect
 	github.com/lpar/date v1.0.0 // indirect
 	github.com/lucasb-eyer/go-colorful v1.2.0 // indirect
 	github.com/lufia/plan9stats v0.0.0-20231016141302-07b5767bb0ed // indirect
@@ -228,4 +229,9 @@ require (
 	github.com/pkg/xattr v0.4.9
 	golang.org/x/mobile v0.0.0-20240716161057-1ad2df20a8b6
 	golang.org/x/term v0.22.0
+)
+
+replace (
+	bazil.org/fuse => github.com/darthshadow/fuse v0.0.0-20230331225904-834c09393e3f
+	github.com/billziss-gh/cgofuse => github.com/darthshadow/cgofuse v1.5.1-0.20230130140708-f87f5db493b5
 )
