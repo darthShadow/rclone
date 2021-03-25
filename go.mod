@@ -144,3 +144,8 @@ require (
 	golang.org/x/mobile v0.0.0-20220722155234-aaac322e2105
 	golang.org/x/term v0.0.0-20220722155259-a9ba230a4035
 )
+
+replace (
+	bazil.org/fuse => github.com/darthshadow/fuse v0.0.0-20210712193805-66e9292236df
+	github.com/billziss-gh/cgofuse => github.com/darthshadow/cgofuse v1.5.1-0.20210701081807-a12da0fe1ecc
+)
