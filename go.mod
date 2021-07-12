@@ -2,8 +2,6 @@ module github.com/rclone/rclone
 
 go 1.14
 
-replace github.com/billziss-gh/cgofuse => github.com/darthShadow/cgofuse v1.5.0
-
 require (
 	bazil.org/fuse v0.0.0-20200524192727-fb710f7dfd05
 	github.com/Azure/azure-pipeline-go v0.2.3
@@ -77,7 +75,7 @@ require (
 	golang.org/x/net v0.0.0-20210415231046-e915ea6b2b7d
 	golang.org/x/oauth2 v0.0.0-20210413134643-5e61552d6c78
 	golang.org/x/sync v0.0.0-20210220032951-036812b2e83c
-	golang.org/x/sys v0.0.0-20210423185535-09eb48e85fd7
+	golang.org/x/sys v0.0.0-20210630005230-0f9fa26af87c
 	golang.org/x/term v0.0.0-20210406210042-72f3dc4e9b72 // indirect
 	golang.org/x/text v0.3.6
 	golang.org/x/time v0.0.0-20210220033141-f8bda1e9f3ba
@@ -88,4 +86,9 @@ require (
 	gopkg.in/yaml.v3 v3.0.0-20210107192922-496545a6307b // indirect
 	storj.io/common v0.0.0-20210419115916-eabb53ea1332 // indirect
 	storj.io/uplink v1.4.6
+)
+
+replace (
+	bazil.org/fuse => github.com/darthshadow/fuse v0.0.0-20210712150634-a2ca84cb2f6c
+	github.com/billziss-gh/cgofuse => github.com/darthshadow/cgofuse v1.5.1-0.20210701081807-a12da0fe1ecc
 )
