@@ -89,6 +89,6 @@ require (
 )
 
 replace (
-	bazil.org/fuse => github.com/darthshadow/fuse v0.0.0-20210712150634-a2ca84cb2f6c
+	bazil.org/fuse => github.com/darthshadow/fuse v0.0.0-20210712193805-66e9292236df
 	github.com/billziss-gh/cgofuse => github.com/darthshadow/cgofuse v1.5.1-0.20210701081807-a12da0fe1ecc
 )

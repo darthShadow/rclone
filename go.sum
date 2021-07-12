@@ -167,8 +167,8 @@ github.com/cpuguy83/go-md2man/v2 v2.0.0/go.mod h1:maD7wRr/U5Z6m/iR4s+kqSMx2CaBsr
 github.com/creack/pty v1.1.7/go.mod h1:lj5s0c3V2DBrqTV7llrYr5NG6My20zk30Fl46Y7DoTY=
 github.com/darthshadow/cgofuse v1.5.1-0.20210701081807-a12da0fe1ecc h1:gLyJ9k0BmxkSgyER41vfImpbJGx3UR5TmIHQGiylX4I=
 github.com/darthshadow/cgofuse v1.5.1-0.20210701081807-a12da0fe1ecc/go.mod h1:aAqOt9tFkaNS11H9sQRwf+t1cGsfAVdtU+GMQA9CACk=
-github.com/darthshadow/fuse v0.0.0-20210712150634-a2ca84cb2f6c h1:cvyED1Y4kPXXZYfI5TOZKaZypzy5xEcVJugtC6t89aA=
-github.com/darthshadow/fuse v0.0.0-20210712150634-a2ca84cb2f6c/go.mod h1:F8PJEGWDzvq8BEpj+rwUVopzXNFy65kwVIKCOPg2gWE=
+github.com/darthshadow/fuse v0.0.0-20210712193805-66e9292236df h1:QZb9ou9jcL01C7Im298vZWzJ2nhrzd+ixf/aXJ1D4SY=
+github.com/darthshadow/fuse v0.0.0-20210712193805-66e9292236df/go.mod h1:F8PJEGWDzvq8BEpj+rwUVopzXNFy65kwVIKCOPg2gWE=
 github.com/davecgh/go-spew v0.0.0-20171005155431-ecdeabc65495/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/davecgh/go-spew v1.1.0/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
