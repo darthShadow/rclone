@@ -20,7 +20,7 @@ on:
 
 jobs:
   build:
-    if: ${{ github.repository == 'rclone/rclone' || github.event.inputs.manual }}
+    if: ${{ github.repository == 'rclone/rclone' || github.repository == 'darthshadow/rclone' || github.event.inputs.manual }}
     timeout-minutes: 60
     strategy:
       fail-fast: false
