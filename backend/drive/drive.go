@@ -10,7 +10,6 @@ package drive
 import (
 	"bytes"
 	"context"
-	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -1081,13 +1080,14 @@ func parseExtensions(extensionsIn ...string) (extensions, mimeTypes []string, er
 	return
 }
 
-// getClient makes an http client according to the options
+// getClient makes a http client according to the options
 func getClient(ctx context.Context, opt *Options) *http.Client {
-	t := fshttp.NewTransportCustom(ctx, func(t *http.Transport) {
-		if opt.DisableHTTP2 {
-			t.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
-		}
-	})
+	//t := fshttp.NewTransportCustom(ctx, func(t *http.Transport) {
+	//	if opt.DisableHTTP2 {
+	//		t.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
+	//	}
+	//})
+	t := fshttp.NewQUICTransportCustom(ctx, nil)
 	return &http.Client{
 		Transport: t,
 	}
