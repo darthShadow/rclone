@@ -31,6 +31,7 @@ require (
 	github.com/hanwen/go-fuse/v2 v2.1.0
 	github.com/hirochachacha/go-smb2 v1.1.0
 	github.com/iguanesolutions/go-systemd/v5 v5.1.0
+	github.com/imroc/req/v3 v3.24.0
 	github.com/jcmturner/gokrb5/v8 v8.4.3
 	github.com/jlaffaye/ftp v0.1.0
 	github.com/jzelinskie/whirlpool v0.0.0-20201016144138-0675e54bb004
@@ -119,6 +120,8 @@ require (
 	github.com/lucasb-eyer/go-colorful v1.2.0 // indirect
 	github.com/lufia/plan9stats v0.0.0-20220913051719-115f729f3c8c // indirect
 	github.com/marten-seemann/qpack v0.2.1 // indirect
+	github.com/marten-seemann/qtls-go1-16 v0.1.5 // indirect
+	github.com/marten-seemann/qtls-go1-17 v0.1.2 // indirect
 	github.com/marten-seemann/qtls-go1-18 v0.1.2 // indirect
 	github.com/marten-seemann/qtls-go1-19 v0.1.0 // indirect
 	github.com/mattn/go-ieproxy v0.0.9 // indirect

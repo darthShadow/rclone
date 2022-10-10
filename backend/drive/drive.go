@@ -1087,7 +1087,7 @@ func getClient(ctx context.Context, opt *Options) *http.Client {
 	//		t.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
 	//	}
 	//})
-	t := fshttp.NewQUICTransportCustom(ctx, nil)
+	t := fshttp.NewReqTransportCustom(ctx, nil)
 	return &http.Client{
 		Transport: t,
 	}
