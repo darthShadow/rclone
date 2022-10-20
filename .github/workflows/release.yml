@@ -1,0 +1,213 @@
+---
+# Github Actions release for rclone
+# -*- compile-command: "yamllint -f parsable release.yml" -*-
+
+name: release
+
+# Trigger the workflow on push or pull request
+on:
+  push:
+    branches:
+      - '**'
+    tags:
+      - '**'
+  workflow_dispatch:
+    inputs:
+      manual:
+        default: true
+        required: true
+
+jobs:
+  release:
+    if: ${{ github.repository == 'darthshadow/rclone' || github.event.inputs.manual }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        job_name: ['linux-20.04', 'linux-18.04', 'mac-arm64']
+
+        include:
+          - job_name: linux-20.04
+            os: ubuntu-20.04
+            container: ''
+            go: '1.21.0-rc.3'
+            gotags: 'cmount'
+            cgo: '1'
+            build_flags: '-include "^linux/"'
+            check: true
+            quicktest: true
+            racequicktest: true
+
+          - job_name: linux-18.04
+            os: ubuntu-20.04
+            container: 'ubuntu:18.04'
+            go: '1.21.0-rc.3'
+            gotags: 'cmount'
+            cgo: '1'
+            build_flags: '-include "^linux/"'
+            check: true
+            quicktest: false
+            racequicktest: false
+
+          - job_name: mac-arm64
+            os: macos-11
+            container: ''
+            go: '1.21.0-rc.3'
+            gotags: 'cmount'
+            cgo: '1'
+            build_flags: '-include "^darwin/arm64" -cgo -macos-arch arm64 -cgo-cflags=-I/usr/local/include -cgo-ldflags=-L/usr/local/lib'
+            check: true
+            quicktest: false
+            racequicktest: false
+
+    name: ${{ matrix.job_name }}
+
+    runs-on: ${{ matrix.os }}
+    container:
+      image: ${{ matrix.container }}
+      options: --privileged --cap-add=SYS_ADMIN --device=/dev/fuse
+
+    steps:
+      - name: Install FUSE & Libraries on Linux
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get upgrade -y
+          sudo add-apt-repository -y ppa:git-core/ppa
+          sudo apt-get install -y ca-certificates kmod software-properties-common
+          sudo apt-get update -y
+          sudo apt-get upgrade -y
+          sudo apt-get install -y git
+          sudo git config --global --add safe.directory `pwd`
+          sudo modprobe fuse
+          sudo chmod 666 /dev/fuse
+          sudo apt-get install -y fuse3 libfuse2 libfuse-dev libfuse3-3 libfuse3-dev rpm pkg-config
+          sudo chown root:$USER /etc/fuse.conf
+        if: (matrix.os == 'ubuntu-20.04' && matrix.container == '')
+
+      - name: Install FUSE & Libraries on Linux
+        shell: bash
+        run: |
+          apt-get update
+          apt-get upgrade -y
+          apt-get install -y ca-certificates kmod software-properties-common
+          add-apt-repository -y ppa:git-core/ppa
+          apt-get update -y
+          apt-get upgrade -y
+          apt-get install -y git
+          git config --global --add safe.directory `pwd`
+          apt-get install -y fuse libfuse2 libfuse-dev rpm pkg-config
+          chown root:$USER /etc/fuse.conf
+        if: (matrix.os == 'ubuntu-20.04' && matrix.container == 'ubuntu:18.04')
+
+      - name: Install FUSE & Libraries on macOS
+        shell: bash
+        run: |
+          brew update
+          brew install git
+          brew install --cask macfuse
+        if: matrix.os == 'macos-11'
+
+      - name: Checkout
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: Install Go
+        uses: actions/setup-go@v3
+        with:
+          go-version: ${{ matrix.go }}
+          check-latest: true
+
+      - name: Set environment variables
+        shell: bash
+        run: |
+          echo 'GOTAGS=${{ matrix.gotags }}' >> $GITHUB_ENV
+          echo 'BUILD_FLAGS=${{ matrix.build_flags }}' >> $GITHUB_ENV
+          echo 'BUILD_ARGS=${{ matrix.build_args }}' >> $GITHUB_ENV
+          if [[ "${{ matrix.goarch }}" != "" ]]; then echo 'GOARCH=${{ matrix.goarch }}' >> $GITHUB_ENV ; fi
+          if [[ "${{ matrix.cgo }}" != "" ]]; then echo 'CGO_ENABLED=${{ matrix.cgo }}' >> $GITHUB_ENV ; fi
+
+      - name: Print Go version and environment
+        shell: bash
+        run: |
+          printf "Using go at: $(which go)\n"
+          printf "Go version: $(go version)\n"
+          printf "\n\nGo environment:\n\n"
+          go env
+          printf "\n\nRclone environment:\n\n"
+          make vars
+          printf "\n\nSystem environment:\n\n"
+          env
+
+      - name: Go module cache
+        uses: actions/cache@v3
+        with:
+          path: ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+
+      - name: Build rclone
+        shell: bash
+        run: |
+          make
+          mkdir -p dist
+          cp -av "$(go env GOPATH)/bin/rclone$(go env GOEXE)" dist/rclone
+
+      - name: Cross-compile arm64 architecture
+        shell: bash
+        run: |
+          make mac_arm64
+        if: matrix.os == 'macos-11'
+
+      - name: Print rclone version
+        shell: bash
+        run: |
+          rclone version
+
+      - name: Run tests
+        shell: bash
+        run: |
+          make quicktest
+        if: matrix.quicktest
+
+      - name: Race test
+        shell: bash
+        run: |
+          make racequicktest
+        if: matrix.racequicktest
+
+      - uses: actions/upload-artifact@v3
+        with:
+          name: rclone-${{ matrix.job_name }}
+          path: dist/rclone
+
+  lint:
+    if: ${{ github.repository == 'darthshadow/rclone' || github.event.inputs.manual }}
+    timeout-minutes: 30
+    name: "lint"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Code quality test
+        uses: golangci/golangci-lint-action@v3
+        with:
+          # Optional: version of golangci-lint to use in form of v1.2 or v1.2.3 or `latest` to use the latest version
+          version: latest
+
+      # Run govulncheck on the latest go version, the one we build binaries with
+      - name: Install Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.21.0-rc.3'
+          check-latest: true
+
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+
+      - name: Scan for vulnerabilities
+        run: govulncheck ./...

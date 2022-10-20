@@ -72,7 +72,7 @@ require (
 	github.com/t3rm1n4l/go-mega v0.0.0-20240219080617-d494b6a8ace7
 	github.com/unknwon/goconfig v1.0.0
 	github.com/willscott/go-nfs v0.0.3-0.20240425122109-91bc38957cc9
-	github.com/winfsp/cgofuse v1.5.1-0.20221118130120-84c0898ad2e0
+	github.com/winfsp/cgofuse v1.5.1-0.20230130140708-f87f5db493b5
 	github.com/xanzy/ssh-agent v0.3.3
 	github.com/youmark/pkcs8 v0.0.0-20201027041543-1326539a0a0a
 	github.com/yunify/qingstor-sdk-go/v3 v3.2.0
