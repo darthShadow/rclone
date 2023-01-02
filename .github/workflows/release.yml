@@ -24,12 +24,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        job_name: ['linux', 'mac_arm64']
+        job_name: ['linux-20.04', 'linux-18.04', 'mac-arm64']
 
         include:
-          - job_name: linux
-            os: ubuntu-18.04
-            go: '^1.19'
+          - job_name: linux-20.04
+            os: ubuntu-20.04
+            container: ''
+            go: '^1.20'
             gotags: 'cmount'
             cgo: '1'
             build_flags: '-include "^linux/"'
@@ -37,17 +38,33 @@ jobs:
             quicktest: true
             racequicktest: true
 
-          - job_name: mac_arm64
+          - job_name: linux-18.04
+            os: ubuntu-20.04
+            container: 'ubuntu:18.04'
+            go: '^1.20'
+            gotags: 'cmount'
+            cgo: '1'
+            build_flags: '-include "^linux/"'
+            check: true
+            quicktest: false
+            racequicktest: false
+
+          - job_name: mac-arm64
             os: macos-11
-            go: '^1.19'
+            container: ''
+            go: '^1.20'
             gotags: 'cmount'
             cgo: '1'
             build_flags: '-include "^darwin/arm64" -cgo -macos-arch arm64 -cgo-cflags=-I/usr/local/include -cgo-ldflags=-L/usr/local/lib'
             quicktest: true
+            racequicktest: true
 
     name: ${{ matrix.job_name }}
 
     runs-on: ${{ matrix.os }}
+    container:
+      image: ${{ matrix.container }}
+      options: --privileged --cap-add=SYS_ADMIN --device=/dev/fuse
 
     steps:
       - name: Checkout
@@ -70,16 +87,33 @@ jobs:
           if [[ "${{ matrix.goarch }}" != "" ]]; then echo 'GOARCH=${{ matrix.goarch }}' >> $GITHUB_ENV ; fi
           if [[ "${{ matrix.cgo }}" != "" ]]; then echo 'CGO_ENABLED=${{ matrix.cgo }}' >> $GITHUB_ENV ; fi
 
-      - name: Install Libraries on Linux
+      - name: Install FUSE & Libraries on Linux
         shell: bash
         run: |
+          sudo apt-get update
+          sudo apt-get upgrade -y
+          sudo apt-get install -y kmod
           sudo modprobe fuse
           sudo chmod 666 /dev/fuse
+          sudo apt-get install -y fuse3 libfuse2 libfuse-dev libfuse3-3 libfuse3-dev rpm pkg-config
           sudo chown root:$USER /etc/fuse.conf
-          sudo apt-get install fuse libfuse-dev rpm pkg-config
-        if: matrix.os == 'ubuntu-18.04'
+        if: (matrix.os == 'ubuntu-20.04' && matrix.container == '')
 
-      - name: Install Libraries on macOS
+      - name: Install FUSE & Libraries on Linux
+        shell: bash
+        run: |
+          apt-get update
+          apt-get install -y software-properties-common ca-certificates
+          add-apt-repository -y ppa:git-core/ppa
+          apt-get update -y
+          apt-get upgrade -y
+          apt-get install -y git
+          git config --global --add safe.directory `pwd`
+          apt-get install -y fuse libfuse2 libfuse-dev rpm pkg-config
+          chown root:$USER /etc/fuse.conf
+        if: (matrix.os == 'ubuntu-20.04' && matrix.container == 'ubuntu:18.04')
+
+      - name: Install FUSE & Libraries on macOS
         shell: bash
         run: |
           brew update
@@ -113,7 +147,13 @@ jobs:
           mkdir -p dist
           cp -av "$(go env GOPATH)/bin/rclone$(go env GOEXE)" dist/rclone
 
-      - name: Rclone version
+      - name: Cross-compile arm64 architecture
+        shell: bash
+        run: |
+          make mac_arm64
+        if: matrix.os == 'macos-11'
+
+      - name: Print rclone version
         shell: bash
         run: |
           rclone version
