@@ -114,6 +114,10 @@ func mountOptions(VFS *vfs.VFS, device string, mountpoint string, opt *mountlib.
 	for _, option := range opt.ExtraFlags {
 		options = append(options, option)
 	}
+	if runtime.GOOS == "linux" {
+		options = append(options, "-o", "big_writes")
+		options = append(options, "-o", fmt.Sprintf("max_write=%d", 1048576))
+	}
 	return options
 }
 
