@@ -142,6 +142,7 @@ require (
 	github.com/klauspost/cpuid/v2 v2.2.6 // indirect
 	github.com/kr/fs v0.1.0 // indirect
 	github.com/kylelemons/godebug v1.1.0 // indirect
+	github.com/libp2p/go-buffer-pool v0.1.0 // indirect
 	github.com/lucasb-eyer/go-colorful v1.2.0 // indirect
 	github.com/lufia/plan9stats v0.0.0-20231016141302-07b5767bb0ed // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
@@ -202,6 +203,6 @@ require (
 )
 
 replace (
-	bazil.org/fuse => github.com/darthshadow/fuse v0.0.0-20230204164217-3bfb758bf1b3
+	bazil.org/fuse => github.com/darthshadow/fuse v0.0.0-20230331225904-834c09393e3f
 	github.com/billziss-gh/cgofuse => github.com/darthshadow/cgofuse v1.5.1-0.20230130140708-f87f5db493b5
 )
