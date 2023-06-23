@@ -30,7 +30,7 @@ jobs:
           - job_name: linux-20.04
             os: ubuntu-20.04
             container: ''
-            go: '^1.20'
+            go: '1.21.0-rc.2'
             gotags: 'cmount'
             cgo: '1'
             build_flags: '-include "^linux/"'
@@ -41,7 +41,7 @@ jobs:
           - job_name: linux-18.04
             os: ubuntu-20.04
             container: 'ubuntu:18.04'
-            go: '^1.20'
+            go: '1.21.0-rc.2'
             gotags: 'cmount'
             cgo: '1'
             build_flags: '-include "^linux/"'
@@ -52,7 +52,7 @@ jobs:
           - job_name: mac-arm64
             os: macos-11
             container: ''
-            go: '^1.20'
+            go: '1.21.0-rc.2'
             gotags: 'cmount'
             cgo: '1'
             build_flags: '-include "^darwin/arm64" -cgo -macos-arch arm64 -cgo-cflags=-I/usr/local/include -cgo-ldflags=-L/usr/local/lib'
