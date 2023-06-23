@@ -8,9 +8,9 @@ name: release
 on:
   push:
     branches:
-      - '*'
+      - '**'
     tags:
-      - '*'
+      - '**'
   workflow_dispatch:
     inputs:
       manual:
@@ -30,7 +30,7 @@ jobs:
           - job_name: linux-20.04
             os: ubuntu-20.04
             container: ''
-            go: '1.21.0-rc.2'
+            go: '1.21.0-rc.3'
             gotags: 'cmount'
             cgo: '1'
             build_flags: '-include "^linux/"'
@@ -41,7 +41,7 @@ jobs:
           - job_name: linux-18.04
             os: ubuntu-20.04
             container: 'ubuntu:18.04'
-            go: '1.21.0-rc.2'
+            go: '1.21.0-rc.3'
             gotags: 'cmount'
             cgo: '1'
             build_flags: '-include "^linux/"'
@@ -52,7 +52,7 @@ jobs:
           - job_name: mac-arm64
             os: macos-11
             container: ''
-            go: '1.21.0-rc.2'
+            go: '1.21.0-rc.3'
             gotags: 'cmount'
             cgo: '1'
             build_flags: '-include "^darwin/arm64" -cgo -macos-arch arm64 -cgo-cflags=-I/usr/local/include -cgo-ldflags=-L/usr/local/lib'
@@ -182,3 +182,32 @@ jobs:
         with:
           name: rclone-${{ matrix.job_name }}
           path: dist/rclone
+
+  lint:
+    if: ${{ github.repository == 'darthshadow/rclone' || github.event.inputs.manual }}
+    timeout-minutes: 30
+    name: "lint"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Code quality test
+        uses: golangci/golangci-lint-action@v3
+        with:
+          # Optional: version of golangci-lint to use in form of v1.2 or v1.2.3 or `latest` to use the latest version
+          version: latest
+
+      # Run govulncheck on the latest go version, the one we build binaries with
+      - name: Install Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.21.0-rc.3'
+          check-latest: true
+
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+
+      - name: Scan for vulnerabilities
+        run: govulncheck ./...
