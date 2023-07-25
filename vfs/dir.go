@@ -39,7 +39,7 @@ type Dir struct {
 	modTimeMu sync.Mutex // protects the following
 	modTime   time.Time
 
-	_hasVirtual atomic.Bool // shows if the directory has virtual entries
+	_childVirtuals atomic.Int32 // atomic int to maintain a count of the virtual entries in this directory
 }
 
 //go:generate stringer -type=vState
@@ -66,7 +66,7 @@ func newDir(vfs *VFS, f fs.Fs, parent *Dir, fsDir fs.Directory) *Dir {
 		items:   make(map[string]Node),
 	}
 	d.cleanupTimer = time.AfterFunc(vfs.Opt.DirCacheTime*2, d.cacheCleanup)
-	d.setHasVirtual(false)
+	d.resetVirtuals()
 	return d
 }
 
@@ -197,14 +197,50 @@ func (d *Dir) Node() Node {
 	return d
 }
 
-// hasVirtual returns whether the directory has virtual entries
-func (d *Dir) hasVirtual() bool {
-	return d._hasVirtual.Load()
+// hasVirtuals returns whether the directory has virtual entries
+func (d *Dir) hasVirtuals() bool {
+	return d._childVirtuals.Load() != 0
 }
 
-// setHasVirtual sets the hasVirtual flag for the directory
-func (d *Dir) setHasVirtual(hasVirtual bool) {
-	d._hasVirtual.Store(hasVirtual)
+// addVirtuals increments or decrements the number of virtual
+// directories by the amount given in the directory
+func (d *Dir) addVirtuals(inc int32) {
+	d._childVirtuals.Add(inc)
+}
+
+// resetVirtuals resets the number of virtual entries to 0
+func (d *Dir) resetVirtuals() {
+	d._childVirtuals.Store(0)
+}
+
+// forgetAllChildren calls ForgetAll on all the children of this directory
+// It returns false if all the children had no virtual entries
+// and true otherwise. Must be called with the d.mu held.
+func (d *Dir) forgetAllChildren() (hasVirtuals bool) {
+	dirHasVirtualsChannel := make(chan bool, len(d.items))
+	dirForgetWG := sync.WaitGroup{}
+
+	for _, node := range d.items {
+		if dir, ok := node.(*Dir); ok {
+			dirForgetWG.Add(1)
+			go func() {
+				dirHasVirtuals := dir.ForgetAll()
+				dirHasVirtualsChannel <- dirHasVirtuals
+				dirForgetWG.Done()
+			}()
+		}
+	}
+
+	dirForgetWG.Wait()
+	close(dirHasVirtualsChannel)
+
+	for dirForgetResult := range dirHasVirtualsChannel {
+		if dirForgetResult {
+			hasVirtuals = true
+		}
+	}
+
+	return hasVirtuals
 }
 
 // ForgetAll forgets directory entries for this directory and any children.
@@ -214,17 +250,17 @@ func (d *Dir) setHasVirtual(hasVirtual bool) {
 // It returns true if the directory or any of its children had virtual entries
 // so could not be forgotten. Children which didn't have virtual entries and
 // children with virtual entries will be forgotten even if true is returned.
-func (d *Dir) ForgetAll() (hasVirtual bool) {
+//
+// It returns false if the directory and all its children had no virtual entries
+// and true otherwise.
+func (d *Dir) ForgetAll() bool {
+	fs.Debugf(d.path, "forgetting directory cache")
+
+	hasVirtuals := false
+
 	d.mu.RLock()
 
-	fs.Debugf(d.path, "forgetting directory cache")
-	for _, node := range d.items {
-		if dir, ok := node.(*Dir); ok {
-			if dir.ForgetAll() {
-				d.setHasVirtual(true)
-			}
-		}
-	}
+	hasVirtuals = d.forgetAllChildren()
 
 	d.mu.RUnlock()
 
@@ -237,18 +273,24 @@ func (d *Dir) ForgetAll() (hasVirtual bool) {
 	d.read = time.Time{}
 
 	// Check if this dir has virtual entries
-	if len(d.virtual) != 0 {
-		d.setHasVirtual(true)
+	if len(d.virtual) != 0 || d.hasVirtuals() {
+		hasVirtuals = true
+	}
+
+	// Check if any of the children have virtual entries
+	if !hasVirtuals && !d.vfs.Opt.ReadOnly {
+		hasVirtuals = d.forgetAllChildren()
 	}
 
 	// Don't clear directory entries if there are virtual entries in this
 	// directory or any children
-	if !d.hasVirtual() {
+	if !hasVirtuals {
 		d.items = make(map[string]Node)
-		d.cleanupTimer.Stop()
+		d.cleanupTimer.Reset(d.vfs.Opt.DirCacheTime * 2)
+		return false
 	}
 
-	return d.hasVirtual()
+	return hasVirtuals
 }
 
 // forgetDirPath clears the cache for itself and all subdirectories if
@@ -394,6 +436,8 @@ func (d *Dir) renameTree(dirPath string) {
 func (d *Dir) rename(newParent *Dir, fsDir fs.Directory) {
 	d.ForgetAll()
 
+	// TODO: Does this need anything regarding the virtuals?
+
 	d.modTimeMu.Lock()
 	d.modTime = fsDir.ModTime(context.TODO())
 	d.modTimeMu.Unlock()
@@ -429,13 +473,14 @@ func (d *Dir) addObject(node Node) {
 	d.items[leaf] = node
 	if d.virtual == nil {
 		d.virtual = make(map[string]vState)
+		d.resetVirtuals()
 	}
 	vAdd := vAddFile
 	if node.IsDir() {
 		vAdd = vAddDir
 	}
 	d.virtual[leaf] = vAdd
-	d.setHasVirtual(true)
+	d.addVirtuals(1)
 	fs.Debugf(d.path, "Added virtual directory entry %v: %q", vAdd, leaf)
 	d.mu.Unlock()
 }
@@ -478,9 +523,10 @@ func (d *Dir) delObject(leaf string) {
 	delete(d.items, leaf)
 	if d.virtual == nil {
 		d.virtual = make(map[string]vState)
+		d.resetVirtuals()
 	}
 	d.virtual[leaf] = vDel
-	d.setHasVirtual(true)
+	d.addVirtuals(1)
 	fs.Debugf(d.path, "Added virtual directory entry %v: %q", vDel, leaf)
 	d.mu.Unlock()
 }
@@ -538,9 +584,10 @@ func (d *Dir) _deleteVirtual(name string) {
 		return
 	}
 	delete(d.virtual, name)
+	d.addVirtuals(-1)
 	if len(d.virtual) == 0 {
 		d.virtual = nil
-		d.setHasVirtual(false)
+		d.resetVirtuals()
 	}
 	fs.Debugf(d.path, "Removed virtual directory entry %v: %q", virtualState, name)
 }
