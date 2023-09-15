@@ -30,7 +30,7 @@ require (
 	github.com/go-chi/chi/v5 v5.0.11
 	github.com/go-git/go-billy/v5 v5.5.0
 	github.com/google/uuid v1.5.0
-	github.com/hanwen/go-fuse/v2 v2.4.0
+	github.com/hanwen/go-fuse/v2 v2.4.3-0.20231120175208-cbb13ba8d29c
 	github.com/henrybear327/Proton-API-Bridge v1.0.0
 	github.com/henrybear327/go-proton-api v1.0.0
 	github.com/jcmturner/gokrb5/v8 v8.4.4
