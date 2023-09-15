@@ -24,13 +24,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        job_name: ['linux-20.04', 'linux-18.04', 'mac-arm64']
+        job_name: ['linux-20.04', 'mac-arm64']
 
         include:
           - job_name: linux-20.04
             os: ubuntu-20.04
             container: ''
-            go: '1.21.0-rc.3'
+            go: '>=1.22.0-rc.1'
             gotags: 'cmount'
             cgo: '1'
             build_flags: '-include "^linux/"'
@@ -38,21 +38,21 @@ jobs:
             quicktest: true
             racequicktest: true
 
-          - job_name: linux-18.04
-            os: ubuntu-20.04
-            container: 'ubuntu:18.04'
-            go: '1.21.0-rc.3'
-            gotags: 'cmount'
-            cgo: '1'
-            build_flags: '-include "^linux/"'
-            check: true
-            quicktest: false
-            racequicktest: false
+          # - job_name: linux-18.04
+          #   os: ubuntu-20.04
+          #   container: 'ubuntu:18.04'
+          #   go: '>=1.22.0-rc.1'
+          #   gotags: 'cmount'
+          #   cgo: '1'
+          #   build_flags: '-include "^linux/"'
+          #   check: true
+          #   quicktest: false
+          #   racequicktest: false
 
           - job_name: mac-arm64
             os: macos-11
             container: ''
-            go: '1.21.0-rc.3'
+            go: '>=1.22.0-rc.1'
             gotags: 'cmount'
             cgo: '1'
             build_flags: '-include "^darwin/arm64" -cgo -macos-arch arm64 -cgo-cflags=-I/usr/local/include -cgo-ldflags=-L/usr/local/lib'
@@ -109,12 +109,12 @@ jobs:
         if: matrix.os == 'macos-11'
 
       - name: Checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
       - name: Install Go
-        uses: actions/setup-go@v3
+        uses: actions/setup-go@v5
         with:
           go-version: ${{ matrix.go }}
           check-latest: true
@@ -141,7 +141,7 @@ jobs:
           env
 
       - name: Go module cache
-        uses: actions/cache@v3
+        uses: actions/cache@v4
         with:
           path: ~/go/pkg/mod
           key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
@@ -191,19 +191,19 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Code quality test
-        uses: golangci/golangci-lint-action@v3
+        uses: golangci/golangci-lint-action@v4
         with:
           # Optional: version of golangci-lint to use in form of v1.2 or v1.2.3 or `latest` to use the latest version
           version: latest
 
       # Run govulncheck on the latest go version, the one we build binaries with
       - name: Install Go
-        uses: actions/setup-go@v4
+        uses: actions/setup-go@v5
         with:
-          go-version: '1.21.0-rc.3'
+          go-version: '>=1.22.0-rc.1'
           check-latest: true
 
       - name: Install govulncheck
