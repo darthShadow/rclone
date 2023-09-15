@@ -2,97 +2,95 @@ package drive
 
 import (
 	"context"
-	"fmt"
 	"path"
-	"strings"
 
 	"github.com/rclone/rclone/fs"
 	"google.golang.org/api/drive/v3"
-	"google.golang.org/api/driveactivity/v2"
 )
 
-const (
-	moveQuery = "detail.action_detail_case:MOVE"
-)
-
+// const (
+//
+//	moveQuery = "detail.action_detail_case:MOVE"
+//
+// )
 type (
-	parent struct {
-		ID   string
-		Name string
-	}
-
+	//parent struct {
+	//	ID   string
+	//	Name string
+	//}
+	//
 	entryType struct {
 		path      string
 		entryType fs.EntryType
 	}
 )
 
-var (
-	consolidationStrategy = driveactivity.ConsolidationStrategy{
-		None: new(driveactivity.NoConsolidation),
-	}
-)
+//var (
+//	consolidationStrategy = driveactivity.ConsolidationStrategy{
+//		None: new(driveactivity.NoConsolidation),
+//	}
+//)
+//
+//func parseItemID(itemName string) string {
+//	return strings.Replace(itemName, "items/", "", -1)
+//}
+//
+//func createItemQueryRequest(itemID, filter, pageToken string) *driveactivity.
+//	QueryDriveActivityRequest {
+//	return &driveactivity.QueryDriveActivityRequest{
+//		PageSize:              1,
+//		ItemName:              fmt.Sprintf("items/%s", itemID),
+//		ConsolidationStrategy: &consolidationStrategy,
+//		Filter:                filter,
+//		PageToken:             pageToken,
+//	}
+//}
 
-func parseItemID(itemName string) string {
-	return strings.Replace(itemName, "items/", "", -1)
-}
-
-func createItemQueryRequest(itemID, filter, pageToken string) *driveactivity.
-	QueryDriveActivityRequest {
-	return &driveactivity.QueryDriveActivityRequest{
-		PageSize:              1,
-		ItemName:              fmt.Sprintf("items/%s", itemID),
-		ConsolidationStrategy: &consolidationStrategy,
-		Filter:                filter,
-		PageToken:             pageToken,
-	}
-}
-
-func (f *Fs) getItemParents(ctx context.Context, itemID string) (parents []*parent) {
-	var (
-		err          error
-		moveResponse *driveactivity.QueryDriveActivityResponse
-	)
-	itemMoveQuery := createItemQueryRequest(itemID, moveQuery, "")
-	err = f.pacer.Call(func() (bool, error) {
-		moveResponse, err = f.activitySvc.Activity.Query(itemMoveQuery).Context(ctx).Do()
-		return f.shouldRetry(ctx, err)
-	})
-	if err != nil {
-		fs.Errorf(itemID, "Unable to retrieve list of moves: %v", err)
-		return nil
-	}
-	fs.Debugf(itemID, "Retrieved Moves : %d\n", len(moveResponse.Activities))
-
-	for _, activity := range moveResponse.Activities {
-		for _, action := range activity.Actions {
-			if action.Detail.Move != nil {
-				for _, addedParent := range action.Detail.Move.AddedParents {
-					if addedParent.DriveItem == nil {
-						fs.Errorf(itemID, "Invalid Added Parent on Move Activity: %v\n",
-							addedParent)
-						continue
-					}
-					parentItem := addedParent.DriveItem
-					parents = append(parents, &parent{ID: parseItemID(parentItem.Name),
-						Name: parentItem.Title})
-				}
-				for _, removedParent := range action.Detail.Move.RemovedParents {
-					if removedParent.DriveItem == nil {
-						fs.Errorf(itemID, "Invalid Removed Parent on Move Activity: %v\n",
-							removedParent)
-						continue
-					}
-					parentItem := removedParent.DriveItem
-					parents = append(parents, &parent{ID: parseItemID(parentItem.Name),
-						Name: parentItem.Title})
-				}
-			}
-		}
-	}
-
-	return
-}
+//func (f *Fs) getItemParents(ctx context.Context, itemID string) (parents []*parent) {
+//	var (
+//		err          error
+//		moveResponse *driveactivity.QueryDriveActivityResponse
+//	)
+//	itemMoveQuery := createItemQueryRequest(itemID, moveQuery, "")
+//	err = f.pacer.Call(func() (bool, error) {
+//		moveResponse, err = f.activitySvc.Activity.Query(itemMoveQuery).Context(ctx).Do()
+//		return f.shouldRetry(ctx, err)
+//	})
+//	if err != nil {
+//		fs.Errorf(itemID, "Unable to retrieve list of moves: %v", err)
+//		return nil
+//	}
+//	fs.Debugf(itemID, "Retrieved Moves : %d\n", len(moveResponse.Activities))
+//
+//	for _, activity := range moveResponse.Activities {
+//		for _, action := range activity.Actions {
+//			if action.Detail.Move != nil {
+//				for _, addedParent := range action.Detail.Move.AddedParents {
+//					if addedParent.DriveItem == nil {
+//						fs.Errorf(itemID, "Invalid Added Parent on Move Activity: %v\n",
+//							addedParent)
+//						continue
+//					}
+//					parentItem := addedParent.DriveItem
+//					parents = append(parents, &parent{ID: parseItemID(parentItem.Name),
+//						Name: parentItem.Title})
+//				}
+//				for _, removedParent := range action.Detail.Move.RemovedParents {
+//					if removedParent.DriveItem == nil {
+//						fs.Errorf(itemID, "Invalid Removed Parent on Move Activity: %v\n",
+//							removedParent)
+//						continue
+//					}
+//					parentItem := removedParent.DriveItem
+//					parents = append(parents, &parent{ID: parseItemID(parentItem.Name),
+//						Name: parentItem.Title})
+//				}
+//			}
+//		}
+//	}
+//
+//	return
+//}
 
 func (f *Fs) changeNotifyStartPageToken(ctx context.Context) (pageToken string, err error) {
 	var startPageToken *drive.StartPageToken

@@ -835,7 +835,6 @@ type Fs struct {
 	exportExtensions []string               // preferred extensions to download docs
 	importMimeTypes  []string               // MIME types to convert to docs
 	isTeamDrive      bool                   // true if this is a team drive
-	fileFields       googleapi.Field        // fields to fetch file info with
 	m                configmap.Mapper
 	grouping         int32                        // number of IDs to search at once in ListR - read with atomic
 	listRmu          *sync.Mutex                  // protects listRempties
