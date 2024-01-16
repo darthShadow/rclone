@@ -848,6 +848,10 @@ type Fs struct {
 	dirResourceKeys  *sync.Map                    // map directory ID to resource key
 	permissionsMu    *sync.Mutex                  // protect the below
 	permissions      map[string]*drive.Permission // map permission IDs to Permissions
+
+	uploadClients     []*http.Client // authorized clients for uploading
+	uploadClientMutex *sync.Mutex    // protects uploadClients and uploadClientIndex
+	uploadClientIndex int            // index of the next client to use
 }
 
 type baseObject struct {
@@ -1283,28 +1287,39 @@ func getServiceAccountClient(ctx context.Context, opt *Options, credentialsData 
 }
 
 func createOAuthClient(ctx context.Context, opt *Options, name string, m configmap.Mapper) (*http.Client, error) {
-	var oAuthClient *http.Client
-	var err error
+	var (
+		err         error
+		oAuthClient *http.Client
+	)
 
-	// try loading service account credentials from env variable, then from a file
-	if len(opt.ServiceAccountCredentials) == 0 && opt.ServiceAccountFile != "" {
-		loadedCreds, err := os.ReadFile(env.ShellExpand(opt.ServiceAccountFile))
+	if clientID, ok := m.Get(config.ConfigClientID); ok && clientID != "" {
+		oAuthClient, _, err = oauthutil.NewClientWithBaseClient(ctx, name, m, driveConfig, getClient(ctx, opt))
 		if err != nil {
-			return nil, fmt.Errorf("error opening service account credentials file: %w", err)
+			return nil, fmt.Errorf("failed to create oauth client: %w", err)
 		}
-		opt.ServiceAccountCredentials = string(loadedCreds)
-	}
-	if opt.ServiceAccountCredentials != "" {
+
+	} else if opt.ServiceAccountCredentials != "" || opt.ServiceAccountFile != "" {
+		// try loading service account credentials from env variable, then from a file
+		if opt.ServiceAccountCredentials == "" && opt.ServiceAccountFile != "" {
+			loadedCreds, err := os.ReadFile(env.ShellExpand(opt.ServiceAccountFile))
+			if err != nil {
+				return nil, fmt.Errorf("error opening service account credentials file: %w", err)
+			}
+			opt.ServiceAccountCredentials = string(loadedCreds)
+		}
+
 		oAuthClient, err = getServiceAccountClient(ctx, opt, []byte(opt.ServiceAccountCredentials))
 		if err != nil {
 			return nil, fmt.Errorf("failed to create oauth client from service account: %w", err)
 		}
+
 	} else if opt.EnvAuth {
 		scopes := driveScopes(opt.Scope)
 		oAuthClient, err = google.DefaultClient(ctx, scopes...)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create client from environment: %w", err)
 		}
+
 	} else {
 		oAuthClient, _, err = oauthutil.NewClientWithBaseClient(ctx, name, m, driveConfig, getClient(ctx, opt))
 		if err != nil {
@@ -1408,8 +1423,17 @@ func newFs(ctx context.Context, name, path string, m configmap.Mapper) (*Fs, err
 		DirModTimeUpdatesOnWrite: false, // FIXME need to check!
 	}).Fill(ctx, f)
 
-	// Create a new authorized Drive client.
 	f.client = oAuthClient
+
+	f.uploadClients, err = loadOAuthClients(ctx, opt, name, m)
+	if err != nil {
+		fs.Errorf(f, "Failed to load upload clients: %v", err)
+		f.uploadClients = []*http.Client{f.client}
+	}
+	f.uploadClientIndex = 0
+	f.uploadClientMutex = new(sync.Mutex)
+
+	// Create a new authorized Drive client.
 	f.svc, err = drive.NewService(context.Background(), option.WithHTTPClient(f.client))
 	if err != nil {
 		return nil, fmt.Errorf("couldn't create Drive client: %w", err)
@@ -3227,15 +3251,21 @@ func (f *Fs) changeChunkSize(chunkSizeString string) (err error) {
 }
 
 func (f *Fs) changeServiceAccountFile(ctx context.Context, file string) (err error) {
-	fs.Debugf(nil, "Changing Service Account File from %s to %s", f.opt.ServiceAccountFile, file)
 	if file == f.opt.ServiceAccountFile {
 		return nil
 	}
+
+	fs.Debugf(nil, "Changing Service Account File from %s to %s", f.opt.ServiceAccountFile, file)
+
+	uploadClientMutex := f.uploadClientMutex
+	uploadClientMutex.Lock()
+	defer uploadClientMutex.Unlock()
 
 	oldSvc := f.svc
 	oldActivitySvc := f.activitySvc
 	oldv2Svc := f.v2Svc
 	oldOAuthClient := f.client
+	oldUploadClients := f.uploadClients
 	oldFile := f.opt.ServiceAccountFile
 	oldCredentials := f.opt.ServiceAccountCredentials
 
@@ -3246,6 +3276,7 @@ func (f *Fs) changeServiceAccountFile(ctx context.Context, file string) (err err
 			f.activitySvc = oldActivitySvc
 			f.v2Svc = oldv2Svc
 			f.client = oldOAuthClient
+			f.uploadClients = oldUploadClients
 			f.opt.ServiceAccountFile = oldFile
 			f.opt.ServiceAccountCredentials = oldCredentials
 		}
@@ -3257,15 +3288,27 @@ func (f *Fs) changeServiceAccountFile(ctx context.Context, file string) (err err
 	if err != nil {
 		return fmt.Errorf("drive: failed when making oauth client: %w", err)
 	}
+
 	f.client = oAuthClient
+
+	f.uploadClients, err = loadOAuthClients(ctx, &f.opt, f.name, f.m)
+	if err != nil {
+		fs.Errorf(nil, "Failed to load upload clients: %v", err)
+		f.uploadClients = []*http.Client{f.client}
+	}
+	f.uploadClientIndex = 0
+
+	// Create a new authorized Drive client.
 	f.svc, err = drive.NewService(context.Background(), option.WithHTTPClient(f.client))
 	if err != nil {
 		return fmt.Errorf("couldn't create Drive client: %w", err)
 	}
+
 	f.activitySvc, err = driveactivity.NewService(context.Background(), option.WithHTTPClient(f.client))
 	if err != nil {
 		return fmt.Errorf("couldn't create Drive Activity client: %w", err)
 	}
+
 	if f.opt.V2DownloadMinSize >= 0 {
 		f.v2Svc, err = drive_v2.NewService(context.Background(), option.WithHTTPClient(f.client))
 		if err != nil {

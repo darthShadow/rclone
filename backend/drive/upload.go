@@ -18,11 +18,17 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 
 	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/config"
+	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/fserrors"
+	"github.com/rclone/rclone/lib/env"
+	"github.com/rclone/rclone/lib/oauthutil"
 	"github.com/rclone/rclone/lib/readers"
+	"golang.org/x/oauth2/google"
 	"google.golang.org/api/drive/v3"
 	"google.golang.org/api/googleapi"
 )
@@ -35,8 +41,9 @@ const (
 // resumableUpload is used by the generated APIs to provide resumable uploads.
 // It is not used by developers directly.
 type resumableUpload struct {
-	f      *Fs
-	remote string
+	f            *Fs
+	uploadClient *http.Client // HTTP client to use in making requests
+	remote       string
 	// URI is the resumable resource destination provided by the server after specifying "&uploadType=resumable".
 	URI string
 	// Media is the object being uploaded.
@@ -51,6 +58,11 @@ type resumableUpload struct {
 
 // Upload the io.Reader in of size bytes with contentType and info
 func (f *Fs) Upload(ctx context.Context, in io.Reader, size int64, contentType, fileID, remote string, info *drive.File) (*drive.File, error) {
+	uploadClient := f.getUploadClient(ctx)
+	if uploadClient == nil {
+		uploadClient = f.client
+	}
+
 	params := url.Values{
 		"alt":        {"json"},
 		"uploadType": {"resumable"},
@@ -89,7 +101,7 @@ func (f *Fs) Upload(ctx context.Context, in io.Reader, size int64, contentType, 
 		if size >= 0 {
 			req.Header.Set("X-Upload-Content-Length", fmt.Sprintf("%v", size))
 		}
-		res, err = f.client.Do(req)
+		res, err = uploadClient.Do(req)
 		if err == nil {
 			defer googleapi.CloseBody(res)
 			err = googleapi.CheckResponse(res)
@@ -102,6 +114,7 @@ func (f *Fs) Upload(ctx context.Context, in io.Reader, size int64, contentType, 
 	loc := res.Header.Get("Location")
 	rx := &resumableUpload{
 		f:             f,
+		uploadClient:  uploadClient,
 		remote:        remote,
 		URI:           loc,
 		Media:         in,
@@ -132,7 +145,7 @@ func (rx *resumableUpload) makeRequest(ctx context.Context, start int64, body io
 func (rx *resumableUpload) transferChunk(ctx context.Context, start int64, chunk io.ReadSeeker, chunkSize int64) (int, error) {
 	_, _ = chunk.Seek(0, io.SeekStart)
 	req := rx.makeRequest(ctx, start, chunk, chunkSize)
-	res, err := rx.f.client.Do(req)
+	res, err := rx.uploadClient.Do(req)
 	if err != nil {
 		return 599, err
 	}
@@ -239,4 +252,71 @@ func (rx *resumableUpload) Upload(ctx context.Context) (*drive.File, error) {
 		return nil, fserrors.RetryErrorf("Incomplete upload - retry, last error %d", StatusCode)
 	}
 	return rx.ret, nil
+}
+
+func loadOAuthClients(ctx context.Context, opt *Options, name string, m configmap.Mapper) ([]*http.Client, error) {
+	var (
+		err         error
+		oAuthClient *http.Client
+	)
+
+	oAuthClients := make([]*http.Client, 0, 3)
+
+	if clientID, ok := m.Get(config.ConfigClientID); ok && clientID != "" {
+		oAuthClient, _, err = oauthutil.NewClientWithBaseClient(ctx, name, m, driveConfig, getClient(ctx, opt))
+		if err != nil {
+			return nil, fmt.Errorf("failed to create oauth client: %w", err)
+		}
+		oAuthClients = append(oAuthClients, oAuthClient)
+	}
+
+	if opt.EnvAuth {
+		scopes := driveScopes(opt.Scope)
+		oAuthClient, err = google.DefaultClient(ctx, scopes...)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create client from environment: %w", err)
+		}
+		oAuthClients = append(oAuthClients, oAuthClient)
+	}
+
+	// try loading service account credentials from env variable, then from a file
+	if len(opt.ServiceAccountCredentials) == 0 && opt.ServiceAccountFile != "" {
+		loadedCreds, err := os.ReadFile(env.ShellExpand(opt.ServiceAccountFile))
+		if err != nil {
+			return nil, fmt.Errorf("error opening service account credentials file: %w", err)
+		}
+		opt.ServiceAccountCredentials = string(loadedCreds)
+	}
+
+	if opt.ServiceAccountCredentials != "" {
+		oAuthClient, err = getServiceAccountClient(ctx, opt, []byte(opt.ServiceAccountCredentials))
+		if err != nil {
+			return nil, fmt.Errorf("failed to create oauth client from service account: %w", err)
+		}
+		oAuthClients = append(oAuthClients, oAuthClient)
+	}
+
+	// Only create a default oauth client if we don't have one already
+	if oAuthClient == nil {
+		oAuthClient, _, err = oauthutil.NewClientWithBaseClient(ctx, name, m, driveConfig, getClient(ctx, opt))
+		if err != nil {
+			return nil, fmt.Errorf("failed to create oauth client: %w", err)
+		}
+		oAuthClients = append(oAuthClients, oAuthClient)
+	}
+
+	return oAuthClients, nil
+}
+
+func (f *Fs) getUploadClient(_ context.Context) *http.Client {
+	uploadClientMutex := f.uploadClientMutex
+	uploadClientMutex.Lock()
+	defer uploadClientMutex.Unlock()
+
+	f.uploadClientIndex++
+	if f.uploadClientIndex > len(f.uploadClients)-1 {
+		f.uploadClientIndex = 0
+	}
+
+	return f.uploadClients[f.uploadClientIndex]
 }
