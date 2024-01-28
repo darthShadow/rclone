@@ -2,21 +2,25 @@ package vfs
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/pkg/xattr"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/dirtree"
 	"github.com/rclone/rclone/fs/list"
 	"github.com/rclone/rclone/fs/log"
 	"github.com/rclone/rclone/fs/operations"
 	"github.com/rclone/rclone/fs/walk"
+	"github.com/rclone/rclone/lib/join"
 	"github.com/rclone/rclone/vfs/vfscommon"
 	"golang.org/x/text/unicode/norm"
 )
@@ -33,12 +37,15 @@ type Dir struct {
 	path    string
 	entry   fs.Directory
 	read    time.Time         // time directory entry last read
+	polled  time.Time         // time directory entry last polled
 	items   map[string]Node   // directory entries - can be empty but not nil
 	virtual map[string]vState // virtual directory entries - may be nil
 	sys     atomic.Value      // user defined info to be attached here
 
-	modTimeMu sync.Mutex // protects the following
-	modTime   time.Time
+	modTimeMu        sync.Mutex // protects the following
+	modTime          time.Time
+	polledModTime    time.Time // modTime of directory when last polled
+	polledCephRcTime time.Time // ceph.dir.rctime of directory when last polled
 
 	_hasVirtual atomic.Bool // shows if the directory has virtual entries
 }
@@ -171,6 +178,13 @@ func (d *Dir) Name() (name string) {
 	return name
 }
 
+// NameBytes returns the name of the directory as a []byte - satisfies Node interface
+func (d *Dir) NameBytes() []byte {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return unsafeStringToBytes(path.Base(d.path))
+}
+
 // Path of the directory - satisfies Node interface
 func (d *Dir) Path() (name string) {
 	d.mu.RLock()
@@ -281,10 +295,10 @@ func (d *Dir) invalidateDir(absPath string) {
 // changeNotify invalidates the directory cache for the relativePath
 // passed in.
 //
-// if entryType is a directory it invalidates the parent of the directory too.
+// if entryType is a directory, it invalidates the parent of the directory too.
 func (d *Dir) changeNotify(relativePath string, entryType fs.EntryType) {
 	d.mu.RLock()
-	absPath := path.Join(d.path, relativePath)
+	absPath := join.PathJoin(d.path, relativePath)
 	d.mu.RUnlock()
 
 	defer log.Trace(d.path, "relativePath=%q, absPath=%q, type=%v", relativePath, absPath,
@@ -310,7 +324,7 @@ func (d *Dir) changeNotify(relativePath string, entryType fs.EntryType) {
 func (d *Dir) ForgetPath(relativePath string, entryType fs.EntryType) {
 	defer log.Trace(d.path, "relativePath=%q, type=%v", relativePath, entryType)("")
 	d.mu.RLock()
-	absPath := path.Join(d.path, relativePath)
+	absPath := join.PathJoin(d.path, relativePath)
 	d.mu.RUnlock()
 	if absPath != "" {
 		d.invalidateDir(vfscommon.FindParent(absPath))
@@ -366,6 +380,14 @@ func (d *Dir) _age(when time.Time) (age time.Duration, stale bool) {
 	}
 	age = when.Sub(d.read)
 	stale = age > time.Duration(d.vfs.Opt.DirCacheTime)
+	if !stale && d.vfs.Opt.PollInterval != 0 {
+		polledAge := when.Sub(d.polled)
+		if polledAge > time.Duration(d.vfs.Opt.PollInterval) {
+			stale = d.hasModTimeChanged()
+			fs.Debugf(d.path, "age=%v, polledAge=%v, stale=%v", age, polledAge, stale)
+			d.polled = when
+		}
+	}
 	return
 }
 
@@ -389,7 +411,7 @@ func (d *Dir) renameTree(dirPath string) {
 	for leaf, node := range d.items {
 		switch x := node.(type) {
 		case *Dir:
-			x.renameTree(path.Join(dirPath, leaf))
+			x.renameTree(join.PathJoin(dirPath, leaf))
 		case *File:
 			x.renameDir(dirPath)
 		default:
@@ -479,7 +501,7 @@ func (d *Dir) AddVirtual(leaf string, size int64, isDir bool) {
 		return
 	}
 	if isDir {
-		remote := path.Join(dPath, leaf)
+		remote := join.PathJoin(dPath, leaf)
 		entry := fs.NewDir(remote, time.Now())
 		node = newDir(d.vfs, d.f, d, entry)
 	} else {
@@ -528,7 +550,7 @@ func (d *Dir) _readDir() error {
 		return nil
 	}
 	entries, err := list.DirSorted(context.TODO(), d.f, false, d.path)
-	if err == fs.ErrorDirNotFound {
+	if errors.Is(err, fs.ErrorDirNotFound) {
 		// We treat directory not found as empty because we
 		// create directories on the fly
 	} else if err != nil {
@@ -726,10 +748,10 @@ func (d *Dir) _readDirFromEntries(entries fs.DirEntries, dirTree dirtree.DirTree
 		if name == "." || name == ".." {
 			continue
 		}
-		node := d.items[name]
 		if mv.add(d, name) {
 			continue
 		}
+		node := d.items[name]
 		switch item := entry.(type) {
 		case fs.Object:
 			obj := item
@@ -936,13 +958,16 @@ func (d *Dir) ReadDirAll() (items Nodes, err error) {
 		items = append(items, item)
 	}
 	d.mu.Unlock()
-	sort.Sort(items)
+
+	// Compare only the leaf strings of the nodes
+	sortNodes(items)
+
 	// fs.Debugf(d.path, "Dir.ReadDirAll OK with %d entries", len(items))
 	return items, nil
 }
 
 // accessModeMask masks off the read modes from the flags
-const accessModeMask = (os.O_RDONLY | os.O_WRONLY | os.O_RDWR)
+const accessModeMask = os.O_RDONLY | os.O_WRONLY | os.O_RDWR
 
 // Open the directory according to the flags provided
 func (d *Dir) Open(flags int) (fd Handle, err error) {
@@ -990,7 +1015,7 @@ func (d *Dir) Mkdir(name string) (*Dir, error) {
 	if d.vfs.Opt.ReadOnly {
 		return nil, EROFS
 	}
-	path := path.Join(d.path, name)
+	path := join.PathJoin(d.path, name)
 	node, err := d.stat(name)
 	switch err {
 	case ENOENT:
@@ -1103,8 +1128,8 @@ func (d *Dir) Rename(oldName, newName string, destDir *Dir) error {
 	if d.vfs.Opt.ReadOnly {
 		return EROFS
 	}
-	oldPath := path.Join(d.path, oldName)
-	newPath := path.Join(destDir.path, newName)
+	oldPath := join.PathJoin(d.path, oldName)
+	newPath := join.PathJoin(destDir.path, newName)
 	// fs.Debugf(oldPath, "Dir.Rename to %q", newPath)
 	oldNode, err := d.stat(oldName)
 	if err != nil {
@@ -1196,4 +1221,80 @@ func (d *Dir) Fs() fs.Fs {
 // Truncate changes the size of the named file.
 func (d *Dir) Truncate(size int64) error {
 	return ENOSYS
+}
+
+func (d *Dir) readActualCephModTime(dirPath string) (cephRcTime time.Time) {
+	cephRcTime = time.Time{}
+
+	if d.f.Features().UserMetadata {
+		if cephRcTimeValue, err := xattr.Get(dirPath, "ceph.dir.rctime"); err == nil {
+			cephRcTimeValueStr := string(cephRcTimeValue)
+			cephRcTimeSecondsFloat, err := strconv.ParseFloat(cephRcTimeValueStr, 64)
+			if err != nil {
+				fs.Errorf(d.path, "failed to parse ceph.dir.rctime: %s: %v", cephRcTimeValueStr, err)
+				return
+			}
+
+			cephRcTimeSeconds := int64(cephRcTimeSecondsFloat)
+			cephRcTime = time.Unix(cephRcTimeSeconds, 0)
+		}
+	}
+
+	return
+}
+
+// hasModTimeChanged checks if the modtime of the directory has changed
+// must be called with the d.mu held
+func (d *Dir) hasModTimeChanged() bool {
+	if !d.f.Features().IsLocal {
+		fs.Debugf(d.path, "not a local backend, skipping modtime check")
+		return false
+	}
+
+	if d.path == "/" || d.path == "." || d.path == "" {
+		fs.Debugf(d.path, "root directory, skipping modtime check")
+		return true
+	}
+
+	if len(d.items) < 16 {
+		fs.Debugf(d.path, "few items, skipping modtime check")
+		return true
+	}
+
+	dirPath := join.FilePathJoin(d.f.Root(), d.path)
+
+	// TODO: Check if this is the fastest way to get the latest modtime
+	fi, err := os.Stat(dirPath)
+	if err != nil {
+		fs.Errorf(d.path, "failed to stat: %v", err)
+		return true
+	}
+
+	if fi.Mode()&os.ModeType != os.ModeDir {
+		fs.Debugf(d.path, "not a directory, skipping modtime check")
+		return true
+	}
+
+	dirModTime := fi.ModTime()
+	fs.Debugf(d.path, "read modtime: %v", dirModTime)
+
+	if dirModTime.IsZero() {
+		fs.Debugf(d.path, "failed to get modtime, skipping modtime check")
+		return true
+	}
+
+	if !d.polledModTime.Equal(dirModTime) {
+		d.polledModTime = dirModTime
+		return true
+	}
+
+	dirCephRcTime := d.readActualCephModTime(dirPath)
+	fs.Debugf(d.path, "read ceph.dir.rctime: %v", dirCephRcTime)
+
+	if !dirCephRcTime.IsZero() && !d.polledCephRcTime.Equal(dirCephRcTime) {
+		d.polledCephRcTime = dirCephRcTime
+		return true
+	}
+
+	return false
 }
