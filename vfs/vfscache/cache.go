@@ -24,6 +24,7 @@ import (
 	"github.com/rclone/rclone/lib/diskusage"
 	"github.com/rclone/rclone/lib/encoder"
 	"github.com/rclone/rclone/lib/file"
+	"github.com/rclone/rclone/lib/join"
 	"github.com/rclone/rclone/lib/systemd"
 	"github.com/rclone/rclone/vfs/vfscache/writeback"
 	"github.com/rclone/rclone/vfs/vfscommon"
@@ -177,7 +178,7 @@ func createDir(dir string) error {
 
 // createRootDir creates a single cache root directory
 func createRootDir(parentOSPath string, name string, relativeDirOSPath string) (path string, err error) {
-	path = file.UNCPath(filepath.Join(parentOSPath, name, relativeDirOSPath))
+	path = file.UNCPath(join.FilePathJoin(parentOSPath, name, relativeDirOSPath))
 	err = createDir(path)
 	return
 }
@@ -250,13 +251,13 @@ func toOSPath(standardPath string) string {
 
 // toOSPath turns a remote relative name into an OS path in the cache
 func (c *Cache) toOSPath(name string) string {
-	return filepath.Join(c.root, toOSPath(name))
+	return join.FilePathJoin(c.root, toOSPath(name))
 }
 
 // toOSPathMeta turns a remote relative name into an OS path in the
 // cache for the metadata
 func (c *Cache) toOSPathMeta(name string) string {
-	return filepath.Join(c.metaRoot, toOSPath(name))
+	return join.FilePathJoin(c.metaRoot, toOSPath(name))
 }
 
 // _get gets name from the cache or creates a new one

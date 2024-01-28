@@ -67,7 +67,7 @@ func (o *Object) parseMetadataTime(m fs.Metadata, key string) (t time.Time, ok b
 	return t, ok
 }
 
-// parse am int from metadata with key and base
+// parse an int from metadata with key and base
 func (o *Object) parseMetadataInt(m fs.Metadata, key string, base int) (result int, ok bool) {
 	value, ok := m[key]
 	if ok {

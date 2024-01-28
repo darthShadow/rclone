@@ -40,6 +40,7 @@ require (
 	github.com/klauspost/compress v1.17.4
 	github.com/koofr/go-httpclient v0.0.0-20230225102643-5d51a2e9dea6
 	github.com/koofr/go-koofrclient v0.0.0-20221207135200-cbd7fc9ad6a6
+	github.com/libp2p/go-buffer-pool v0.1.0
 	github.com/mattn/go-colorable v0.1.13
 	github.com/mattn/go-runewidth v0.0.15
 	github.com/minio/minio-go/v7 v7.0.66
@@ -142,7 +143,6 @@ require (
 	github.com/klauspost/cpuid/v2 v2.2.6 // indirect
 	github.com/kr/fs v0.1.0 // indirect
 	github.com/kylelemons/godebug v1.1.0 // indirect
-	github.com/libp2p/go-buffer-pool v0.1.0 // indirect
 	github.com/lucasb-eyer/go-colorful v1.2.0 // indirect
 	github.com/lufia/plan9stats v0.0.0-20231016141302-07b5767bb0ed // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect

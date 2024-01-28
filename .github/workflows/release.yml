@@ -178,10 +178,11 @@ jobs:
           make racequicktest
         if: matrix.racequicktest
 
-      - uses: actions/upload-artifact@v3
+      - uses: actions/upload-artifact@v4
         with:
           name: rclone-${{ matrix.job_name }}
           path: dist/rclone
+          overwrite: true
 
   lint:
     if: ${{ github.repository == 'darthshadow/rclone' || github.event.inputs.manual }}
