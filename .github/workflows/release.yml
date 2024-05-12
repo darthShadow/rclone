@@ -30,7 +30,7 @@ jobs:
           - job_name: linux-20.04
             os: ubuntu-20.04
             container: ''
-            go: '>=1.22.0-rc.1'
+            go: '>=1.23.0-rc.1'
             gotags: 'cmount'
             cgo: '1'
             build_flags: '-include "^linux/"'
@@ -41,7 +41,7 @@ jobs:
           # - job_name: linux-18.04
           #   os: ubuntu-20.04
           #   container: 'ubuntu:18.04'
-          #   go: '>=1.22.0-rc.1'
+          #   go: '>=1.23.0-rc.1'
           #   gotags: 'cmount'
           #   cgo: '1'
           #   build_flags: '-include "^linux/"'
@@ -50,9 +50,9 @@ jobs:
           #   racequicktest: false
 
           - job_name: mac-arm64
-            os: macos-11
+            os: macos-latest
             container: ''
-            go: '>=1.22.0-rc.1'
+            go: '>=1.23.0-rc.1'
             gotags: 'cmount'
             cgo: '1'
             build_flags: '-include "^darwin/arm64" -cgo -macos-arch arm64 -cgo-cflags=-I/usr/local/include -cgo-ldflags=-L/usr/local/lib'
@@ -68,46 +68,6 @@ jobs:
       options: --privileged --cap-add=SYS_ADMIN --device=/dev/fuse
 
     steps:
-      - name: Install FUSE & Libraries on Linux
-        shell: bash
-        run: |
-          sudo apt-get update
-          sudo apt-get upgrade -y
-          sudo add-apt-repository -y ppa:git-core/ppa
-          sudo apt-get install -y ca-certificates kmod software-properties-common
-          sudo apt-get update -y
-          sudo apt-get upgrade -y
-          sudo apt-get install -y git
-          sudo git config --global --add safe.directory `pwd`
-          sudo modprobe fuse
-          sudo chmod 666 /dev/fuse
-          sudo apt-get install -y fuse3 libfuse2 libfuse-dev libfuse3-3 libfuse3-dev rpm pkg-config
-          sudo chown root:$USER /etc/fuse.conf
-        if: (matrix.os == 'ubuntu-20.04' && matrix.container == '')
-
-      - name: Install FUSE & Libraries on Linux
-        shell: bash
-        run: |
-          apt-get update
-          apt-get upgrade -y
-          apt-get install -y ca-certificates kmod software-properties-common
-          add-apt-repository -y ppa:git-core/ppa
-          apt-get update -y
-          apt-get upgrade -y
-          apt-get install -y git
-          git config --global --add safe.directory `pwd`
-          apt-get install -y fuse libfuse2 libfuse-dev rpm pkg-config
-          chown root:$USER /etc/fuse.conf
-        if: (matrix.os == 'ubuntu-20.04' && matrix.container == 'ubuntu:18.04')
-
-      - name: Install FUSE & Libraries on macOS
-        shell: bash
-        run: |
-          brew update
-          brew install git
-          brew install --cask macfuse
-        if: matrix.os == 'macos-11'
-
       - name: Checkout
         uses: actions/checkout@v4
         with:
@@ -128,6 +88,52 @@ jobs:
           if [[ "${{ matrix.goarch }}" != "" ]]; then echo 'GOARCH=${{ matrix.goarch }}' >> $GITHUB_ENV ; fi
           if [[ "${{ matrix.cgo }}" != "" ]]; then echo 'CGO_ENABLED=${{ matrix.cgo }}' >> $GITHUB_ENV ; fi
 
+      - name: Install FUSE & Libraries on Linux
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get upgrade -y
+          sudo add-apt-repository -y ppa:git-core/ppa
+          sudo apt-get install -y ca-certificates kmod software-properties-common
+          sudo apt-get update -y
+          sudo apt-get upgrade -y
+          sudo apt-get install -y git
+          sudo git config --global --add safe.directory `pwd`
+          sudo modprobe fuse
+          sudo chmod 666 /dev/fuse
+          sudo apt-get install -y fuse3 libfuse2 libfuse-dev libfuse3-3 libfuse3-dev rpm pkg-config git-annex upx git-annex-remote-rclone nfs-common
+          sudo chown root:$USER /etc/fuse.conf
+        if: (matrix.os == 'ubuntu-20.04' && matrix.container == '')
+
+      - name: Install FUSE & Libraries on Linux
+        shell: bash
+        run: |
+          apt-get update
+          apt-get upgrade -y
+          apt-get install -y ca-certificates kmod software-properties-common
+          add-apt-repository -y ppa:git-core/ppa
+          apt-get update -y
+          apt-get upgrade -y
+          apt-get install -y git
+          git config --global --add safe.directory `pwd`
+          apt-get install -y fuse libfuse2 libfuse-dev rpm pkg-config git-annex upx git-annex-remote-rclone nfs-common
+          chown root:$USER /etc/fuse.conf
+        if: (matrix.os == 'ubuntu-20.04' && matrix.container == 'ubuntu:18.04')
+
+      - name: Install FUSE & Libraries on macOS
+        shell: bash
+        run: |
+          # https://github.com/Homebrew/brew/issues/15621#issuecomment-1619266788
+          # https://github.com/orgs/Homebrew/discussions/4612#discussioncomment-6319008
+          unset HOMEBREW_NO_INSTALL_FROM_API
+          brew untap --force homebrew/core
+          brew untap --force homebrew/cask
+          brew update
+          brew upgrade
+          brew install --cask macfuse
+          brew install git-annex git-annex-remote-rclone
+        if: matrix.os == 'macos-latest'
+
       - name: Print Go version and environment
         shell: bash
         run: |
@@ -140,13 +146,14 @@ jobs:
           printf "\n\nSystem environment:\n\n"
           env
 
-      - name: Go module cache
-        uses: actions/cache@v4
-        with:
-          path: ~/go/pkg/mod
-          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
-          restore-keys: |
-            ${{ runner.os }}-go-
+      - name: Build rclone
+        shell: bash
+        run: |
+          make
+          upx -v "$(go env GOPATH)/bin/rclone$(go env GOEXE)"
+          mkdir -p dist
+          cp -av "$(go env GOPATH)/bin/rclone$(go env GOEXE)" dist/rclone
+        if: matrix.os != 'macos-latest'
 
       - name: Build rclone
         shell: bash
@@ -154,12 +161,7 @@ jobs:
           make
           mkdir -p dist
           cp -av "$(go env GOPATH)/bin/rclone$(go env GOEXE)" dist/rclone
-
-      - name: Cross-compile arm64 architecture
-        shell: bash
-        run: |
-          make mac_arm64
-        if: matrix.os == 'macos-11'
+        if: matrix.os == 'macos-latest'
 
       - name: Print rclone version
         shell: bash
@@ -191,21 +193,46 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      - name: Get runner parameters
+        id: get-runner-parameters
+        shell: bash
+        run: |
+          echo "year-week=$(/bin/date -u "+%Y%V")" >> $GITHUB_OUTPUT
+          echo "runner-os-version=$ImageOS" >> $GITHUB_OUTPUT
+
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Code quality test
-        uses: golangci/golangci-lint-action@v4
-        with:
-          # Optional: version of golangci-lint to use in form of v1.2 or v1.2.3 or `latest` to use the latest version
-          version: latest
-
-      # Run govulncheck on the latest go version, the one we build binaries with
       - name: Install Go
         uses: actions/setup-go@v5
         with:
-          go-version: '>=1.22.0-rc.1'
+          go-version: '>=1.23.0-rc.1'
           check-latest: true
+          cache: false
+
+      - name: Cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+            ~/.cache/golangci-lint
+          key: golangci-lint-${{ steps.get-runner-parameters.outputs.runner-os-version }}-go${{ steps.setup-go.outputs.go-version }}-${{ steps.get-runner-parameters.outputs.year-week }}-${{ hashFiles('go.sum') }}
+          restore-keys: golangci-lint-${{ steps.get-runner-parameters.outputs.runner-os-version }}-go${{ steps.setup-go.outputs.go-version }}-${{ steps.get-runner-parameters.outputs.year-week }}-
+
+      - name: Code quality test (Linux)
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+          skip-cache: true
+
+      - name: Code quality test (macOS)
+        uses: golangci/golangci-lint-action@v6
+        env:
+          GOOS: "darwin"
+        with:
+          version: latest
+          skip-cache: true
 
       - name: Install govulncheck
         run: go install golang.org/x/vuln/cmd/govulncheck@latest

@@ -43,7 +43,7 @@ ifdef GOTAGS
 BUILDTAGS=-tags "$(GOTAGS)"
 LINTTAGS=--build-tags "$(GOTAGS)"
 endif
-LDFLAGS=--ldflags "-s -X github.com/rclone/rclone/fs.Version=$(TAG)"
+LDFLAGS=--ldflags "-s -w -X github.com/rclone/rclone/fs.Version=$(TAG)"
 
 .PHONY: rclone test_all vars version
 
