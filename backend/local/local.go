@@ -853,24 +853,89 @@ func (f *Fs) PutStream(ctx context.Context, in io.Reader, src fs.ObjectInfo, opt
 	return f.Put(ctx, in, src, options...)
 }
 
-// Mkdir creates the directory if it doesn't exist
-func (f *Fs) Mkdir(ctx context.Context, dir string) error {
+// mkParentDir creates the parent of the remote path if it doesn't exist
+func (f *Fs) mkParentDir(ctx context.Context, remote string, metadata fs.Metadata) error {
+	remoteDir := filepath.Dir(remote)
+	// Avoid infinite recursion
+	if remoteDir == remote {
+		return nil
+	}
+
+	localPath, err := f.localPath(remote)
+	if err != nil {
+		return err
+	}
+	localDirPath := filepath.Dir(localPath)
+	_, err = f.lstat(localDirPath)
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("mkParentDir: %s: failed to read info: %s: %w", remote, localDirPath, err)
+	}
+
+	err = f.mkParentDir(ctx, remoteDir, metadata)
+	if err != nil {
+		return fmt.Errorf("mkParentDir: %s: failed to make parent directory: %s: %w", remote, remoteDir, err)
+	}
+
+	err = f.mkdirAll(localDirPath)
+	if err != nil {
+		return fmt.Errorf("mkParentDir: %s: failed to make directory: %s: %w", remote, localPath, err)
+	}
+
+	if metadata != nil && remoteDir != "" && remoteDir != "." && remoteDir != ".." && remoteDir != "/" {
+		fi, err := f.lstat(localDirPath)
+		if err != nil {
+			return fmt.Errorf("mkParentDir: %s: failed to read info after creating directory: %s: %w", remote, localDirPath, err)
+		}
+		d, err := f.newDirectory(remoteDir, fi)
+		if err != nil {
+			return fmt.Errorf("mkParentDir: %s: failed to make directory object: %s: %w", remote, localDirPath, err)
+		}
+		err = d.writeMetadata(metadata)
+		if err != nil {
+			return fmt.Errorf("mkParentDir: %s: failed to set metadata: %s: %w", remote, localPath, err)
+		}
+	}
+
+	return nil
+}
+
+func (f *Fs) mkdir(ctx context.Context, dir string, metadata fs.Metadata) (os.FileInfo, error) {
 	localPath, err := f.localPath(dir)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	err = f.mkdirAll(localPath)
-	if err != nil {
-		return err
-	}
-	if dir == "" {
-		fi, err := f.lstat(localPath)
+	fi, err := f.lstat(localPath)
+	if errors.Is(err, os.ErrNotExist) {
+		err := f.mkParentDir(ctx, dir, metadata)
 		if err != nil {
-			return err
+			return nil, fmt.Errorf("mkdir: %s: failed to make parent directory: %w", dir, err)
 		}
+		err = f.mkdirAll(localPath)
+		if err != nil {
+			return nil, err
+		}
+		fi, err = f.lstat(localPath)
+		if err != nil {
+			return nil, fmt.Errorf("mkdir: %s: failed to re-read info: %s: %w", dir, localPath, err)
+		}
+	} else if err != nil {
+		return nil, fmt.Errorf("mkdir: %s: failed to read info: %s: %w", dir, localPath, err)
+	}
+
+	if dir == "" {
 		f.dev = readDevice(fi, f.opt.OneFileSystem)
 	}
-	return nil
+
+	return fi, nil
+}
+
+// Mkdir creates the directory if it doesn't exist
+func (f *Fs) Mkdir(ctx context.Context, dir string) error {
+	_, err := f.mkdir(ctx, dir, nil)
+	return err
 }
 
 // DirSetModTime sets the directory modtime for dir
@@ -896,22 +961,9 @@ func (f *Fs) DirSetModTime(ctx context.Context, dir string, modTime time.Time) e
 // It returns the directory that was created.
 func (f *Fs) MkdirMetadata(ctx context.Context, dir string, metadata fs.Metadata) (fs.Directory, error) {
 	// Find and or create the directory
-	localPath, err := f.localPath(dir)
+	fi, err := f.mkdir(ctx, dir, metadata)
 	if err != nil {
-		return nil, err
-	}
-	fi, err := f.lstat(localPath)
-	if errors.Is(err, os.ErrNotExist) {
-		err := f.Mkdir(ctx, dir)
-		if err != nil {
-			return nil, fmt.Errorf("mkdir metadata: failed make directory: %w", err)
-		}
-		fi, err = f.lstat(localPath)
-		if err != nil {
-			return nil, fmt.Errorf("mkdir metadata: failed to read info: %w", err)
-		}
-	} else if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("mkdir metadata: %w", err)
 	}
 
 	// Create directory object
@@ -924,7 +976,7 @@ func (f *Fs) MkdirMetadata(ctx context.Context, dir string, metadata fs.Metadata
 	if metadata != nil {
 		err = d.writeMetadata(metadata)
 		if err != nil {
-			return nil, fmt.Errorf("failed to set metadata on directory: %w", err)
+			return nil, fmt.Errorf("mkdir metadata: failed to set metadata on directory: %w", err)
 		}
 		// Re-read info now we have finished setting stuff
 		err = d.lstat()
@@ -932,6 +984,7 @@ func (f *Fs) MkdirMetadata(ctx context.Context, dir string, metadata fs.Metadata
 			return nil, fmt.Errorf("mkdir metadata: failed to re-read info: %w", err)
 		}
 	}
+
 	return d, nil
 }
 
@@ -1058,7 +1111,7 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	}
 
 	// Create destination
-	err = dstObj.mkdirAll()
+	err = dstObj.mkdirAll(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -1129,8 +1182,8 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 	}
 
 	// Create parent of destination
-	dstParentPath := filepath.Dir(dstPath)
-	err = file.MkdirAll(dstParentPath, 0777)
+	metadata := fs.GetConfig(ctx).MetadataSet
+	err = f.mkParentDir(ctx, dstRemote, metadata)
 	if err != nil {
 		return err
 	}
@@ -1620,8 +1673,9 @@ func (f *Fs) chtimes(localPath string, atime, mtime time.Time) (err error) {
 }
 
 // mkdirAll makes all the directories needed to store the object
-func (o *Object) mkdirAll() error {
-	return o.fs.mkdirAll(filepath.Dir(o.path))
+func (o *Object) mkdirAll(ctx context.Context) error {
+	metadata := fs.GetConfig(ctx).MetadataSet
+	return o.fs.mkParentDir(ctx, o.remote, metadata)
 }
 
 type nopWriterCloser struct {
@@ -1661,7 +1715,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 		}
 	}
 
-	err = o.mkdirAll()
+	err = o.mkdirAll(ctx)
 	if err != nil {
 		return err
 	}
@@ -1779,7 +1833,7 @@ func (f *Fs) OpenWriterAt(ctx context.Context, remote string, size int64) (fs.Wr
 		return nil, err
 	}
 
-	err = o.mkdirAll()
+	err = o.mkdirAll(ctx)
 	if err != nil {
 		return nil, err
 	}

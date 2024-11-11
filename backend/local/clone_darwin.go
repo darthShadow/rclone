@@ -46,7 +46,7 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	if err != nil {
 		return nil, err
 	}
-	err = dstObj.mkdirAll()
+	err = dstObj.mkdirAll(ctx)
 	if err != nil {
 		return nil, err
 	}

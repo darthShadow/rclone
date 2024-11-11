@@ -129,7 +129,7 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 	if err != nil {
 		// If none of the backends can have empty directories then
 		// don't complain about directories not being found
-		if !f.features.CanHaveEmptyDirectories && err == fs.ErrorObjectNotFound {
+		if !f.features.CanHaveEmptyDirectories && errors.Is(err, fs.ErrorObjectNotFound) {
 			return nil
 		}
 		return err
@@ -150,12 +150,12 @@ func (f *Fs) Hashes() hash.Set {
 }
 
 // mkdir makes the directory passed in and returns the upstreams used
-func (f *Fs) mkdir(ctx context.Context, dir string) ([]*upstream.Fs, error) {
+func (f *Fs) mkdir(ctx context.Context, dir string, withMetadata bool) ([]*upstream.Fs, error) {
 	upstreams, err := f.create(ctx, dir)
-	if err == fs.ErrorObjectNotFound {
+	if errors.Is(err, fs.ErrorObjectNotFound) {
 		parent := parentDir(dir)
 		if dir != parent {
-			upstreams, err = f.mkdir(ctx, parent)
+			upstreams, err = f.mkdir(ctx, parent, withMetadata)
 		} else if dir == "" {
 			// If root dirs not created then create them
 			upstreams, err = f.upstreams, nil
@@ -164,17 +164,38 @@ func (f *Fs) mkdir(ctx context.Context, dir string) ([]*upstream.Fs, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	metadataSet := fs.GetConfig(ctx).MetadataSet
+
 	errs := Errors(make([]error, len(upstreams)))
 	multithread(len(upstreams), func(i int) {
-		err := upstreams[i].Mkdir(ctx, dir)
-		if err != nil {
-			errs[i] = fmt.Errorf("%s: %w", upstreams[i].Name(), err)
+		u := upstreams[i]
+		if withMetadata && metadataSet != nil {
+			if do := u.Features().MkdirMetadata; do != nil {
+				_, err := do(ctx, dir, metadataSet)
+				if err != nil {
+					errs[i] = fmt.Errorf("%s: %w", u.Name(), err)
+				}
+
+			} else {
+				// Just do Mkdir on upstreams which don't support MkdirMetadata
+				err := u.Mkdir(ctx, dir)
+				if err != nil {
+					errs[i] = fmt.Errorf("%s: %w", u.Name(), err)
+				}
+			}
+		} else {
+			err := u.Mkdir(ctx, dir)
+			if err != nil {
+				errs[i] = fmt.Errorf("%s: %w", u.Name(), err)
+			}
 		}
 	})
 	err = errs.Err()
 	if err != nil {
 		return nil, err
 	}
+
 	// If created roots then choose one
 	if dir == "" {
 		upstreams, err = f.create(ctx, dir)
@@ -184,7 +205,7 @@ func (f *Fs) mkdir(ctx context.Context, dir string) ([]*upstream.Fs, error) {
 
 // Mkdir makes the root directory of the Fs object
 func (f *Fs) Mkdir(ctx context.Context, dir string) error {
-	_, err := f.mkdir(ctx, dir)
+	_, err := f.mkdir(ctx, dir, false)
 	return err
 }
 
@@ -201,11 +222,11 @@ func (f *Fs) MkdirMetadata(ctx context.Context, dir string, metadata fs.Metadata
 		if do := u.Features().MkdirMetadata; do != nil {
 			newDir, err := do(ctx, dir, metadata)
 			if err != nil {
-				errs[i] = fmt.Errorf("%s: %w", upstreams[i].Name(), err)
+				errs[i] = fmt.Errorf("%s: %w", u.Name(), err)
 			} else {
 				entries[i], err = u.WrapEntry(newDir)
 				if err != nil {
-					errs[i] = fmt.Errorf("%s: %w", upstreams[i].Name(), err)
+					errs[i] = fmt.Errorf("%s: %w", u.Name(), err)
 				}
 			}
 
@@ -213,7 +234,7 @@ func (f *Fs) MkdirMetadata(ctx context.Context, dir string, metadata fs.Metadata
 			// Just do Mkdir on upstreams which don't support MkdirMetadata
 			err := u.Mkdir(ctx, dir)
 			if err != nil {
-				errs[i] = fmt.Errorf("%s: %w", upstreams[i].Name(), err)
+				errs[i] = fmt.Errorf("%s: %w", u.Name(), err)
 			}
 		}
 	})
@@ -533,8 +554,8 @@ func multiReader(n int, in io.Reader) ([]io.Reader, <-chan error) {
 func (f *Fs) put(ctx context.Context, in io.Reader, src fs.ObjectInfo, stream bool, options ...fs.OpenOption) (fs.Object, error) {
 	srcPath := src.Remote()
 	upstreams, err := f.create(ctx, srcPath)
-	if err == fs.ErrorObjectNotFound {
-		upstreams, err = f.mkdir(ctx, parentDir(srcPath))
+	if errors.Is(err, fs.ErrorObjectNotFound) {
+		upstreams, err = f.mkdir(ctx, parentDir(srcPath), true)
 	}
 	if err != nil {
 		return nil, err
@@ -593,10 +614,10 @@ func (f *Fs) put(ctx context.Context, in io.Reader, src fs.ObjectInfo, stream bo
 // nil and the error
 func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
 	o, err := f.NewObject(ctx, src.Remote())
-	switch err {
-	case nil:
+	switch {
+	case err == nil:
 		return o, o.Update(ctx, in, src, options...)
-	case fs.ErrorObjectNotFound:
+	case errors.Is(err, fs.ErrorObjectNotFound):
 		return f.put(ctx, in, src, false, options...)
 	default:
 		return nil, err
@@ -610,10 +631,10 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 // nil and the error
 func (f *Fs) PutStream(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
 	o, err := f.NewObject(ctx, src.Remote())
-	switch err {
-	case nil:
+	switch {
+	case err == nil:
 		return o, o.Update(ctx, in, src, options...)
-	case fs.ErrorObjectNotFound:
+	case errors.Is(err, fs.ErrorObjectNotFound):
 		return f.put(ctx, in, src, true, options...)
 	default:
 		return nil, err
@@ -782,7 +803,7 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 	multithread(len(f.upstreams), func(i int) {
 		u := f.upstreams[i]
 		o, err := u.NewObject(ctx, remote)
-		if err != nil && err != fs.ErrorObjectNotFound {
+		if err != nil && !errors.Is(err, fs.ErrorObjectNotFound) {
 			errs[i] = fmt.Errorf("%s: %w", u.Name(), err)
 			return
 		}
@@ -832,7 +853,7 @@ func (f *Fs) searchEntries(entries ...upstream.Entry) (upstream.Entry, error) {
 }
 
 func (f *Fs) mergeDirEntries(entriesList [][]upstream.Entry) (fs.DirEntries, error) {
-	entryMap := make(map[string]([]upstream.Entry))
+	entryMap := make(map[string][]upstream.Entry)
 	for _, en := range entriesList {
 		if en == nil {
 			continue
@@ -846,8 +867,8 @@ func (f *Fs) mergeDirEntries(entriesList [][]upstream.Entry) (fs.DirEntries, err
 		}
 	}
 	var entries fs.DirEntries
-	for path := range entryMap {
-		e, err := f.wrapEntries(entryMap[path]...)
+	for entryPath := range entryMap {
+		e, err := f.wrapEntries(entryMap[entryPath]...)
 		if err != nil {
 			return nil, err
 		}
@@ -929,11 +950,11 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	var usedUpstreams []*upstream.Fs
 	var fserr error
 	for i, err := range errs {
-		if err != nil && err != fs.ErrorIsFile {
+		if err != nil && !errors.Is(err, fs.ErrorIsFile) {
 			return nil, err
 		}
 		// Only the upstreams returns ErrorIsFile would be used if any
-		if err == fs.ErrorIsFile {
+		if errors.Is(err, fs.ErrorIsFile) {
 			usedUpstreams = append(usedUpstreams, upstreams[i])
 			fserr = fs.ErrorIsFile
 		}
@@ -949,7 +970,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		upstreams: usedUpstreams,
 	}
 	// Correct root if definitely pointing to a file
-	if fserr == fs.ErrorIsFile {
+	if errors.Is(fserr, fs.ErrorIsFile) {
 		f.root = path.Dir(f.root)
 		if f.root == "." || f.root == "/" {
 			f.root = ""
