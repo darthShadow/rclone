@@ -669,6 +669,38 @@ func TestDirMoveThroughPlantedSymlinkBlocked(t *testing.T) {
 	require.NoError(t, err, "the directory should still be in the destination")
 }
 
+// TestMoveThroughPlantedSymlinkBlocked checks Move can't move a file out of
+// the root through a planted symlink.
+func TestMoveThroughPlantedSymlinkBlocked(t *testing.T) {
+	skipIfNoSymlinks(t)
+	ctx := context.Background()
+
+	evil := t.TempDir()
+
+	r := fstest.NewRun(t)
+	f := r.Flocal.(*Fs)
+	linksMode(f)
+
+	// Control: an in-tree move works as normal.
+	require.NoError(t, putFile(ctx, f, "file.txt", "data"))
+	o, err := f.NewObject(ctx, "file.txt")
+	require.NoError(t, err)
+	_, err = f.Move(ctx, o, "sub/moved.txt")
+	require.NoError(t, err)
+
+	// The planted symlink dst/pwn -> outside, faithfully reproduced by --links.
+	require.NoError(t, putLink(ctx, f, "pwn", evil))
+
+	o, err = f.NewObject(ctx, "sub/moved.txt")
+	require.NoError(t, err)
+	_, err = f.Move(ctx, o, "pwn/moved.txt")
+	require.Error(t, err, "moving a file through a planted symlink should be refused")
+	_, err = os.Lstat(filepath.Join(evil, "moved.txt"))
+	require.True(t, os.IsNotExist(err), "a file escaped the destination into %q", evil)
+	_, err = os.Lstat(filepath.Join(f.root, "sub", "moved.txt"))
+	require.NoError(t, err, "the file should still be in the destination")
+}
+
 // TestEncodingEscapeBlocked checks that a name from a malicious source can't
 // be decoded into path syntax which writes outside the destination.
 func TestEncodingEscapeBlocked(t *testing.T) {

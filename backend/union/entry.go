@@ -68,7 +68,7 @@ func (d *Directory) candidates() []upstream.Entry {
 // return an error or update the object properly (rather than e.g. calling panic).
 func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
 	entries, err := o.fs.actionEntries(o.candidates()...)
-	if err == fs.ErrorPermissionDenied {
+	if errors.Is(err, fs.ErrorPermissionDenied) {
 		// There are no candidates in this object which can be written to
 		// So attempt to create a new object instead
 		newO, err := o.fs.put(ctx, in, src, false, options...)

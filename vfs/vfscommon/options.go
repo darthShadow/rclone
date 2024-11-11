@@ -2,6 +2,7 @@ package vfscommon
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"runtime"
 	"time"
@@ -151,6 +152,11 @@ var OptionsInfo = fs.Options{{
 	Help:    "Specify the total space of disk",
 	Groups:  "VFS",
 }, {
+	Name:    "vfs_skip_metadata",
+	Default: true,
+	Help:    "Skip setting the metadata on the underlying files & directories",
+	Groups:  "VFS",
+}, {
 	Name:    "umask",
 	Default: FileMode(getUmask()),
 	Help:    "Override the permission bits set by the filesystem (not supported on Windows)",
@@ -216,6 +222,7 @@ type Options struct {
 	DiskSpaceTotalSize fs.SizeSuffix `config:"vfs_disk_space_total_size"`
 	HandleCaching      fs.Duration   `config:"vfs_handle_caching"`     // time to keep handle alive after last close
 	MetadataExtension  string        `config:"vfs_metadata_extension"` // if set respond to files with this extension with metadata
+	SkipMetadata       bool          `config:"vfs_skip_metadata"`      // VFS will skip setting the metadata on the underlying files & directories
 }
 
 // Opt is the default options modified by the environment variables and command line flags
@@ -240,4 +247,10 @@ func (opt *Options) Init(ctx context.Context) {
 
 	// Make sure links are returned as links
 	opt.LinkPerms |= FileMode(os.ModeSymlink)
+
+	if !opt.SkipMetadata {
+		// FIXME: Set mode. How to separate it for file & directories?
+		fs.GetConfig(ctx).MetadataSet.Set("uid", fmt.Sprintf("%d", opt.UID))
+		fs.GetConfig(ctx).MetadataSet.Set("gid", fmt.Sprintf("%d", opt.GID))
+	}
 }
