@@ -428,6 +428,30 @@ func (fh *RWFileHandle) Sync() error {
 	return fh.item.Sync()
 }
 
+// Fd returns the integer Unix file descriptor referencing the open file.
+func (fh *RWFileHandle) Fd() uintptr {
+	// FIXME: Files returned this way are empty after the write
+	// if fh.file == nil {
+	// 	return 0
+	// }
+	// o := fh.file.getObject()
+	// if o == nil {
+	// 	return 0
+	// }
+	// if do, ok := o.(fs.Fder); ok {
+	// 	fd, err := do.Fd(context.TODO(), fh.flags)
+	// 	if err != nil {
+	// 		if !errors.Is(err, fs.ErrorNotImplemented) {
+	// 			fs.Errorf(fh.logPrefix(), "Failed to get fd for read-write: %v", err)
+	// 		}
+	// 		return 0
+	// 	}
+	// 	fs.Infof(fh.logPrefix(), "Returning fd for read-write passthrough: %d", fd)
+	// 	return fd
+	// }
+	return 0
+}
+
 func (fh *RWFileHandle) logPrefix() string {
 	return fmt.Sprintf("%s(%p)", fh.file.Path(), fh)
 }
@@ -446,11 +470,6 @@ func (fh *RWFileHandle) Chmod(mode os.FileMode) error {
 // Chown changes the numeric uid and gid of the named file.
 func (fh *RWFileHandle) Chown(uid, gid int) error {
 	return ENOSYS
-}
-
-// Fd returns the integer Unix file descriptor referencing the open file.
-func (fh *RWFileHandle) Fd() uintptr {
-	return 0xdeadbeef // FIXME
 }
 
 // Name returns the name of the file from the underlying Object.

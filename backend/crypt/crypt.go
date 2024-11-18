@@ -145,7 +145,7 @@ problem that should be investigated.`,
 			Name: "filename_encoding",
 			Help: `How to encode the encrypted filename to text string.
 
-This option could help with shortening the encrypted filename. The 
+This option could help with shortening the encrypted filename. The
 suitable option would depend on the way your remote count the filename
 length and if it's case sensitive.`,
 			Default: "base32",
@@ -168,7 +168,7 @@ length and if it's case sensitive.`,
 			Name: "suffix",
 			Help: `If this is set it will override the default suffix of ".bin".
 
-Setting suffix to "none" will result in an empty suffix. This may be useful 
+Setting suffix to "none" will result in an empty suffix. This may be useful
 when the path length is critical.`,
 			Default:  ".bin",
 			Advanced: true,
@@ -1306,6 +1306,13 @@ func (o *Object) SetMetadata(ctx context.Context, metadata fs.Metadata) error {
 // default.
 func (o *Object) MimeType(ctx context.Context) string {
 	return ""
+}
+
+// Fd returns the Fd of the Object
+//
+// It should return fs.ErrorNotImplemented if it's not available
+func (o *Object) Fd(ctx context.Context, flags int) (uintptr, error) {
+	return 0, fs.ErrorNotImplemented
 }
 
 // Check the interfaces are satisfied

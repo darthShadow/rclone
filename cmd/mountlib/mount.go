@@ -124,9 +124,14 @@ var OptionsInfo = fs.Options{{
 	Help:    "Tell the OS the mount is case insensitive (true) or sensitive (false) regardless of the backend (auto)",
 	Groups:  "Mount",
 }, {
+	Name:    "max_stack_depth",
+	Default: 1,
+	Help:    "Maximum stacking depth for passthrough files. Defaults to 1",
+	Groups:  "Mount",
+}, {
 	Name:    "direct_io",
 	Default: false,
-	Help:    "Use Direct IO, disables caching of data",
+	Help:    "Use Direct IO, disables the page cache",
 	Groups:  "Mount",
 }, {
 	Name:    "volname",
@@ -195,6 +200,7 @@ type Options struct {
 	NetworkMode        bool          `config:"network_mode"` // Windows only
 	DirectIO           bool          `config:"direct_io"`    // use Direct IO for file access
 	CaseInsensitive    fs.Tristate   `config:"mount_case_insensitive"`
+	MaxStackDepth      int           `config:"max_stack_depth"`
 }
 
 type (
