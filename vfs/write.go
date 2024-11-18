@@ -380,6 +380,30 @@ func (fh *WriteFileHandle) ReadAt(p []byte, off int64) (n int, err error) {
 	return 0, EPERM
 }
 
+// Fd returns the integer Unix file descriptor referencing the underlying file.
+func (fh *WriteFileHandle) Fd() uintptr {
+	// FIXME: Files returned this way are empty after the write
+	// if fh.file == nil {
+	// 	return 0
+	// }
+	// o := fh.file.getObject()
+	// if o == nil {
+	// 	return 0
+	// }
+	// if do, ok := o.(fs.Fder); ok {
+	// 	fd, err := do.Fd(context.TODO(), fh.flags)
+	// 	if err != nil {
+	// 		if !errors.Is(err, fs.ErrorNotImplemented) {
+	// 			fs.Errorf(fh.remote, "Failed to get fd for write: %v", err)
+	// 		}
+	// 		return 0
+	// 	}
+	// 	fs.Infof(fh.remote, "Returning fd for write passthrough: %d", fd)
+	// 	return fd
+	// }
+	return 0
+}
+
 // Sync commits the current contents of the file to stable storage. Typically,
 // this means flushing the file system's in-memory copy of recently written
 // data to disk.

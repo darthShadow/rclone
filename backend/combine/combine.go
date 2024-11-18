@@ -1173,6 +1173,13 @@ func (o *Object) SetTier(tier string) error {
 	return do.SetTier(tier)
 }
 
+// Fd returns the Fd of the Object
+//
+// It should return fs.ErrorNotImplemented if it's not available
+func (o *Object) Fd(ctx context.Context, flags int) (uintptr, error) {
+	return 0, fs.ErrorNotImplemented
+}
+
 // Check the interfaces are satisfied
 var (
 	_ fs.Fs              = (*Fs)(nil)

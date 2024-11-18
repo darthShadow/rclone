@@ -149,3 +149,19 @@ func (f *FileHandle) Setattr(ctx context.Context, in *fuse.SetAttrIn, out *fuse.
 }
 
 var _ fusefs.FileSetattrer = (*FileHandle)(nil)
+
+// PassthroughFd returns the file descriptor of the file if the remote supports passthrough
+func (f *FileHandle) PassthroughFd() (int, bool) {
+	_, ok := f.h.Node().(*vfs.File)
+	if !ok {
+		return 0, false
+	}
+
+	fileFd := f.h.Fd()
+	if fileFd == 0 {
+		return 0, false
+	}
+	return int(fileFd), true
+}
+
+var _ fusefs.FilePassthroughFder = (*FileHandle)(nil)

@@ -211,6 +211,14 @@ type SetMetadataer interface {
 	SetMetadata(ctx context.Context, metadata Metadata) error
 }
 
+// Fder is an optional interface for DirEntry
+type Fder interface {
+	// Fd returns the underlying fd for an DirEntry
+	//
+	// It should return fs.ErrorNotImplemented if it can't return an fd
+	Fd(ctx context.Context, flags int) (uintptr, error)
+}
+
 // SetModTimer is an optional interface for Directory.
 //
 // Object implements this as part of its requires set of interfaces.
@@ -245,6 +253,7 @@ type FullObject interface {
 	SetTierer
 	Metadataer
 	SetMetadataer
+	Fder
 }
 
 // ObjectOptionalInterfaces returns the names of supported and

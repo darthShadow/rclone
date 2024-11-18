@@ -579,6 +579,17 @@ func (o *Object) SetMetadata(ctx context.Context, metadata fs.Metadata) error {
 	return do.SetMetadata(ctx, metadata)
 }
 
+// Fd returns the Fd of the Object
+//
+// It should return fs.ErrorNotImplemented if it's not available
+func (o *Object) Fd(ctx context.Context, flags int) (uintptr, error) {
+	do, ok := o.Object.(fs.Fder)
+	if !ok {
+		return 0, fs.ErrorNotImplemented
+	}
+	return do.Fd(ctx, flags)
+}
+
 // Check the interfaces are satisfied
 var (
 	_ fs.Fs              = (*Fs)(nil)
