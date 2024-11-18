@@ -34,6 +34,7 @@ func mountOptions(fsys *FS, f fs.Fs, opt *mountlib.Options) (mountOpts *fuse.Mou
 		MaxWrite:           1024 * 1024, // Linux v4.20+ caps requests at 1 MiB
 		DisableReadDirPlus: true,
 		IDMappedMount:      opt.AllowIDMap,
+		MaxStackDepth:      fsys.opt.MaxStackDepth,
 
 		// RememberInodes: true,
 		// SingleThreaded: true,

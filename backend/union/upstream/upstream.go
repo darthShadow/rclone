@@ -333,6 +333,17 @@ func (o *Object) SetMetadata(ctx context.Context, metadata fs.Metadata) error {
 	return do.SetMetadata(ctx, metadata)
 }
 
+// Fd returns the Fd of the Object
+//
+// It should return fs.ErrorNotImplemented if it's not available
+func (o *Object) Fd(ctx context.Context, flags int) (uintptr, error) {
+	do, ok := o.Object.(fs.Fder)
+	if !ok {
+		return 0, fs.ErrorNotImplemented
+	}
+	return do.Fd(ctx, flags)
+}
+
 // Metadata returns metadata for an DirEntry
 //
 // It should return nil if there is no Metadata

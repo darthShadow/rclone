@@ -219,6 +219,17 @@ func (d *Directory) ModTime(ctx context.Context) (t time.Time) {
 	return t
 }
 
+// Fd returns the Fd of the Object
+//
+// It should return fs.ErrorNotImplemented if it's not available
+func (o *Object) Fd(ctx context.Context, flags int) (uintptr, error) {
+	do, ok := o.Object.Object.(fs.Fder)
+	if !ok {
+		return 0, fs.ErrorNotImplemented
+	}
+	return do.Fd(ctx, flags)
+}
+
 // Size returns the size of the directory
 // It returns the sum of all candidates
 func (d *Directory) Size() (s int64) {

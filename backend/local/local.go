@@ -2010,6 +2010,19 @@ func cleanRootPath(s string, noUNC bool, enc encoder.MultiEncoder) string {
 	return s
 }
 
+// Fd returns the Fd of the Object
+//
+// It should return fs.ErrorNotImplemented if it's not available
+func (o *Object) Fd(ctx context.Context, flags int) (uintptr, error) {
+	osFile, err := file.OpenFile(o.path, flags, 0)
+	if err != nil {
+		return 0, fmt.Errorf("failed to open file: %s: %w", o.path, err)
+	}
+	fileFd := osFile.Fd()
+	fs.Infof(o, "Returning fd: %s: %d", o.path, fileFd)
+	return fileFd, nil
+}
+
 // Items returns the count of items in this directory or this
 // directory and subdirectories if known, -1 for unknown
 func (d *Directory) Items() int64 {

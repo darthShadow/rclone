@@ -501,3 +501,32 @@ func (fh *ReadFileHandle) Stat() (os.FileInfo, error) {
 	defer fh.mu.Unlock()
 	return fh.file, nil
 }
+
+// Fd returns the integer Unix file descriptor referencing the underlying file.
+func (fh *ReadFileHandle) Fd() uintptr {
+	if fh.file == nil {
+		return 0
+	}
+	o := fh.file.getObject()
+	if o == nil {
+		return 0
+	}
+	if !fh.sizeUnknown {
+		// if the file is less than 64MB, don't use the passthrough functionality
+		if fh.size < 64*1024*1024 {
+			return 0
+		}
+	}
+	if do, ok := o.(fs.Fder); ok {
+		fd, err := do.Fd(fh.file.ctx, os.O_RDONLY)
+		if err != nil {
+			if !errors.Is(err, fs.ErrorNotImplemented) {
+				fs.Errorf(fh.remote, "Failed to get fd for read: %v", err)
+			}
+			return 0
+		}
+		fs.Infof(fh.remote, "Returning fd for read passthrough: %d", fd)
+		return fd
+	}
+	return 0
+}

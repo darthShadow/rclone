@@ -115,7 +115,7 @@ Notes:
 In this case the compressed file will need to be cached to determine
 it's size.
 
-Files smaller than this limit will be cached in RAM, files larger than 
+Files smaller than this limit will be cached in RAM, files larger than
 this limit will be cached on disk.`,
 			Default:  fs.SizeSuffix(20 * 1024 * 1024),
 			Advanced: true,
@@ -1493,6 +1493,13 @@ func (o *Object) ID() string {
 		return ""
 	}
 	return do.ID()
+}
+
+// Fd returns the Fd of the Object
+//
+// It should return fs.ErrorNotImplemented if it's not available
+func (o *Object) Fd(ctx context.Context, flags int) (uintptr, error) {
+	return 0, fs.ErrorNotImplemented
 }
 
 // Name of the remote (as passed into NewFs)
