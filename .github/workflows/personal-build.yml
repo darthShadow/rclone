@@ -40,7 +40,7 @@ jobs:
             os: ubuntu-22.04
             container: 'ubuntu:20.04'
             go: '>=1.25.0-rc.1'
-            gotags: 'cmount'
+            gotags: 'cmount,re2_cgo'
             cgo: '1'
             build_flags: '-include "^linux/"'
             check: true
@@ -53,7 +53,7 @@ jobs:
             os: ubuntu-22.04
             container: ''
             go: '>=1.25.0-rc.1'
-            gotags: 'cmount'
+            gotags: 'cmount,re2_cgo'
             cgo: '1'
             build_flags: '-include "^linux/"'
             check: true
@@ -66,7 +66,7 @@ jobs:
             os: ubuntu-24.04
             container: ''
             go: '>=1.25.0-rc.1'
-            gotags: 'cmount'
+            gotags: 'cmount,re2_cgo'
             cgo: '1'
             build_flags: '-include "^linux/"'
             check: true
@@ -114,7 +114,7 @@ jobs:
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y git gh
           # sudo modprobe fuse
           # sudo chmod 666 /dev/fuse
-          sudo apt-get install -y fuse3 libfuse2 libfuse-dev libfuse3-3 libfuse3-dev rpm pkg-config git-annex upx git-annex-remote-rclone nfs-common
+          sudo apt-get install -y fuse3 libfuse2 libfuse-dev libfuse3-3 libfuse3-dev libre2-dev rpm pkg-config git-annex upx git-annex-remote-rclone nfs-common
           sudo chown root:$USER /etc/fuse.conf
         if: matrix.os != 'macos-latest'
 
