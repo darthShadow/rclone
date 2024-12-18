@@ -6,12 +6,13 @@ import (
 	"fmt"
 	"maps"
 	"os"
-	"regexp"
 	"regexp/syntax"
 	"slices"
 	"strings"
 	"unicode"
 	"unicode/utf8"
+
+	regexp "github.com/wasilibs/go-re2"
 
 	"github.com/rclone/rclone/fs"
 )
