@@ -4,9 +4,10 @@ package flags
 
 import (
 	"os"
-	"regexp"
 	"strings"
 	"time"
+
+	regexp "github.com/wasilibs/go-re2"
 
 	"github.com/rclone/rclone/fs"
 	"github.com/spf13/pflag"
