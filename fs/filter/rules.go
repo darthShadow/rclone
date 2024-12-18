@@ -4,9 +4,10 @@ import (
 	"bufio"
 	"fmt"
 	"os"
-	"regexp"
 	"slices"
 	"strings"
+
+	regexp "github.com/wasilibs/go-re2"
 
 	"github.com/rclone/rclone/fs"
 )
