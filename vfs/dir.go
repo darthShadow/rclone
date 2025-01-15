@@ -876,6 +876,7 @@ func (d *Dir) statMetadata(leaf, baseLeaf string) (metaNode Node, err error) {
 // contains files with names that differ only by case.
 func (d *Dir) stat(leaf string) (Node, error) {
 	d.mu.Lock()
+	// TODO: Define & Use the Stat-er interface to avoid reading the entire directory
 	err := d._readDir()
 	if err != nil {
 		d.mu.Unlock()

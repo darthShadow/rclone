@@ -16,11 +16,17 @@ import (
 	"github.com/rclone/rclone/vfs"
 )
 
+/**
+References:
+	* https://github.com/octohelm/unifs/blob/main/pkg/fuse/node.go
+    * https://github.com/rfjakob/gocryptfs/blob/master/internal/fusefrontend_reverse/node.go
+    * https://github.com/seaweedfs/seaweedfs/tree/master/weed/mount
+*/
+
 // Node represents a directory or file
 type Node struct {
-	fusefs.Inode
-	node vfs.Node
 	fsys *FS
+	fusefs.Inode
 }
 
 // Node types must be InodeEmbedders
@@ -35,7 +41,6 @@ func newNode(fsys *FS, vfsNode vfs.Node) (node *Node) {
 		return node
 	}
 	node = &Node{
-		node: vfsNode,
 		fsys: fsys,
 	}
 	// Cache the node for later
@@ -43,40 +48,50 @@ func newNode(fsys *FS, vfsNode vfs.Node) (node *Node) {
 	return node
 }
 
-// String used for pretty printing.
-func (n *Node) String() string {
-	return n.node.Path()
+// Path returns the path of the node relative to the root
+func (n *Node) path(names ...string) string {
+	return n.fsys.path(n, names...)
 }
 
-// lookup a Node in a directory
-func (n *Node) lookupVfsNodeInDir(leaf string) (vfsNode vfs.Node, errno syscall.Errno) {
-	dir, ok := n.node.(*vfs.Dir)
+// String used for pretty printing.
+func (n *Node) String() string {
+	return n.path()
+}
+
+// VFS returns the VFS that this node is part of
+func (n *Node) VFS() *vfs.VFS {
+	return n.fsys.VFS
+}
+
+// lookup a Node given a path
+func (n *Node) lookupNode(leaf string) (vfs.Node, syscall.Errno) {
+	var (
+		node vfs.Node
+		err  error
+	)
+	if leaf == "" {
+		node, err = n.VFS().Stat(n.path())
+	} else {
+		node, err = n.VFS().Stat(n.path(leaf))
+	}
+	return node, translateError(err)
+}
+
+// lookup a Dir given a path
+func (n *Node) lookupDir(leaf string) (*vfs.Dir, syscall.Errno) {
+	vfsNode, errno := n.lookupNode(leaf)
+	if errno != 0 {
+		return nil, errno
+	}
+	if !vfsNode.IsDir() {
+		return nil, syscall.ENOTDIR
+	}
+	dir, ok := vfsNode.(*vfs.Dir)
 	if !ok {
 		return nil, syscall.ENOTDIR
 	}
-	vfsNode, err := dir.Stat(leaf)
-	return vfsNode, translateError(err)
+	return dir, 0
 }
-
-// // lookup a Dir given a path
-// func (n *Node) lookupDir(path string) (dir *vfs.Dir, code fuse.Status) {
-// 	node, code := fsys.lookupVfsNodeInDir(path)
-// 	if !code.Ok() {
-// 		return nil, code
-// 	}
-// 	dir, ok := n.(*vfs.Dir)
-// 	if !ok {
-// 		return nil, fuse.ENOTDIR
-// 	}
-// 	return dir, fuse.OK
-// }
-
-// // lookup a parent Dir given a path returning the dir and the leaf
-// func (n *Node) lookupParentDir(filePath string) (leaf string, dir *vfs.Dir, code fuse.Status) {
-// 	parentDir, leaf := path.Split(filePath)
-// 	dir, code = fsys.lookupDir(parentDir)
-// 	return leaf, dir, code
-// }
 
 // Statfs implements statistics for the filesystem that holds this
 // Inode. If not defined, the `out` argument will zeroed with an OK
@@ -85,7 +100,7 @@ func (n *Node) lookupVfsNodeInDir(leaf string) (vfsNode vfs.Node, errno syscall.
 func (n *Node) Statfs(ctx context.Context, out *fuse.StatfsOut) syscall.Errno {
 	defer log.Trace(n, "")("out=%+v", &out)
 	const blockSize = 4096
-	total, _, free := n.fsys.VFS.Statfs()
+	total, _, free := n.VFS().Statfs()
 	out.Blocks = uint64(total) / blockSize // Total data blocks in file system.
 	out.Bfree = uint64(free) / blockSize   // Free blocks in file system.
 	out.Bavail = out.Bfree                 // Free blocks in file system if you're not root.
@@ -110,7 +125,11 @@ var _ = (fusefs.NodeStatfser)((*Node)(nil))
 // with the Options.NullPermissions setting. If blksize is unset, 4096
 // is assumed, and the 'blocks' field is set accordingly.
 func (n *Node) Getattr(ctx context.Context, f fusefs.FileHandle, out *fuse.AttrOut) syscall.Errno {
-	n.fsys.setAttrOut(n.node, out)
+	vfsNode, errno := n.lookupNode("")
+	if errno != 0 {
+		return errno
+	}
+	n.fsys.setAttrOut(vfsNode, out)
 	return 0
 }
 
@@ -120,10 +139,14 @@ var _ = (fusefs.NodeGetattrer)((*Node)(nil))
 func (n *Node) Setattr(ctx context.Context, f fusefs.FileHandle, in *fuse.SetAttrIn, out *fuse.AttrOut) (errno syscall.Errno) {
 	defer log.Trace(n, "in=%v", in)("out=%#v, errno=%v", &out, &errno)
 	var err error
-	n.fsys.setAttrOut(n.node, out)
+	vfsNode, errno := n.lookupNode("")
+	if errno != 0 {
+		return errno
+	}
+	n.fsys.setAttrOut(vfsNode, out)
 	size, ok := in.GetSize()
 	if ok {
-		err = n.node.Truncate(int64(size))
+		err = vfsNode.Truncate(int64(size))
 		if err != nil {
 			return translateError(err)
 		}
@@ -131,7 +154,7 @@ func (n *Node) Setattr(ctx context.Context, f fusefs.FileHandle, in *fuse.SetAtt
 	}
 	mtime, ok := in.GetMTime()
 	if ok {
-		err = n.node.SetModTime(mtime)
+		err = vfsNode.SetModTime(mtime)
 		if err != nil {
 			return translateError(err)
 		}
@@ -149,12 +172,16 @@ func (n *Node) Open(ctx context.Context, flags uint32) (fh fusefs.FileHandle, fu
 	defer log.Trace(n, "flags=%#o", flags)("errno=%v", &errno)
 	// fuse flags are based off syscall flags as are os flags, so
 	// should be compatible
-	handle, err := n.node.Open(int(flags))
+	vfsNode, errno := n.lookupNode("")
+	if errno != 0 {
+		return nil, 0, errno
+	}
+	handle, err := vfsNode.Open(int(flags))
 	if err != nil {
 		return nil, 0, translateError(err)
 	}
 	// If size unknown then use direct io to read
-	if entry := n.node.DirEntry(); entry != nil && entry.Size() < 0 {
+	if entry := vfsNode.DirEntry(); entry != nil && entry.Size() < 0 {
 		fuseFlags |= fuse.FOPEN_DIRECT_IO
 	}
 	if n.fsys.opt.DirectIO {
@@ -190,18 +217,16 @@ var _ = (fusefs.NodeOpener)((*Node)(nil))
 // populate their fuse.EntryOut arguments.
 func (n *Node) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (inode *fusefs.Inode, errno syscall.Errno) {
 	defer log.Trace(n, "name=%q", name)("inode=%v, attr=%v, errno=%v", &inode, &out, &errno)
-	vfsNode, errno := n.lookupVfsNodeInDir(name)
+	vfsNode, errno := n.lookupNode(name)
 	if errno != 0 {
 		return nil, errno
 	}
-	newNode := newNode(n.fsys, vfsNode)
 
-	// FIXME
-	// out.SetEntryTimeout(dt time.Duration)
-	// out.SetAttrTimeout(dt time.Duration)
 	n.fsys.setEntryOut(vfsNode, out)
 
-	return n.NewInode(ctx, newNode, fusefs.StableAttr{Mode: out.Attr.Mode, Ino: newNode.node.Inode()}), 0
+	newNode := newNode(n.fsys, vfsNode)
+
+	return n.NewInode(ctx, newNode, fusefs.StableAttr{Mode: out.Attr.Mode, Ino: vfsNode.Inode()}), 0
 }
 
 var _ = (fusefs.NodeLookuper)((*Node)(nil))
@@ -211,8 +236,9 @@ var _ = (fusefs.NodeLookuper)((*Node)(nil))
 // this method is just for performing sanity/permission
 // checks. The default is to return success.
 func (n *Node) Opendir(ctx context.Context) syscall.Errno {
-	if !n.node.IsDir() {
-		return syscall.ENOTDIR
+	_, errno := n.lookupDir("")
+	if errno != 0 {
+		return errno
 	}
 	return 0
 }
@@ -305,10 +331,11 @@ var _ fusefs.FileSeekdirer = (*dirStream)(nil)
 // static in-memory file systems need not implement NodeReaddirer.
 func (n *Node) Readdir(ctx context.Context) (ds fusefs.DirStream, errno syscall.Errno) {
 	defer log.Trace(n, "")("ds=%v, errno=%v", &ds, &errno)
-	if !n.node.IsDir() {
-		return nil, syscall.ENOTDIR
+	vfsDir, errno := n.lookupDir("")
+	if errno != 0 {
+		return nil, errno
 	}
-	fh, err := n.node.Open(os.O_RDONLY)
+	fh, err := vfsDir.Open(os.O_RDONLY)
 	if err != nil {
 		return nil, translateError(err)
 	}
@@ -333,17 +360,17 @@ var _ = (fusefs.NodeReaddirer)((*Node)(nil))
 // Default is to return EROFS.
 func (n *Node) Mkdir(ctx context.Context, name string, mode uint32, out *fuse.EntryOut) (inode *fusefs.Inode, errno syscall.Errno) {
 	defer log.Trace(name, "mode=0%o", mode)("inode=%v, errno=%v", &inode, &errno)
-	dir, ok := n.node.(*vfs.Dir)
-	if !ok {
-		return nil, syscall.ENOTDIR
+	vfsDir, errno := n.lookupDir("")
+	if errno != 0 {
+		return nil, errno
 	}
-	newDir, err := dir.Mkdir(name)
+	newDir, err := vfsDir.Mkdir(name)
 	if err != nil {
 		return nil, translateError(err)
 	}
 	newNode := newNode(n.fsys, newDir)
-	n.fsys.setEntryOut(newNode.node, out)
-	newInode := n.NewInode(ctx, newNode, fusefs.StableAttr{Mode: out.Attr.Mode, Ino: newNode.node.Inode()})
+	n.fsys.setEntryOut(newDir, out)
+	newInode := n.NewInode(ctx, newNode, fusefs.StableAttr{Mode: out.Attr.Mode, Ino: newDir.Inode()})
 	return newInode, 0
 }
 
@@ -355,13 +382,13 @@ var _ = (fusefs.NodeMkdirer)((*Node)(nil))
 // Default is to return EROFS.
 func (n *Node) Create(ctx context.Context, name string, flags uint32, mode uint32, out *fuse.EntryOut) (node *fusefs.Inode, fh fusefs.FileHandle, fuseFlags uint32, errno syscall.Errno) {
 	defer log.Trace(n, "name=%q, flags=%#o, mode=%#o", name, flags, mode)("node=%v, fh=%v, flags=%#o, errno=%v", &node, &fh, &fuseFlags, &errno)
-	dir, ok := n.node.(*vfs.Dir)
-	if !ok {
-		return nil, nil, 0, syscall.ENOTDIR
+	vfsDir, errno := n.lookupDir("")
+	if errno != 0 {
+		return nil, nil, 0, errno
 	}
 	// translate the fuse flags to os flags
 	osFlags := int(flags) | os.O_CREATE
-	file, err := dir.Create(name, osFlags)
+	file, err := vfsDir.Create(name, osFlags)
 	if err != nil {
 		return nil, nil, 0, translateError(err)
 	}
@@ -378,14 +405,14 @@ func (n *Node) Create(ctx context.Context, name string, flags uint32, mode uint3
 	// }
 
 	// Find the created node
-	vfsNode, errno := n.lookupVfsNodeInDir(name)
+	vfsNode, errno := n.lookupNode(name)
 	if errno != 0 {
 		return nil, nil, 0, errno
 	}
 	n.fsys.setEntryOut(vfsNode, out)
 	newNode := newNode(n.fsys, vfsNode)
 	fs.Debugf(nil, "attr=%#v", out.Attr)
-	newInode := n.NewInode(ctx, newNode, fusefs.StableAttr{Mode: out.Attr.Mode, Ino: newNode.node.Inode()})
+	newInode := n.NewInode(ctx, newNode, fusefs.StableAttr{Mode: out.Attr.Mode, Ino: vfsNode.Inode()})
 	return newInode, fh, 0, 0
 }
 
@@ -429,7 +456,7 @@ var _ = (fusefs.NodeMknoder)((*Node)(nil))
 // FS tree automatically. Default is to return EROFS.
 func (n *Node) Unlink(ctx context.Context, name string) (errno syscall.Errno) {
 	defer log.Trace(n, "name=%q", name)("errno=%v", &errno)
-	vfsNode, errno := n.lookupVfsNodeInDir(name)
+	vfsNode, errno := n.lookupNode(name)
 	if errno != 0 {
 		return errno
 	}
@@ -442,7 +469,7 @@ var _ = (fusefs.NodeUnlinker)((*Node)(nil))
 // Default is to return EROFS.
 func (n *Node) Rmdir(ctx context.Context, name string) (errno syscall.Errno) {
 	defer log.Trace(n, "name=%q", name)("errno=%v", &errno)
-	vfsNode, errno := n.lookupVfsNodeInDir(name)
+	vfsNode, errno := n.lookupNode(name)
 	if errno != 0 {
 		return errno
 	}
@@ -456,20 +483,20 @@ var _ = (fusefs.NodeRmdirer)((*Node)(nil))
 // OK. Default is to return EROFS.
 func (n *Node) Rename(ctx context.Context, oldName string, newParent fusefs.InodeEmbedder, newName string, flags uint32) (errno syscall.Errno) {
 	defer log.Trace(n, "oldName=%q, newParent=%v, newName=%q", oldName, newParent, newName)("errno=%v", &errno)
-	oldDir, ok := n.node.(*vfs.Dir)
-	if !ok {
-		return syscall.ENOTDIR
+	vfsDir, errno := n.lookupDir("")
+	if errno != 0 {
+		return errno
 	}
 	newParentNode, ok := newParent.(*Node)
 	if !ok {
 		fs.Errorf(n, "newParent was not a *Node")
 		return syscall.EIO
 	}
-	newDir, ok := newParentNode.node.(*vfs.Dir)
-	if !ok {
+	newDir, errno := newParentNode.lookupDir("")
+	if errno != 0 {
 		return syscall.ENOTDIR
 	}
-	return translateError(oldDir.Rename(oldName, newName, newDir))
+	return translateError(vfsDir.Rename(oldName, newName, newDir))
 }
 
 var _ = (fusefs.NodeRenamer)((*Node)(nil))
@@ -516,8 +543,8 @@ var _ fusefs.NodeReadlinker = (*Node)(nil)
 // Readlink read symbolic link target.
 func (n *Node) Readlink(ctx context.Context) (ret []byte, err syscall.Errno) {
 	defer log.Trace(n, "")("ret=%v, err=%v", &ret, &err)
-	path := n.node.Path()
-	s, serr := n.node.VFS().Readlink(path)
+	nodePath := n.path()
+	s, serr := n.VFS().Readlink(nodePath)
 	return []byte(s), translateError(serr)
 }
 
@@ -526,15 +553,15 @@ var _ fusefs.NodeSymlinker = (*Node)(nil)
 // Symlink create symbolic link.
 func (n *Node) Symlink(ctx context.Context, target, name string, out *fuse.EntryOut) (node *fusefs.Inode, err syscall.Errno) {
 	defer log.Trace(n, "name=%v, target=%v", name, target)("node=%v, err=%v", &node, &err)
-	fullPath := path.Join(n.node.Path(), name)
-	vfsNode, serr := n.node.VFS().CreateSymlink(target, fullPath)
+	fullPath := path.Join(n.path(), name)
+	vfsNode, serr := n.VFS().CreateSymlink(target, fullPath)
 	if serr != nil {
 		return nil, translateError(serr)
 	}
 
 	n.fsys.setEntryOut(vfsNode, out)
 	newNode := newNode(n.fsys, vfsNode)
-	newInode := n.NewInode(ctx, newNode, fusefs.StableAttr{Mode: out.Attr.Mode, Ino: newNode.node.Inode()})
+	newInode := n.NewInode(ctx, newNode, fusefs.StableAttr{Mode: out.Attr.Mode, Ino: vfsNode.Inode()})
 
 	return newInode, 0
 }
