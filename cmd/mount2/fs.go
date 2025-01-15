@@ -14,14 +14,16 @@ import (
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/fserrors"
 	"github.com/rclone/rclone/fs/log"
+	"github.com/rclone/rclone/lib/join"
 	"github.com/rclone/rclone/vfs"
 )
 
 // FS represents the top level filing system
 type FS struct {
-	VFS *vfs.VFS
-	f   fs.Fs
-	opt *mountlib.Options
+	VFS  *vfs.VFS
+	f    fs.Fs
+	opt  *mountlib.Options
+	root *Node
 }
 
 // NewFS creates a pathfs.FileSystem from the fs.Fs passed in
@@ -34,6 +36,24 @@ func NewFS(VFS *vfs.VFS, opt *mountlib.Options) *FS {
 	return fsys
 }
 
+func (f *FS) path(node *Node, names ...string) string {
+	// Check if the node is the root node
+	if f.root == node {
+		if len(names) == 0 {
+			return "/"
+		}
+		return join.FilePathJoin(append([]string{""}, names...)...)
+	}
+
+	rootNode := node.EmbeddedInode().Root()
+	nodePath := node.Path(rootNode)
+	nodePathElements := []string{"", nodePath}
+	if len(names) == 0 {
+		return join.FilePathJoin(nodePathElements...)
+	}
+	return join.FilePathJoin(append(nodePathElements, names...)...)
+}
+
 // Root returns the root node
 func (f *FS) Root() (node *Node, err error) {
 	defer log.Trace("", "")("node=%+v, err=%v", &node, &err)
@@ -41,7 +61,8 @@ func (f *FS) Root() (node *Node, err error) {
 	if err != nil {
 		return nil, err
 	}
-	return newNode(f, root), nil
+	f.root = newNode(f, root)
+	return f.root, nil
 }
 
 // SetDebug if called, provide debug output through the log package.
