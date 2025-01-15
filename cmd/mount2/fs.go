@@ -14,6 +14,7 @@ import (
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/fserrors"
 	"github.com/rclone/rclone/fs/log"
+	"github.com/rclone/rclone/lib/join"
 	"github.com/rclone/rclone/vfs"
 )
 
@@ -32,6 +33,16 @@ func NewFS(VFS *vfs.VFS, opt *mountlib.Options) *FS {
 		opt: opt,
 	}
 	return fsys
+}
+
+func (f *FS) path(node *Node, names ...string) string {
+	rootNode := node.EmbeddedInode().Root()
+	nodePath := node.Path(rootNode)
+	nodePathElements := []string{"", nodePath}
+	if len(names) == 0 {
+		return join.FilePathJoin(nodePathElements...)
+	}
+	return join.FilePathJoin(append(nodePathElements, names...)...)
 }
 
 // Root returns the root node
