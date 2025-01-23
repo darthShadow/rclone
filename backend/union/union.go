@@ -796,6 +796,54 @@ func (f *Fs) ListR(ctx context.Context, dir string, callback fs.ListRCallback) (
 	return callback(entries)
 }
 
+// Stat returns the DirEntry for the given name
+//
+// It should return fs.ErrorNotImplemented if it can't return a DirEntry
+func (f *Fs) Stat(ctx context.Context, dir string, leaf string) (fs.DirEntry, error) {
+	entriesList := make([][]upstream.Entry, len(f.upstreams))
+	errs := Errors(make([]error, len(f.upstreams)))
+
+	multithread(len(f.upstreams), func(i int) {
+		u := f.upstreams[i]
+		stater, ok := u.Fs.(fs.Stater)
+		if !ok {
+			errs[i] = fs.ErrorNotImplemented
+			return
+		}
+		entry, err := stater.Stat(ctx, dir, leaf)
+		if err != nil {
+			errs[i] = fmt.Errorf("%s: %w", u.Name(), err)
+			return
+		}
+		uEntries := make([]upstream.Entry, 1)
+		uEntries[0], _ = u.WrapEntry(entry)
+		entriesList[i] = uEntries
+	})
+
+	if len(errs) == len(errs.FilterNil()) {
+		errs = errs.Map(func(e error) error {
+			if errors.Is(e, fs.ErrorDirNotFound) {
+				return nil
+			}
+			return e
+		})
+		if len(errs) == 0 {
+			return nil, fs.ErrorDirNotFound
+		}
+		return nil, errs.Err()
+	}
+
+	entries, err := f.mergeDirEntries(entriesList)
+	if err != nil {
+		return nil, err
+	}
+	if len(entries) != 1 {
+		return nil, fmt.Errorf("internal error: expected 1 entry but got %d", len(entries))
+	}
+
+	return entries[0], nil
+}
+
 // NewObject creates a new remote union file object
 func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 	objs := make([]*upstream.Object, len(f.upstreams))
@@ -1096,4 +1144,5 @@ var (
 	_ fs.ListRer         = (*Fs)(nil)
 	_ fs.Shutdowner      = (*Fs)(nil)
 	_ fs.CleanUpper      = (*Fs)(nil)
+	_ fs.Stater          = (*Fs)(nil)
 )
