@@ -31,9 +31,10 @@ func getVFS(in rc.Params) (vfs *VFS, err error) {
 	if rc.IsErrParamNotFound(err) {
 		var count int
 		vfs, count = activeCacheEntries()
-		if count == 1 {
+		switch count {
+		case 1:
 			return vfs, nil
-		} else if count == 0 {
+		case 0:
 			return nil, errors.New(`no VFS active and "fs" parameter not supplied`)
 		}
 		return nil, errors.New(`more than one VFS active - need "fs" parameter`)
