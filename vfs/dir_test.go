@@ -13,6 +13,7 @@ import (
 	"unsafe"
 
 	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/filter"
 	"github.com/rclone/rclone/fs/operations"
 	"github.com/rclone/rclone/fstest"
 	"github.com/stretchr/testify/assert"
@@ -93,9 +94,20 @@ func TestDirForgetAll(t *testing.T) {
 	root, err := vfs.Root()
 	require.NoError(t, err)
 
+	// Stat should not cause a directory listing
+	assert.True(t, root.read.IsZero())
+	assert.True(t, dir.read.IsZero())
+
+	_, err = root.ReadDirAll()
+	require.NoError(t, err)
+
 	assert.Equal(t, 1, len(root.items))
-	assert.Equal(t, 1, len(dir.items))
 	assert.False(t, root.read.IsZero())
+
+	_, err = dir.ReadDirAll()
+	require.NoError(t, err)
+
+	assert.Equal(t, 1, len(dir.items))
 	assert.False(t, dir.read.IsZero())
 
 	dir.ForgetAll()
@@ -120,9 +132,20 @@ func TestDirForgetPath(t *testing.T) {
 	root, err := vfs.Root()
 	require.NoError(t, err)
 
+	// Stat should not cause a directory listing
+	assert.True(t, root.read.IsZero())
+	assert.True(t, dir.read.IsZero())
+
+	_, err = root.ReadDirAll()
+	require.NoError(t, err)
+
 	assert.Equal(t, 1, len(root.items))
-	assert.Equal(t, 1, len(dir.items))
 	assert.False(t, root.read.IsZero())
+
+	_, err = dir.ReadDirAll()
+	require.NoError(t, err)
+
+	assert.Equal(t, 1, len(dir.items))
 	assert.False(t, dir.read.IsZero())
 
 	root.ForgetPath("dir/notfound", fs.EntryObject)
@@ -237,6 +260,82 @@ func TestDirStat(t *testing.T) {
 
 	_, err = dir.Stat("not found")
 	assert.Equal(t, ENOENT, err)
+}
+
+func TestDirStatFiltered(t *testing.T) {
+	tests := []struct {
+		name  string
+		leaf  string
+		setup func(t *testing.T, r *fstest.Run, fi *filter.Filter)
+	}{
+		{
+			name: "PathFilteredFile",
+			leaf: "path-filtered",
+			setup: func(t *testing.T, r *fstest.Run, fi *filter.Filter) {
+				r.WriteObject(context.Background(), "path-filtered", "excluded", t1)
+				require.NoError(t, fi.Add(false, "/path-filtered"))
+			},
+		},
+		{
+			name: "SizeFilteredFile",
+			leaf: "size-filtered",
+			setup: func(t *testing.T, r *fstest.Run, fi *filter.Filter) {
+				r.WriteObject(context.Background(), "size-filtered", "too large", t1)
+				fi.Opt.MaxSize = 1
+			},
+		},
+		{
+			name: "FilteredDirectory",
+			leaf: "filtered-dir",
+			setup: func(t *testing.T, r *fstest.Run, fi *filter.Filter) {
+				r.WriteObject(context.Background(), "filtered-dir/file", "excluded", t1)
+				require.NoError(t, fi.Add(false, "/filtered-dir/"))
+			},
+		},
+		{
+			name: "ExcludeIfPresent",
+			leaf: "exclude-if-present",
+			setup: func(t *testing.T, r *fstest.Run, fi *filter.Filter) {
+				r.WriteObject(context.Background(), "exclude-if-present", "excluded", t1)
+				r.WriteObject(context.Background(), ".ignore", "marker", t1)
+				fi.Opt.ExcludeFile = []string{".ignore"}
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			r := fstest.NewRun(t)
+			if _, ok := r.Fremote.(fs.Stater); !ok {
+				t.Skip("backend does not implement fs.Stater")
+			}
+
+			fi, err := filter.NewFilter(nil)
+			require.NoError(t, err)
+			test.setup(t, r, fi)
+
+			ctx := filter.ReplaceConfig(context.Background(), fi)
+			vfs := New(ctx, r.Fremote, nil)
+			t.Cleanup(func() {
+				cleanupVFS(t, vfs)
+			})
+
+			root, err := vfs.Root()
+			require.NoError(t, err)
+			require.True(t, root.read.IsZero())
+
+			node, err := vfs.Stat(test.leaf)
+			assert.Nil(t, node)
+			assert.ErrorIs(t, err, ENOENT)
+
+			root.mu.RLock()
+			_, cached := root.items[test.leaf]
+			root.mu.RUnlock()
+			assert.False(t, cached)
+
+			checkListing(t, root, nil)
+		})
+	}
 }
 
 // This lists dir and checks the listing is as expected

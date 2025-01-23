@@ -219,6 +219,14 @@ type Fder interface {
 	Fd(ctx context.Context, flags int) (uintptr, error)
 }
 
+// Stater is an optional interface for Directory
+type Stater interface {
+	// Stat returns the DirEntry for the given leaf
+	//
+	// It should return fs.ErrorNotImplemented if it can't return a DirEntry
+	Stat(ctx context.Context, dir string, leaf string) (DirEntry, error)
+}
+
 // SetModTimer is an optional interface for Directory.
 //
 // Object implements this as part of its requires set of interfaces.

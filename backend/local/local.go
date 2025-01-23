@@ -1266,6 +1266,88 @@ func (f *Fs) Command(ctx context.Context, name string, arg []string, opt map[str
 	}
 }
 
+// Stat returns the DirEntry for the given name
+//
+// It should return fs.ErrorNotImplemented if it can't return a DirEntry
+func (f *Fs) Stat(ctx context.Context, dir string, leaf string) (entry fs.DirEntry, err error) {
+	filter, useFilter := filter.GetConfig(ctx), filter.GetUseFilter(ctx)
+
+	var newRemote string
+
+	if useFilter {
+		newRemote = f.cleanRemote(dir, leaf)
+		if !filter.IncludeRemote(newRemote) {
+			return nil, fs.ErrorObjectNotFound
+		}
+	}
+
+	fsDirPath, err := f.localPath(dir)
+	if err != nil {
+		return nil, err
+	}
+
+	leafPath := join.FilePathJoin(fsDirPath, leaf)
+	fi, fierr := os.Lstat(leafPath)
+	if fierr != nil {
+		return nil, fmt.Errorf("%q: fetching info about directory entry %q: %w", dir, leafPath, fierr)
+	}
+
+	name := fi.Name()
+	mode := fi.Mode()
+	newRemote = f.cleanRemote(dir, name)
+
+	// Follow symlinks if required
+	if f.opt.FollowSymlinks && (mode&os.ModeSymlink) != 0 {
+		localPath := join.FilePathJoin(fsDirPath, name)
+		fi, fierr = os.Stat(localPath)
+		// Quietly skip errors on excluded files and directories
+		if fierr != nil && useFilter && !filter.IncludeRemote(newRemote) {
+			return nil, fs.ErrorObjectNotFound
+		}
+
+		if fierr != nil {
+			return nil, fmt.Errorf("%q: following symlink for %q: %w", dir, leafPath, fierr)
+		}
+
+		mode = fi.Mode()
+	}
+
+	if fi.IsDir() {
+		// Ignore directories which are symlinks.  These are junction points under windows which
+		// are kind of a souped up symlink. Unix doesn't have directories which are symlinks.
+		if (mode&os.ModeSymlink) == 0 && f.dev == readDevice(fi, f.opt.OneFileSystem) {
+			d, err := f.newDirectory(newRemote, fi)
+			if err != nil {
+				return nil, err
+			}
+			return d, nil
+		}
+
+	} else {
+		// Check whether this link should be translated
+		if f.opt.TranslateSymlinks && fi.Mode()&os.ModeSymlink != 0 {
+			newRemote += fs.LinkSuffix
+		}
+
+		// Don't include non directory if not included
+		// we leave directory filtering to the layer above
+		if useFilter && !filter.IncludeRemote(newRemote) {
+			return nil, fs.ErrorObjectNotFound
+		}
+
+		fso, err := f.newObjectWithInfo(newRemote, fi)
+		if err != nil {
+			return nil, err
+		}
+
+		if fso.Storable() {
+			return fso, nil
+		}
+	}
+
+	return nil, fs.ErrorObjectNotFound
+}
+
 // ------------------------------------------------------------
 
 // Fs returns the parent Fs
@@ -2065,6 +2147,7 @@ var (
 	_ fs.OpenWriterAter  = &Fs{}
 	_ fs.DirSetModTimer  = &Fs{}
 	_ fs.MkdirMetadataer = &Fs{}
+	_ fs.Stater          = &Fs{}
 	_ fs.Object          = &Object{}
 	_ fs.Metadataer      = &Object{}
 	_ fs.SetMetadataer   = &Object{}

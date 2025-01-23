@@ -23,6 +23,7 @@ package vfs
 import (
 	"context"
 	_ "embed"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -588,7 +589,7 @@ func (vfs *VFS) OpenFile(name string, flags int, perm os.FileMode) (fd Handle, e
 
 	node, err := vfs.Stat(name)
 	if err != nil {
-		if err != ENOENT || flags&os.O_CREATE == 0 {
+		if !errors.Is(err, ENOENT) || flags&os.O_CREATE == 0 {
 			return nil, err
 		}
 		// If not found and O_CREATE then create the file
@@ -793,7 +794,7 @@ func (vfs *VFS) Chown(name string, uid, gid int) error {
 
 // mkdir creates a new directory with the specified name and permission bits
 // (before umask) returning the new directory node.
-func (vfs *VFS) mkdir(name string, perm os.FileMode) (*Dir, error) {
+func (vfs *VFS) mkdir(name string, _ os.FileMode) (*Dir, error) {
 	dir, leaf, err := vfs.StatParent(name)
 	if err != nil {
 		return nil, err

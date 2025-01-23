@@ -3,6 +3,7 @@ package vfs
 import (
 	"context"
 	"os"
+	"runtime"
 	"testing"
 
 	"github.com/rclone/rclone/fs"
@@ -101,7 +102,7 @@ func TestCaseSensitivity(t *testing.T) {
 	assertFileAbsentVFS(t, vfsCS, "FILEB")
 }
 
-func checkFileDataVFS(t *testing.T, vfs *VFS, name string, expect string) bool {
+func checkFileDataVFS(_ *testing.T, vfs *VFS, name string, expect string) bool {
 	fd, err := vfs.OpenFile(name, os.O_RDONLY, 0777)
 	if fd == nil || err != nil {
 		return false
@@ -193,5 +194,12 @@ func TestUnicodeNormalization(t *testing.T) {
 	defer func() { fs.GetConfig(ctx).NoUnicodeNormalization = oldVal }() // restore the prior value after the test
 	ci.NoUnicodeNormalization = true
 	assertFileDataVFS(t, vfs, norm.NFD.String(both), "data1")
-	assertFileAbsentVFS(t, vfs, nfd)
+	if runtime.GOOS == "darwin" {
+		assertFileDataVFS(t, vfs, nfd, "data2")
+	} else {
+		// On darwin, the NFD name is the same as the NFC name, so we expect the file to be found
+		// APFS is normalization-insensitive yet normalization-preserving.
+		// Source: https://news.ycombinator.com/item?id=35336510
+		assertFileAbsentVFS(t, vfs, nfd)
+	}
 }

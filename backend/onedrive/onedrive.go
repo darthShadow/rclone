@@ -388,7 +388,7 @@ block download of the file.
 
 In this case you will see a message like this
 
-    server reports this file is infected with a virus - use --onedrive-av-override to download anyway: Infected (name of virus): 403 Forbidden: 
+    server reports this file is infected with a virus - use --onedrive-av-override to download anyway: Infected (name of virus): 403 Forbidden:
 
 If you are 100% sure you want to download this file anyway then use
 the --onedrive-av-override flag, or av_override = true in the config
@@ -3229,13 +3229,13 @@ var (
 	_ fs.ListPer         = (*Fs)(nil)
 	_ fs.Shutdowner      = (*Fs)(nil)
 	_ fs.Object          = (*Object)(nil)
-	_ fs.MimeTyper       = &Object{}
-	_ fs.IDer            = &Object{}
+	_ fs.MimeTyper       = (*Object)(nil)
+	_ fs.IDer            = (*Object)(nil)
 	_ fs.Metadataer      = (*Object)(nil)
 	_ fs.Metadataer      = (*Directory)(nil)
 	_ fs.SetModTimer     = (*Directory)(nil)
 	_ fs.SetMetadataer   = (*Directory)(nil)
-	_ fs.MimeTyper       = &Directory{}
+	_ fs.MimeTyper       = (*Directory)(nil)
 	_ fs.DirSetModTimer  = (*Fs)(nil)
 	_ fs.MkdirMetadataer = (*Fs)(nil)
 )
