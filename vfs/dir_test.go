@@ -93,9 +93,20 @@ func TestDirForgetAll(t *testing.T) {
 	root, err := vfs.Root()
 	require.NoError(t, err)
 
+	// Stat should not cause a directory listing
+	assert.True(t, root.read.IsZero())
+	assert.True(t, dir.read.IsZero())
+
+	_, err = root.ReadDirAll()
+	require.NoError(t, err)
+
 	assert.Equal(t, 1, len(root.items))
-	assert.Equal(t, 1, len(dir.items))
 	assert.False(t, root.read.IsZero())
+
+	_, err = dir.ReadDirAll()
+	require.NoError(t, err)
+
+	assert.Equal(t, 1, len(dir.items))
 	assert.False(t, dir.read.IsZero())
 
 	dir.ForgetAll()
@@ -120,9 +131,20 @@ func TestDirForgetPath(t *testing.T) {
 	root, err := vfs.Root()
 	require.NoError(t, err)
 
+	// Stat should not cause a directory listing
+	assert.True(t, root.read.IsZero())
+	assert.True(t, dir.read.IsZero())
+
+	_, err = root.ReadDirAll()
+	require.NoError(t, err)
+
 	assert.Equal(t, 1, len(root.items))
-	assert.Equal(t, 1, len(dir.items))
 	assert.False(t, root.read.IsZero())
+
+	_, err = dir.ReadDirAll()
+	require.NoError(t, err)
+
+	assert.Equal(t, 1, len(dir.items))
 	assert.False(t, dir.read.IsZero())
 
 	root.ForgetPath("dir/notfound", fs.EntryObject)

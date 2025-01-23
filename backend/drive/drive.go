@@ -3781,8 +3781,8 @@ Use the --interactive/-i or --dry-run flag to see what would be moved beforehand
 Usage:
 
     rclone backend query drive: query
-    
-The query syntax is documented at [Google Drive Search query terms and 
+
+The query syntax is documented at [Google Drive Search query terms and
 operators](https://developers.google.com/drive/api/guides/ref-search-terms).
 
 For example:
@@ -3790,7 +3790,7 @@ For example:
 	rclone backend query drive: "'0ABc9DEFGHIJKLMNop0QRatUVW3X' in parents and name contains 'foo'"
 
 If the query contains literal ' or \ characters, these need to be escaped with
-\ characters. "'" becomes "\'" and "\" becomes "\\\", for example to match a 
+\ characters. "'" becomes "\'" and "\" becomes "\\\", for example to match a
 file named "foo ' \.txt":
 
 	rclone backend query drive: "name = 'foo \' \\\.txt'"

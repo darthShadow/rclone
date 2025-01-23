@@ -23,6 +23,7 @@ package vfs
 import (
 	"context"
 	_ "embed"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -530,7 +531,7 @@ func (vfs *VFS) OpenFile(name string, flags int, perm os.FileMode) (fd Handle, e
 
 	node, err := vfs.Stat(name)
 	if err != nil {
-		if err != ENOENT || flags&os.O_CREATE == 0 {
+		if !errors.Is(err, ENOENT) || flags&os.O_CREATE == 0 {
 			return nil, err
 		}
 		// If not found and O_CREATE then create the file
