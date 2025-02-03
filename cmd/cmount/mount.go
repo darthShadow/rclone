@@ -62,9 +62,9 @@ func mountOptions(VFS *vfs.VFS, device string, mountpoint string, opt *mountlib.
 		if runtime.GOOS != "openbsd" {
 			options = append(options, "-o", fmt.Sprintf("max_readahead=%d", opt.MaxReadAhead))
 			// This causes FUSE to supply O_TRUNC with the Open
-			// call which is more efficient for cmount.  However
-			// it does not work with cgofuse on Windows with
-			// WinFSP so cmount must work with or without it.
+			// call which is more efficient for cmount.
+			// However, it does not work with cgofuse on Windows
+			// with WinFSP so cmount must work with or without it.
 			options = append(options, "-o", "atomic_o_trunc")
 		}
 		if opt.DaemonTimeout != 0 {
