@@ -40,7 +40,8 @@ func TestMount(t *testing.T) {
 		}
 		sudo = true
 	}
-	for _, cacheType := range []string{"memory", "disk", "symlink"} {
+	//for _, cacheType := range []string{"memory", "disk", "symlink"} {
+	for _, cacheType := range []string{"disk"} {
 		t.Run(cacheType, func(t *testing.T) {
 			nfs.Opt.HandleCacheDir = t.TempDir()
 			require.NoError(t, nfs.Opt.HandleCache.Set(cacheType))

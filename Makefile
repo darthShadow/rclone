@@ -1,3 +1,4 @@
+export TZ = UTC
 SHELL = bash
 # Branch we are working on
 BRANCH := $(or $(BUILD_SOURCEBRANCHNAME),$(lastword $(subst /, ,$(GITHUB_REF))),$(shell git rev-parse --abbrev-ref HEAD))
@@ -43,7 +44,7 @@ ifdef GOTAGS
 BUILDTAGS=-tags "$(GOTAGS)"
 LINTTAGS=--build-tags "$(GOTAGS)"
 endif
-LDFLAGS=--ldflags "-s -X github.com/rclone/rclone/fs.Version=$(TAG)"
+LDFLAGS=--ldflags "-s -w -X github.com/rclone/rclone/fs.Version=$(TAG)"
 
 .PHONY: rclone test_all vars version fetch-gui fetch-gui-and-commit
 
@@ -51,7 +52,7 @@ rclone:
 ifeq ($(GO_OS),windows)
 	go run bin/resource_windows.go -version $(TAG) -syso resource_windows_`go env GOARCH`.syso
 endif
-	go build -v $(LDFLAGS) $(BUILDTAGS) $(BUILD_ARGS)
+	go build -pgo=./profiles/rclone.pprof -v $(LDFLAGS) $(BUILDTAGS) $(BUILD_ARGS)
 ifeq ($(GO_OS),windows)
 	rm resource_windows_`go env GOARCH`.syso
 endif
@@ -98,13 +99,13 @@ test:	rclone test_all
 # cmd/gitannex end to end tests can take longer than that on slow CI
 # runners.
 quicktest:
-	RCLONE_CONFIG="/notfound" go test $(LDFLAGS) $(BUILDTAGS) -timeout 20m ./...
+	RCLONE_CONFIG="/notfound" go test $(BUILDTAGS) -timeout 20m ./...
 
 racequicktest:
-	RCLONE_CONFIG="/notfound" go test $(LDFLAGS) $(BUILDTAGS) -cpu=2 -race -timeout 20m ./...
+	RCLONE_CONFIG="/notfound" go test $(BUILDTAGS) -cpu=2 -race -timeout 20m ./...
 
 compiletest:
-	RCLONE_CONFIG="/notfound" go test $(LDFLAGS) $(BUILDTAGS) -run XXX ./...
+	RCLONE_CONFIG="/notfound" go test $(BUILDTAGS) -run XXX ./...
 
 # Do source code quality checks
 check:	rclone

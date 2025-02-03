@@ -1,0 +1,127 @@
+---
+# Github Actions release for rclone
+# -*- compile-command: "yamllint -f parsable personal-lint.yml" -*-
+
+name: Lint & Vulnerability Check
+
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref || github.run_id }}
+  cancel-in-progress: true
+
+# Trigger the workflow on push or pull request
+on:
+  push:
+    branches:
+      - '**'
+    tags:
+      - '**'
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      manual:
+        description: Manual run (bypass default conditions)
+        type: boolean
+        default: true
+
+jobs:
+  lint:
+    if: inputs.manual || (github.repository == 'darthshadow/rclone' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.event.pull_request.base.repo.full_name))
+    timeout-minutes: 30
+    name: "lint"
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Get runner parameters
+        id: get-runner-parameters
+        run: |
+          echo "year-week=$(/bin/date -u "+%Y%V")" >> $GITHUB_OUTPUT
+          echo "runner-os-version=$ImageOS" >> $GITHUB_OUTPUT
+
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+
+      - name: Install Go
+        id: setup-go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c  # v6.4.0
+        with:
+          go-version: '>=1.27.0-rc.1'
+          check-latest: true
+          cache: false
+
+      - name: Set Go Cache Paths
+        run: |
+          echo "GOMODCACHE=$GITHUB_WORKSPACE/.gomodcache" >> "$GITHUB_ENV"
+          echo "GOCACHE=$(go env GOCACHE)" >> "$GITHUB_ENV"
+
+      # Use the same Linux module key as personal-build; lint/build caches
+      # keep their own rotation because their contents are job-specific.
+      - name: Load Go Module Cache
+        id: gomod-cache
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae  # v5.0.5
+        with:
+          path: |
+            ${{ github.workspace }}/.gomodcache
+          key: go-mod-${{ runner.os }}-${{ hashFiles('**/go.mod') }}-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            go-mod-${{ runner.os }}-
+
+      - name: Load Lint & Build Caches
+        id: lint-cache
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae  # v5.0.5
+        with:
+          path: |
+            ${{ env.GOCACHE }}
+            ~/.cache/golangci-lint
+          key: golangci-lint-${{ steps.get-runner-parameters.outputs.runner-os-version }}-go${{ steps.setup-go.outputs.go-version }}-${{ steps.get-runner-parameters.outputs.year-week }}-${{ hashFiles('go.sum') }}
+          restore-keys: golangci-lint-${{ steps.get-runner-parameters.outputs.runner-os-version }}-go${{ steps.setup-go.outputs.go-version }}-${{ steps.get-runner-parameters.outputs.year-week }}-
+
+      - name: Code quality test (Linux)
+        uses: golangci/golangci-lint-action@82606bf257cbaff209d206a39f5134f0cfbfd2ee  # v9.2.1
+        with:
+          version: latest
+          skip-cache: true
+          args: --verbose
+
+      - name: Code quality test (macOS)
+        uses: golangci/golangci-lint-action@82606bf257cbaff209d206a39f5134f0cfbfd2ee  # v9.2.1
+        if: success() || failure()
+        env:
+          GOOS: "darwin"
+        with:
+          version: latest
+          skip-cache: true
+
+      - name: Install govulncheck
+        if: success() || failure()
+        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+
+      - name: Scan for vulnerabilities
+        run: govulncheck ./...
+
+      - name: Trim Go Module Cache
+        if: always() && github.ref_name == github.event.repository.default_branch && github.event_name != 'pull_request'
+        run: |
+          find "$GOMODCACHE/cache/download" -name '*.zip' -type f -delete 2>/dev/null || true
+
+      - name: Save Lint & Build Caches
+        if: always() && github.ref_name == github.event.repository.default_branch && github.event_name != 'pull_request' && steps.lint-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae  # v5.0.5
+        with:
+          path: |
+            ${{ env.GOCACHE }}
+            ~/.cache/golangci-lint
+          key: golangci-lint-${{ steps.get-runner-parameters.outputs.runner-os-version }}-go${{ steps.setup-go.outputs.go-version }}-${{ steps.get-runner-parameters.outputs.year-week }}-${{ hashFiles('go.sum') }}
+
+      - name: Save Go Module Cache
+        if: always() && github.ref_name == github.event.repository.default_branch && github.event_name != 'pull_request' && steps.gomod-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae  # v5.0.5
+        with:
+          path: |
+            ${{ github.workspace }}/.gomodcache
+          key: go-mod-${{ runner.os }}-${{ hashFiles('**/go.mod') }}-${{ hashFiles('**/go.sum') }}
