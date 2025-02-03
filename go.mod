@@ -2,6 +2,8 @@ module github.com/rclone/rclone
 
 go 1.24.0
 
+toolchain go1.24.4
+
 require (
 	bazil.org/fuse v0.0.0-20230120002735-62a210ff1fd5
 	github.com/Azure/azure-sdk-for-go/sdk/azcore v1.18.2
@@ -9,7 +11,7 @@ require (
 	github.com/Azure/azure-sdk-for-go/sdk/storage/azblob v1.6.2
 	github.com/Azure/azure-sdk-for-go/sdk/storage/azfile v1.5.2
 	github.com/Azure/go-ntlmssp v0.0.0-20221128193559-754e69321358
-	github.com/Files-com/files-sdk-go/v3 v3.2.218
+	github.com/Files-com/files-sdk-go/v3 v3.2.221
 	github.com/Max-Sum/base32768 v0.0.0-20230304063302-18e6ce5945fd
 	github.com/a8m/tree v0.0.0-20240104212747-2c8764a5f17e
 	github.com/aalpar/deheap v0.0.0-20210914013432-0cc84d79dec3
@@ -73,7 +75,7 @@ require (
 	github.com/t3rm1n4l/go-mega v0.0.0-20241213151442-a19cff0ec7b5
 	github.com/unknwon/goconfig v1.0.0
 	github.com/willscott/go-nfs v0.0.3
-	github.com/winfsp/cgofuse v1.6.0
+	github.com/winfsp/cgofuse v1.6.1-0.20250813110601-7d90b0992471
 	github.com/xanzy/ssh-agent v0.3.3
 	github.com/youmark/pkcs8 v0.0.0-20240726163527-a2c0da244d78
 	github.com/yunify/qingstor-sdk-go/v3 v3.2.0
@@ -95,7 +97,7 @@ require (
 )
 
 require (
-	cloud.google.com/go/auth v0.16.4 // indirect
+	cloud.google.com/go/auth v0.16.5 // indirect
 	cloud.google.com/go/auth/oauth2adapt v0.2.8 // indirect
 	cloud.google.com/go/compute/metadata v0.8.0 // indirect
 	github.com/Azure/azure-sdk-for-go/sdk/internal v1.11.2 // indirect
@@ -223,7 +225,7 @@ require (
 	go.opentelemetry.io/otel/metric v1.37.0 // indirect
 	go.opentelemetry.io/otel/trace v1.37.0 // indirect
 	go.yaml.in/yaml/v2 v2.4.2 // indirect
-	golang.org/x/exp v0.0.0-20250811191247-51f88131bc50 // indirect
+	golang.org/x/exp v0.0.0-20250813145105-42675adae3e6 // indirect
 	golang.org/x/tools v0.36.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20250811230008-5f3141c8851a // indirect
 	google.golang.org/grpc v1.74.2 // indirect
@@ -244,6 +246,6 @@ require (
 	github.com/ProtonMail/go-crypto v1.3.0
 	github.com/golang-jwt/jwt/v4 v4.5.2
 	github.com/pkg/xattr v0.4.12
-	golang.org/x/mobile v0.0.0-20250808145247-395d808d53cd
+	golang.org/x/mobile v0.0.0-20250813145510-f12310a0cfd9
 	golang.org/x/term v0.34.0
 )

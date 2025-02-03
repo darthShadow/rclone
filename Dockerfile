@@ -1,3 +1,11 @@
+# Mounts of type=cache are not exported:
+# RUN --mount=type=cache,target=/root/.cache/go-build
+# They can possible be re-used by separating the import & export stages:
+# https://github.com/docker/buildx/issues/244#issuecomment-602750160
+# Further references:
+# https://github.com/FerretDB/FerretDB/issues/2170
+# https://github.com/moby/buildkit/issues/1512
+
 FROM golang:alpine AS builder
 
 ARG CGO_ENABLED=0
@@ -14,23 +22,21 @@ RUN echo "**** Install Dependencies ****" && \
         gawk \
         git
 
-COPY go.mod .
-COPY go.sum .
-
-RUN echo "**** Download Go Dependencies ****" && \
-    go mod download -x
-
-RUN echo "**** Verify Go Dependencies ****" && \
+RUN --mount=type=bind,source=go.sum,target=go.sum \
+    --mount=type=bind,source=go.mod,target=go.mod \
+    echo "**** Download Go Dependencies ****" && \
+    go mod download -x && \
+    echo "**** Verify Go Dependencies ****" && \
     go mod verify
 
-COPY . .
-
-RUN --mount=type=cache,target=/root/.cache/go-build,sharing=locked \
+# The written content will not be persisted back to the host
+RUN --mount=type=bind,source=.,target=.,rw \
     echo "**** Build Binary ****" && \
-    make
+    make && \
+    cp -vf ./rclone /tmp/rclone
 
 RUN echo "**** Print Version Binary ****" && \
-    ./rclone version
+    /tmp/rclone version
 
 # Begin final image
 FROM alpine:latest
@@ -43,7 +49,7 @@ RUN echo "**** Install Dependencies ****" && \
     echo "Enable user_allow_other in fuse" && \
     echo "user_allow_other" >> /etc/fuse.conf
 
-COPY --from=builder /go/src/github.com/rclone/rclone/rclone /usr/local/bin/
+COPY --from=builder /tmp/rclone /usr/local/bin/
 
 RUN addgroup -g 1009 rclone && adduser -u 1009 -Ds /bin/sh -G rclone rclone
 
