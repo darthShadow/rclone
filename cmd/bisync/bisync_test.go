@@ -277,7 +277,6 @@ func testBisync(t *testing.T, path1, path2 string) {
 		ci.RefreshTimes = true
 	}
 	bisync.Colors = true
-	time.Local = bisync.TZ
 	ci.FsCacheExpireDuration = fs.Duration(5 * time.Hour)
 
 	baseDir, err := os.Getwd()

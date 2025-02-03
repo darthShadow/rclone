@@ -1,0 +1,284 @@
+---
+# Github Actions release for rclone
+# -*- compile-command: "yamllint -f parsable personal-build.yml" -*-
+
+name: Build & Push Personal Binary Builds
+
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref || github.run_id }}
+  cancel-in-progress: true
+
+# Trigger the workflow on push or pull request
+on:
+  push:
+    branches:
+      - '**'
+    tags:
+      - '**'
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      manual:
+        description: Manual run (bypass default conditions)
+        type: boolean
+        default: true
+
+jobs:
+  build:
+    if: inputs.manual || (github.repository == 'darthshadow/rclone' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.event.pull_request.base.repo.full_name))
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - job_name: linux-20.04
+            platform: linux/amd64
+            os: ubuntu-22.04
+            container: 'ubuntu:20.04'
+            go: '>=1.25.0-rc.1'
+            gotags: 'cmount'
+            cgo: '1'
+            build_flags: '-include "^linux/"'
+            check: true
+            quicktest: false
+            racequicktest: false
+            librclonetest: false
+
+          - job_name: linux-22.04
+            platform: linux/amd64
+            os: ubuntu-22.04
+            container: ''
+            go: '>=1.25.0-rc.1'
+            gotags: 'cmount'
+            cgo: '1'
+            build_flags: '-include "^linux/"'
+            check: true
+            quicktest: true
+            racequicktest: true
+            librclonetest: true
+
+          - job_name: linux-24.04
+            platform: linux/amd64
+            os: ubuntu-24.04
+            container: ''
+            go: '>=1.25.0-rc.1'
+            gotags: 'cmount'
+            cgo: '1'
+            build_flags: '-include "^linux/"'
+            check: true
+            quicktest: true
+            racequicktest: true
+            librclonetest: true
+
+          - job_name: mac-arm64
+            platform: darwin/arm64
+            os: macos-latest
+            go: '>=1.25.0-rc.1'
+            gotags: 'cmount'
+            cgo: '1'
+            build_flags: '-include "^darwin/arm64" -cgo -macos-arch arm64 -cgo-cflags=-I/usr/local/include -cgo-ldflags=-L/usr/local/lib'
+            check: true
+            quicktest: false
+            racequicktest: false
+
+    name: Build Binary for ${{ matrix.platform }} on ${{ matrix.job_name }}
+    runs-on: ${{ matrix.os }}
+    container: ${{ matrix.container }}
+
+    steps:
+      - name: Install Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+          check-latest: true
+          cache: false
+
+      - name: Install sudo on Linux
+        shell: bash
+        run: |
+          apt-get update -y
+          apt-get install -y sudo
+        if: matrix.os != 'macos-latest' && matrix.container != ''
+
+      - name: Install FUSE & Libraries on Linux
+        shell: bash
+        run: |
+          sudo apt-get update -y
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential ca-certificates curl gpg jq kmod software-properties-common
+          sudo add-apt-repository -y ppa:git-core/ppa
+          curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo gpg --dearmor -o /usr/share/keyrings/githubcli-archive-keyring.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+          sudo apt-get update -y
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y git gh
+          # sudo modprobe fuse
+          # sudo chmod 666 /dev/fuse
+          sudo apt-get install -y fuse3 libfuse2 libfuse-dev libfuse3-3 libfuse3-dev rpm pkg-config git-annex upx git-annex-remote-rclone nfs-common
+          sudo chown root:$USER /etc/fuse.conf
+        if: matrix.os != 'macos-latest'
+
+      - name: Install FUSE & Libraries on macOS
+        shell: bash
+        run: |
+          # https://github.com/Homebrew/brew/issues/15621#issuecomment-1619266788
+          # https://github.com/orgs/Homebrew/discussions/4612#discussioncomment-6319008
+          unset HOMEBREW_NO_INSTALL_FROM_API
+          brew untap --force homebrew/core
+          brew untap --force homebrew/cask
+          brew update
+          brew install --cask macfuse
+          brew install git-annex git-annex-remote-rclone
+        if: matrix.os == 'macos-latest'
+
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fix Git Permissions
+        shell: bash
+        run: |
+          git config --global --add safe.directory `pwd`
+          sudo git config --global --add safe.directory `pwd`
+
+      - name: Set Environment Variables
+        shell: bash
+        run: |
+          echo 'GOTAGS=${{ matrix.gotags }}' >> $GITHUB_ENV
+          echo 'BUILD_FLAGS=${{ matrix.build_flags }}' >> $GITHUB_ENV
+          echo 'BUILD_ARGS=${{ matrix.build_args }}' >> $GITHUB_ENV
+          echo "GOMODCACHE=$(go env GOMODCACHE)" >> $GITHUB_ENV
+          echo "GOCACHE=$(go env GOCACHE)" >> $GITHUB_ENV
+          if [[ "${{ matrix.goarch }}" != "" ]]; then echo 'GOARCH=${{ matrix.goarch }}' >> $GITHUB_ENV ; fi
+          if [[ "${{ matrix.cgo }}" != "" ]]; then echo 'CGO_ENABLED=${{ matrix.cgo }}' >> $GITHUB_ENV ; fi
+
+      - name: Set PLATFORM Variable
+        shell: bash
+        run: |
+          platform=${{ matrix.platform }}
+          echo "PLATFORM=${platform//\//-}" >> $GITHUB_ENV
+
+      - name: Set CACHE_PREFIX Variable
+        shell: bash
+        run: |
+          cache_prefix=${{ runner.os }}-ubuntu20-${{ env.PLATFORM }}-go
+          echo "CACHE_PREFIX=${cache_prefix}" >> $GITHUB_ENV
+        if: matrix.container != ''
+
+      - name: Get ImageOS
+        # There's no way around this, because "ImageOS" is only available to
+        # processes, but the setup-go action uses it in its key.
+        id: imageos
+        uses: actions/github-script@v7
+        with:
+          result-encoding: string
+          script: |
+            return process.env.ImageOS
+        if: matrix.container == ''
+
+      - name: Set CACHE_PREFIX Variable
+        shell: bash
+        run: |
+          cache_prefix=${{ runner.os }}-${{ steps.imageos.outputs.result }}-${{ env.PLATFORM }}-go
+          echo "CACHE_PREFIX=${cache_prefix}" >> $GITHUB_ENV
+        if: matrix.container == ''
+
+      - name: Print Go Version and Environment
+        shell: bash
+        run: |
+          printf "Using go at: $(which go)\n"
+          printf "Go version: $(go version)\n"
+          printf "\n\nGo environment:\n\n"
+          go env
+          printf "\n\nRclone environment:\n\n"
+          make vars
+          printf "\n\nSystem environment:\n\n"
+          env
+
+      - name: Load Go Module Cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.GOMODCACHE }}
+          key: ${{ env.CACHE_PREFIX }}-modcache-${{ hashFiles('**/go.mod') }}-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ env.CACHE_PREFIX }}-modcache
+
+      - name: Load Go Build & Test Cache
+        id: go-cache
+        uses: actions/cache@v4
+        if: github.ref_name == github.event.repository.default_branch && github.event_name != 'pull_request'
+        with:
+          path: |
+            ${{ env.GOCACHE }}
+          key: ${{ env.CACHE_PREFIX }}-cache-${{ hashFiles('**/go.mod') }}-${{ hashFiles('**/go.sum') }}-${{ github.run_id }}
+          restore-keys: |
+            ${{ env.CACHE_PREFIX }}-cache
+
+      - name: Load Go Build & Test Cache
+        id: go-cache-restore
+        uses: actions/cache/restore@v4
+        if: github.ref_name != github.event.repository.default_branch || github.event_name == 'pull_request'
+        with:
+          path: |
+            ${{ env.GOCACHE }}
+          key: ${{ env.CACHE_PREFIX }}-cache-${{ hashFiles('**/go.mod') }}-${{ hashFiles('**/go.sum') }}-${{ github.run_id }}
+          restore-keys: |
+            ${{ env.CACHE_PREFIX }}-cache
+
+      - name: Build rclone
+        shell: bash
+        run: |
+          make
+          mkdir -p dist
+          cp -av "$(go env GOPATH)/bin/rclone$(go env GOEXE)" dist/rclone
+
+      - name: Compress rclone
+        shell: bash
+        run: |
+          upx -v dist/rclone
+        if: matrix.os != 'macos-latest'
+
+      - name: Print rclone version
+        shell: bash
+        run: |
+          ./dist/rclone version
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rclone-${{ matrix.job_name }}
+          path: dist/rclone
+          overwrite: true
+
+      - name: Update mtime
+        shell: bash
+        run: |
+          go run ./bin/go-test-cache/main.go
+
+      - name: Run Tests
+        shell: bash
+        run: |
+          make quicktest
+        if: matrix.quicktest
+
+      - name: Race Test
+        if: (success() || failure()) && matrix.racequicktest
+        shell: bash
+        run: |
+          make racequicktest
+
+      - name: Delete Existing Cache
+        if: (success() || failure()) && github.ref_name == github.event.repository.default_branch && github.event_name != 'pull_request' && steps.go-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cache_ids=($(gh cache list --key "${{ env.CACHE_PREFIX }}-cache" --json id | jq '.[].id'))
+          for cache_id in "${cache_ids[@]}"; do
+            echo "Deleting Cache: $cache_id"
+            gh cache delete "$cache_id"
+          done
