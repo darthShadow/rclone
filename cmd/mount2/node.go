@@ -6,6 +6,8 @@ import (
 	"context"
 	"os"
 	"path"
+	"slices"
+	"strings"
 	"syscall"
 
 	fusefs "github.com/hanwen/go-fuse/v2/fs"
@@ -245,79 +247,6 @@ func (n *Node) Opendir(ctx context.Context) syscall.Errno {
 
 var _ = (fusefs.NodeOpendirer)((*Node)(nil))
 
-type dirStream struct {
-	nodes []os.FileInfo
-	i     int
-}
-
-// HasNext indicates if there are further entries. HasNext
-// might be called on already closed streams.
-func (ds *dirStream) HasNext() bool {
-	return ds.i < len(ds.nodes)+2
-}
-
-// Next retrieves the next entry. It is only called if HasNext
-// has previously returned true.  The Errno return may be used to
-// indicate I/O errors
-func (ds *dirStream) Next() (de fuse.DirEntry, errno syscall.Errno) {
-	// defer log.Trace(nil, "")("de=%+v, errno=%v", &de, &errno)
-	if ds.i == 0 {
-		ds.i++
-		return fuse.DirEntry{
-			Mode: fuse.S_IFDIR,
-			Name: ".",
-			Ino:  0, // FIXME
-		}, 0
-	} else if ds.i == 1 {
-		ds.i++
-		return fuse.DirEntry{
-			Mode: fuse.S_IFDIR,
-			Name: "..",
-			Ino:  0, // FIXME
-		}, 0
-	}
-	fi := ds.nodes[ds.i-2]
-	de = fuse.DirEntry{
-		// Mode is the file's mode. Only the high bits (e.g. S_IFDIR)
-		// are considered.
-		Mode: getMode(fi),
-
-		// Name is the basename of the file in the directory.
-		Name: path.Base(fi.Name()),
-
-		// Ino is the inode number.
-		Ino: 0, // FIXME
-	}
-	ds.i++
-	return de, 0
-}
-
-// Close releases resources related to this directory
-// stream.
-func (ds *dirStream) Close() {
-}
-
-// Seekdir implements fusefs.FileSeekdirer so go-fuse can reposition the
-// directory stream. The kernel calls this both to rewind (lseek(fd, 0,
-// SEEK_SET) before a second getdents) and, for a kernel-NFS-exported mount,
-// to resume from a previously returned directory cookie: nfsd is stateless,
-// so it opens a fresh handle and seeks to the last offset on every readdir
-// continuation. Handling only offset 0 made go-fuse return ENOTSUP for those
-// resumes, so any listing spanning more than one readdir batch failed over NFS.
-//
-// dirStream is a snapshot taken at Readdir time and go-fuse assigns each entry
-// a sequential offset in Next() order (the entry yielded at index i carries
-// offset i+1), so repositioning to off means the next entry is the one at
-// index off. Values past the end clamp to EOF via HasNext.
-// See: https://github.com/hanwen/go-fuse/issues/549
-func (ds *dirStream) Seekdir(_ context.Context, off uint64) syscall.Errno {
-	ds.i = int(off)
-	return 0
-}
-
-var _ fusefs.DirStream = (*dirStream)(nil)
-var _ fusefs.FileSeekdirer = (*dirStream)(nil)
-
 // Readdir opens a stream of directory entries.
 //
 // Readdir essentially returns a list of strings, and it is allowed
@@ -335,23 +264,37 @@ func (n *Node) Readdir(ctx context.Context) (ds fusefs.DirStream, errno syscall.
 	if errno != 0 {
 		return nil, errno
 	}
-	fh, err := vfsDir.Open(os.O_RDONLY)
+	items, err := vfs.MapReadDir[fuse.DirEntry](vfsDir, func(n vfs.Node) (fuse.DirEntry, error) {
+		return fuse.DirEntry{
+			// Mode is the file's mode. Only the high bits (e.g. S_IFDIR)
+			// are considered.
+			Mode: getMode(n),
+
+			// Name is the basename of the file in the directory.
+			Name: path.Base(n.Name()),
+
+			// Ino is the inode number.
+			Ino: 0, // FIXME
+		}, nil
+	}, 2)
 	if err != nil {
 		return nil, translateError(err)
 	}
-	defer func() {
-		closeErr := fh.Close()
-		if errno == 0 && closeErr != nil {
-			errno = translateError(closeErr)
-		}
-	}()
-	items, err := fh.Readdir(-1)
-	if err != nil {
-		return nil, translateError(err)
+
+	items[0] = fuse.DirEntry{
+		Mode: fuse.S_IFDIR,
+		Name: ".",
+		Ino:  0, // FIXME
 	}
-	return &dirStream{
-		nodes: items,
-	}, 0
+	items[1] = fuse.DirEntry{
+		Mode: fuse.S_IFDIR,
+		Name: "..",
+		Ino:  0, // FIXME
+	}
+	slices.SortFunc(items, func(a, b fuse.DirEntry) int {
+		return strings.Compare(a.Name, b.Name)
+	})
+	return fusefs.NewListDirStream(items), 0
 }
 
 var _ = (fusefs.NodeReaddirer)((*Node)(nil))
