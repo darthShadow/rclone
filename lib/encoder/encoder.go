@@ -149,6 +149,7 @@ func init() {
 	alias("RightCrLfHtVt", EncodeRightCrLfHtVt)
 	alias("InvalidUtf8", EncodeInvalidUtf8)
 	alias("Dot", EncodeDot)
+	alias("Standard", Standard)
 }
 
 // ValidStrings returns all the valid MultiEncoder strings

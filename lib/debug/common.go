@@ -16,3 +16,9 @@ func SetGCPercent(percent int) int {
 func SetMemoryLimit(limit int64) int64 {
 	return debug.SetMemoryLimit(limit)
 }
+
+// FreeOSMemory calls the runtime/debug.FreeOSMemory function to free memory
+// that is no longer in use.
+func FreeOSMemory() {
+	debug.FreeOSMemory()
+}

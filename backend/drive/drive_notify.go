@@ -2,9 +2,9 @@ package drive
 
 import (
 	"context"
-	"path"
 
 	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/lib/join"
 	"google.golang.org/api/drive/v3"
 )
 
@@ -169,7 +169,7 @@ func (f *Fs) changeNotifyRunner(ctx context.Context, notifyFunc func(string, fs.
 						// translate the parent dir of this object
 						if parentPath, ok := f.dirCache.GetInv(parent); ok {
 							// and append the drive file name to compute the full file name
-							newPath := path.Join(parentPath, change.File.Name)
+							newPath := join.PathJoin(parentPath, change.File.Name)
 							// this will now clear the actual file too
 							pathsToClear = append(pathsToClear, entryType{
 								path: newPath, entryType: changeType})

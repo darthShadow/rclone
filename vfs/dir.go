@@ -3,10 +3,11 @@ package vfs
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -19,6 +20,7 @@ import (
 	"github.com/rclone/rclone/fs/object"
 	"github.com/rclone/rclone/fs/operations"
 	"github.com/rclone/rclone/fs/walk"
+	"github.com/rclone/rclone/lib/join"
 	"github.com/rclone/rclone/vfs/vfscommon"
 	"golang.org/x/text/unicode/norm"
 )
@@ -84,6 +86,7 @@ func (d *Dir) cacheCleanup() {
 	when := time.Now()
 
 	d.mu.Lock()
+	// Check if the directory has been read since the last cleanup
 	_, stale := d._age(when)
 	d.mu.Unlock()
 
@@ -287,10 +290,10 @@ func (d *Dir) invalidateDir(absPath string) {
 // changeNotify invalidates the directory cache for the relativePath
 // passed in.
 //
-// if entryType is a directory it invalidates the parent of the directory too.
+// if entryType is a directory, it invalidates the parent of the directory too.
 func (d *Dir) changeNotify(relativePath string, entryType fs.EntryType) {
 	d.mu.RLock()
-	absPath := path.Join(d.path, relativePath)
+	absPath := join.PathJoin(d.path, relativePath)
 	d.mu.RUnlock()
 
 	defer log.Trace(d.path, "relativePath=%q, absPath=%q, type=%v", relativePath, absPath,
@@ -316,7 +319,7 @@ func (d *Dir) changeNotify(relativePath string, entryType fs.EntryType) {
 func (d *Dir) ForgetPath(relativePath string, entryType fs.EntryType) {
 	defer log.Trace(d.path, "relativePath=%q, type=%v", relativePath, entryType)("")
 	d.mu.RLock()
-	absPath := path.Join(d.path, relativePath)
+	absPath := join.PathJoin(d.path, relativePath)
 	d.mu.RUnlock()
 	if absPath != "" {
 		d.invalidateDir(vfscommon.FindParent(absPath))
@@ -395,7 +398,7 @@ func (d *Dir) renameTree(dirPath string) {
 	for leaf, node := range d.items {
 		switch x := node.(type) {
 		case *Dir:
-			x.renameTree(path.Join(dirPath, leaf))
+			x.renameTree(join.PathJoin(dirPath, leaf))
 		case *File:
 			x.renameDir(dirPath)
 		default:
@@ -488,7 +491,7 @@ func (d *Dir) AddVirtual(leaf string, size int64, isDir bool) {
 		return
 	}
 	if isDir {
-		remote := path.Join(dPath, leaf)
+		remote := join.PathJoin(dPath, leaf)
 		entry := fs.NewDir(remote, time.Now())
 		node = newDir(d.vfs, d.f, d, entry)
 	} else {
@@ -547,8 +550,9 @@ func (d *Dir) _readDir() error {
 	} else {
 		return nil
 	}
+
 	entries, err := list.DirSorted(context.TODO(), d.f, false, d.path)
-	if err == fs.ErrorDirNotFound {
+	if errors.Is(err, fs.ErrorDirNotFound) {
 		// We treat directory not found as empty because we
 		// create directories on the fly
 	} else if err != nil {
@@ -559,13 +563,18 @@ func (d *Dir) _readDir() error {
 		ci := fs.GetConfig(context.TODO())
 
 		// sort entries such that NFD comes before NFC of same name
-		sort.Slice(entries, func(i, j int) bool {
-			if entries[i] != entries[j] && fs.DirEntryType(entries[i]) == fs.DirEntryType(entries[j]) && norm.NFC.String(entries[i].Remote()) == norm.NFC.String(entries[j].Remote()) {
-				if norm.NFD.IsNormalString(entries[i].Remote()) && !norm.NFD.IsNormalString(entries[j].Remote()) {
-					return true
+		slices.SortFunc(entries, func(entryA, entryB fs.DirEntry) int {
+			if entryA != entryB && fs.DirEntryType(entryA) == fs.DirEntryType(entryB) {
+				if norm.NFC.String(entryA.Remote()) == norm.NFC.String(entryB.Remote()) {
+					if norm.NFD.IsNormalString(entryA.Remote()) && !norm.NFD.IsNormalString(entryB.Remote()) {
+						return 1
+					}
+					if !norm.NFD.IsNormalString(entryA.Remote()) && norm.NFD.IsNormalString(entryB.Remote()) {
+						return -1
+					}
 				}
 			}
-			return entries.Less(i, j)
+			return fs.CompareDirEntries(entryA, entryB)
 		})
 
 		// detect dupes, remove them from the list and log an error
@@ -1022,13 +1031,16 @@ func (d *Dir) ReadDirAll() (items Nodes, err error) {
 		items = append(items, item)
 	}
 	d.mu.Unlock()
-	sort.Sort(items)
+	// Compare only the leaf strings of the nodes
+	slices.SortFunc(items, func(a, b Node) int {
+		return strings.Compare(a.Name(), b.Name())
+	})
 	// fs.Debugf(d.path, "Dir.ReadDirAll OK with %d entries", len(items))
 	return items, nil
 }
 
 // accessModeMask masks off the read modes from the flags
-const accessModeMask = (os.O_RDONLY | os.O_WRONLY | os.O_RDWR)
+const accessModeMask = os.O_RDONLY | os.O_WRONLY | os.O_RDWR
 
 // Open the directory according to the flags provided
 func (d *Dir) Open(flags int) (fd Handle, err error) {
@@ -1076,7 +1088,7 @@ func (d *Dir) Mkdir(name string) (*Dir, error) {
 	if d.vfs.Opt.ReadOnly {
 		return nil, EROFS
 	}
-	path := path.Join(d.path, name)
+	path := join.PathJoin(d.path, name)
 	node, err := d.stat(name)
 	switch err {
 	case ENOENT:
@@ -1189,8 +1201,8 @@ func (d *Dir) Rename(oldName, newName string, destDir *Dir) error {
 	if d.vfs.Opt.ReadOnly {
 		return EROFS
 	}
-	oldPath := path.Join(d.path, oldName)
-	newPath := path.Join(destDir.path, newName)
+	oldPath := join.PathJoin(d.path, oldName)
+	newPath := join.PathJoin(destDir.path, newName)
 	// fs.Debugf(oldPath, "Dir.Rename to %q", newPath)
 	oldNode, err := d.stat(oldName)
 	if err != nil {
