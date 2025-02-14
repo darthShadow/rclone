@@ -1121,18 +1121,11 @@ func (d *Dir) Stat(name string) (node Node, err error) {
 
 // ReadDirAll reads the contents of the directory sorted
 func (d *Dir) ReadDirAll() (items Nodes, err error) {
-	// fs.Debugf(d.path, "Dir.ReadDirAll")
-	d.mu.Lock()
-	err = d._readDir()
+	items, err = MapReadDir(d, func(n Node) (Node, error) { return n, nil }, 0)
 	if err != nil {
-		fs.Debugf(d.path, "Dir.ReadDirAll error: %v", err)
-		d.mu.Unlock()
+		fs.Debugf(d.Path(), "Dir.ReadDirAll error: %v", err)
 		return nil, err
 	}
-	for _, item := range d.items {
-		items = append(items, item)
-	}
-	d.mu.Unlock()
 	// Compare only the leaf strings of the nodes
 	slices.SortFunc(items, func(a, b Node) int {
 		return strings.Compare(a.Name(), b.Name())
@@ -1410,4 +1403,29 @@ func (d *Dir) Fs() fs.Fs {
 // Truncate changes the size of the named file.
 func (d *Dir) Truncate(size int64) error {
 	return ENOSYS
+}
+
+// MapReadDir applies a conversion function to all nodes returned from a readdir of the directory
+// and returns a slice of results
+func MapReadDir[T any](d *Dir, convertNode func(Node) (T, error), existingItemCount int) (items []T, err error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	err = d._readDir()
+	if err != nil {
+		return nil, err
+	}
+
+	// Initialize slice with existingItemCount length to preserve existing items
+	items = make([]T, existingItemCount, existingItemCount+len(d.items))
+
+	for _, item := range d.items {
+		itemT, err := convertNode(item)
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, itemT)
+	}
+
+	return items, nil
 }
