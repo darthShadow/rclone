@@ -17,6 +17,7 @@ import (
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/log"
 	"github.com/rclone/rclone/fs/operations"
+	"github.com/rclone/rclone/lib/join"
 	"github.com/rclone/rclone/vfs/vfscommon"
 )
 
@@ -143,15 +144,14 @@ func (f *File) Name() (name string) {
 // _path returns the full path of the file
 // use when lock is held
 func (f *File) _path() string {
-	return path.Join(f.dPath, f.leaf)
+	return join.PathJoin(f.dPath, f.leaf)
 }
 
 // Path returns the full path of the file
 func (f *File) Path() string {
 	f.mu.RLock()
-	dPath, leaf := f.dPath, f.leaf
-	f.mu.RUnlock()
-	return path.Join(dPath, leaf)
+	defer f.mu.RUnlock()
+	return f._path()
 }
 
 // _fixCachePath returns fullPath with the fs.LinkSuffix added if appropriate
@@ -170,7 +170,7 @@ func (f *File) _cachePath() string {
 	if f.isLink {
 		leaf += fs.LinkSuffix
 	}
-	return path.Join(dPath, leaf)
+	return join.PathJoin(dPath, leaf)
 }
 
 // CachePath returns the full path of the file with the fs.LinkSuffix if appropriate
@@ -204,9 +204,10 @@ func (f *File) Node() Node {
 
 // renameDir - call when parent directory has been renamed
 func (f *File) renameDir(dPath string) {
-	f.mu.RLock()
+	// TODO: Why was this a RLock?
+	f.mu.Lock()
 	f.dPath = dPath
-	f.mu.RUnlock()
+	f.mu.Unlock()
 }
 
 // applyPendingRename runs a previously set rename operation if there are no
@@ -243,7 +244,7 @@ func (f *File) rename(ctx context.Context, destDir *Dir, newName string) error {
 	}
 
 	// File.mu is unlocked here to call Dir.Path()
-	newPath := path.Join(destDir.Path(), newCacheName)
+	newPath := join.PathJoin(destDir.Path(), newCacheName)
 
 	renameCall := func(ctx context.Context) (err error) {
 		// chain rename calls if any
@@ -779,7 +780,7 @@ func (f *File) resolveNode() (target Node, err error) {
 		// Symlinks are relative to their file node
 		if !path.IsAbs(targetPath) {
 			basePath := path.Dir(f.Path())
-			targetPath = path.Join(basePath, targetPath)
+			targetPath = join.PathJoin(basePath, targetPath)
 		}
 
 		// Clean the path, rclone style

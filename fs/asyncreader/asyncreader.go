@@ -125,7 +125,6 @@ func (a *AsyncReader) getBuffer() *buffer {
 	}
 }
 
-// Read will return the next available data.
 func (a *AsyncReader) fill() (err error) {
 	if a.cur.isEmpty() {
 		if a.cur != nil {

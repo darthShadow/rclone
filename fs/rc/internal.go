@@ -162,7 +162,10 @@ memory problems.
 
 // Do a garbage collection run
 func rcGc(ctx context.Context, in Params) (out Params, err error) {
+	oldGCPercent := debug.SetGCPercent(25)
 	runtime.GC()
+	debug.FreeOSMemory()
+	_ = debug.SetGCPercent(oldGCPercent)
 	return nil, nil
 }
 

@@ -82,7 +82,7 @@ type Nodes []Node
 // Sort functions
 func (ns Nodes) Len() int           { return len(ns) }
 func (ns Nodes) Swap(i, j int)      { ns[i], ns[j] = ns[j], ns[i] }
-func (ns Nodes) Less(i, j int) bool { return ns[i].Path() < ns[j].Path() }
+func (ns Nodes) Less(i, j int) bool { return strings.Compare(ns[i].Name(), ns[j].Name()) == -1 } // Compare only the leaf strings of the nodes
 
 // Noder represents something which can return a node
 type Noder interface {
@@ -297,6 +297,7 @@ func (vfs *VFS) Stats() (out rc.Params) {
 	if vfs.cache != nil {
 		out["diskCache"] = vfs.cache.Stats()
 	}
+
 	return out
 }
 
@@ -325,7 +326,7 @@ func (vfs *VFS) SetCacheMode(cacheMode vfscommon.CacheMode) {
 	vfs.cache = nil
 	if cacheMode > vfscommon.CacheModeOff {
 		ctx, cancel := context.WithCancel(context.Background())
-		cache, err := vfscache.New(ctx, vfs.f, &vfs.Opt, vfs.AddVirtual) // FIXME pass on context or get from Opt?
+		vfsCache, err := vfscache.New(ctx, vfs.f, &vfs.Opt, vfs.AddVirtual) // FIXME pass on context or get from Opt?
 		if err != nil {
 			fs.Errorf(nil, "Failed to create vfs cache - disabling: %v", err)
 			vfs.Opt.CacheMode = vfscommon.CacheModeOff
@@ -334,7 +335,7 @@ func (vfs *VFS) SetCacheMode(cacheMode vfscommon.CacheMode) {
 		}
 		vfs.Opt.CacheMode = cacheMode
 		vfs.cancelCache = cancel
-		vfs.cache = cache
+		vfs.cache = vfsCache
 	}
 }
 
