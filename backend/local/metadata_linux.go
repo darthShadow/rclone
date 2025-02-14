@@ -107,7 +107,7 @@ func readMetadataFromFileFstatat(o *Object, m *fs.Metadata) (err error) {
 	}
 	setTime := func(key string, t unix.Timespec) {
 		// The types of t.Sec and t.Nsec vary from int32 to int64 on
-		// different Linux architectures so we need to cast them to
+		// different Linux architectures, so we need to cast them to
 		// int64 here and hence need to quiet the linter about
 		// unnecessary casts.
 		//

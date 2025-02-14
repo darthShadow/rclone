@@ -60,7 +60,7 @@ func (fh *DirHandle) Readdir(n int) (fis []os.FileInfo, err error) {
 		if err != nil {
 			return nil, err
 		}
-		fh.fis = []os.FileInfo{}
+		fh.fis = make([]os.FileInfo, 0, len(nodes))
 		for _, node := range nodes {
 			fh.fis = append(fh.fis, node)
 		}
