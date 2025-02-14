@@ -83,9 +83,13 @@ var (
 type Nodes []Node
 
 // Sort functions
-func (ns Nodes) Len() int           { return len(ns) }
-func (ns Nodes) Swap(i, j int)      { ns[i], ns[j] = ns[j], ns[i] }
-func (ns Nodes) Less(i, j int) bool { return ns[i].Path() < ns[j].Path() }
+func (ns Nodes) Len() int      { return len(ns) }
+func (ns Nodes) Swap(i, j int) { ns[i], ns[j] = ns[j], ns[i] }
+
+// Less orders nodes by leaf name (not full Path()). Fork divergence from upstream:
+// callers of Nodes sort siblings of a single directory, so the shared parent prefix
+// in Path() is wasted comparison work; leaf-only compare matches dir.go ReadDirAll.
+func (ns Nodes) Less(i, j int) bool { return strings.Compare(ns[i].Name(), ns[j].Name()) == -1 }
 
 // Noder represents something which can return a node
 type Noder interface {
@@ -340,6 +344,7 @@ func (vfs *VFS) Stats() (out rc.Params) {
 	if vfs.cache != nil {
 		out["diskCache"] = vfs.cache.Stats()
 	}
+
 	return out
 }
 
@@ -374,7 +379,7 @@ func (vfs *VFS) SetCacheMode(cacheMode vfscommon.CacheMode) {
 	vfs.cache = nil
 	if cacheMode > vfscommon.CacheModeOff {
 		ctx, cancel := context.WithCancel(vfs.ctx)
-		cache, err := vfscache.New(ctx, vfs.f, &vfs.Opt, vfs.AddVirtual)
+		vfsCache, err := vfscache.New(ctx, vfs.f, &vfs.Opt, vfs.AddVirtual)
 		if err != nil {
 			fs.Errorf(nil, "Failed to create vfs cache - disabling: %v", err)
 			vfs.Opt.CacheMode = vfscommon.CacheModeOff
@@ -383,7 +388,7 @@ func (vfs *VFS) SetCacheMode(cacheMode vfscommon.CacheMode) {
 		}
 		vfs.Opt.CacheMode = cacheMode
 		vfs.cancelCache = cancel
-		vfs.cache = cache
+		vfs.cache = vfsCache
 	}
 }
 

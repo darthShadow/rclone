@@ -96,7 +96,7 @@ type Object interface {
 	// return an error or update the object properly (rather than e.g. calling panic).
 	Update(ctx context.Context, in io.Reader, src ObjectInfo, options ...OpenOption) error
 
-	// Removes this object
+	// Remove this object
 	Remove(ctx context.Context) error
 }
 

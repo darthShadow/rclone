@@ -56,6 +56,7 @@ require (
 	github.com/koofr/go-httpclient v0.0.0-20240520111329-e20f8f203988
 	github.com/koofr/go-koofrclient v0.0.0-20221207135200-cbd7fc9ad6a6
 	github.com/lanrat/extsort v1.4.2
+	github.com/libp2p/go-buffer-pool v0.1.0
 	github.com/mattn/go-colorable v0.1.15
 	github.com/mattn/go-runewidth v0.0.24
 	github.com/mholt/archives v0.1.5

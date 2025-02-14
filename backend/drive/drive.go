@@ -43,6 +43,7 @@ import (
 	"github.com/rclone/rclone/lib/dircache"
 	"github.com/rclone/rclone/lib/encoder"
 	"github.com/rclone/rclone/lib/env"
+	"github.com/rclone/rclone/lib/join"
 	"github.com/rclone/rclone/lib/oauthutil"
 	"github.com/rclone/rclone/lib/pacer"
 	"github.com/rclone/rclone/lib/readers"
@@ -2064,7 +2065,7 @@ func (f *Fs) ListP(ctx context.Context, dir string, callback fs.ListRCallback) e
 
 	var iErr error
 	_, err = f.list(ctx, []string{directoryID}, "", false, false, f.opt.TrashedOnly, false, func(item *drive.File) bool {
-		entry, err := f.itemToDirEntry(ctx, path.Join(dir, item.Name), item)
+		entry, err := f.itemToDirEntry(ctx, join.PathJoin(dir, item.Name), item)
 		if err != nil {
 			iErr = err
 			return true
@@ -2181,7 +2182,7 @@ func (f *Fs) listRRunner(ctx context.Context, wg *sync.WaitGroup, in chan listRE
 						continue
 					}
 				}
-				remote := path.Join(paths[i], item.Name)
+				remote := join.PathJoin(paths[i], item.Name)
 				entry, err := f.itemToDirEntry(ctx, remote, item)
 				if err != nil {
 					iErr = err
@@ -2786,7 +2787,7 @@ func (f *Fs) delete(ctx context.Context, id string, useTrash bool) error {
 // purgeCheck removes the dir directory, if check is set then it
 // refuses to do so if it has anything in
 func (f *Fs) purgeCheck(ctx context.Context, dir string, check bool) error {
-	root := path.Join(f.root, dir)
+	root := join.PathJoin(f.root, dir)
 	dc := f.dirCache
 	directoryID, err := dc.FindDir(ctx, dir, false)
 	if err != nil {
@@ -2994,7 +2995,7 @@ func (r cleanupResult) Error() string {
 
 func (f *Fs) cleanupTeamDrive(ctx context.Context, dir string, directoryID string) (r cleanupResult, err error) {
 	_, err = f.list(ctx, []string{directoryID}, "", false, false, true, false, func(item *drive.File) bool {
-		remote := path.Join(dir, item.Name)
+		remote := join.PathJoin(dir, item.Name)
 		if item.ExplicitlyTrashed { // description is wrong - can also be set for folders - no need to recurse them
 			err := f.delete(ctx, item.Id, false)
 			if err != nil {
@@ -3522,7 +3523,7 @@ func (f *Fs) unTrash(ctx context.Context, dir string, directoryID string, recurs
 	directoryID = actualID(directoryID)
 	fs.Debugf(dir, "finding trash to restore in directory %q", directoryID)
 	_, err = f.list(ctx, []string{directoryID}, "", false, false, f.opt.TrashedOnly, true, func(item *drive.File) bool {
-		remote := path.Join(dir, item.Name)
+		remote := join.PathJoin(dir, item.Name)
 		if item.ExplicitlyTrashed {
 			fs.Infof(remote, "restoring %q", item.Id)
 			if operations.SkipDestructive(ctx, remote, "restore") {
