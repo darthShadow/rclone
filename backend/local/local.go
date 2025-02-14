@@ -9,7 +9,6 @@ import (
 	"io"
 	iofs "io/fs"
 	"os"
-	"path"
 	"path/filepath"
 	"runtime"
 	"slices"
@@ -29,6 +28,7 @@ import (
 	"github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/lib/encoder"
 	"github.com/rclone/rclone/lib/file"
+	"github.com/rclone/rclone/lib/join"
 	"github.com/rclone/rclone/lib/readers"
 	"golang.org/x/text/unicode/norm"
 )
@@ -294,9 +294,9 @@ cause disk fragmentation and can be slow to work with.`,
 				Help: `Disable setting modtime.
 
 Normally rclone updates modification time of files after they are done
-uploading. This can cause permissions issues on Linux platforms when 
+uploading. This can cause permissions issues on Linux platforms when
 the user rclone is running as does not own the file uploaded, such as
-when copying to a CIFS mount owned by another user. If this option is 
+when copying to a CIFS mount owned by another user. If this option is
 enabled, rclone will no longer update the modtime after copying a file.`,
 				Default:  false,
 				Advanced: true,
@@ -529,6 +529,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		// return an error with an fs which points to the parent
 		return f, fs.ErrorIsFile
 	}
+
 	return f, nil
 }
 
@@ -730,8 +731,9 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 				break
 			}
 			if err == nil {
+				// TODO: Parallelise this loop
 				for _, name := range names {
-					namepath := filepath.Join(fsDirPath, name)
+					namepath := join.FilePathJoin(fsDirPath, name)
 					fi, fierr := os.Lstat(namepath)
 					if os.IsNotExist(fierr) {
 						// skip entry removed by a concurrent goroutine
@@ -758,6 +760,7 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 			return nil, fmt.Errorf("failed to read directory entry: %w", err)
 		}
 
+		// TODO: Parallelise this loop
 		for _, fi := range fis {
 			name := fi.Name()
 			mode := fi.Mode()
@@ -768,7 +771,7 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 			}
 			// Follow symlinks if required
 			if f.opt.FollowSymlinks && (mode&symlinkFlag) != 0 {
-				localPath := filepath.Join(fsDirPath, name)
+				localPath := join.FilePathJoin(fsDirPath, name)
 				fi, err = os.Stat(localPath)
 				// A directory symlink pointing to a parent would be followed
 				// until the OS returns ELOOP, which can take a very long time
@@ -861,7 +864,8 @@ func (f *Fs) cleanRemote(dir, filename string) (remote string) {
 	if f.opt.UTFNorm {
 		filename = norm.NFC.String(filename)
 	}
-	remote = path.Join(dir, f.opt.Enc.ToStandardName(filename))
+
+	remote = join.PathJoin(dir, f.opt.Enc.ToStandardName(filename))
 
 	if !utf8.ValidString(filename) {
 		f.warnedMu.Lock()
@@ -871,6 +875,7 @@ func (f *Fs) cleanRemote(dir, filename string) (remote string) {
 		}
 		f.warnedMu.Unlock()
 	}
+
 	return
 }
 
@@ -886,7 +891,7 @@ func (f *Fs) nativePath(name string) string {
 // It returns errPathEscapes if name resolves outside f.root which can
 // happen depending on the encoding.
 func (f *Fs) localPath(name string) (string, error) {
-	localPath := filepath.Join(f.root, f.nativePath(name))
+	localPath := join.FilePathJoin(f.root, f.nativePath(name))
 	rel, err := filepath.Rel(f.root, localPath)
 	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 		return "", fserrors.NoRetryError(fmt.Errorf("%q: %w", name, errPathEscapes))
