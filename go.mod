@@ -140,6 +140,7 @@ require (
 	github.com/creasty/defaults v1.8.0 // indirect
 	github.com/cronokirby/saferith v0.33.0 // indirect
 	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
+	github.com/dolthub/maphash v0.1.0 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/ebitengine/purego v0.8.4 // indirect
 	github.com/emersion/go-message v0.18.2 // indirect
@@ -253,3 +254,5 @@ require (
 	golang.org/x/mobile v0.0.0-20250813145510-f12310a0cfd9
 	golang.org/x/term v0.34.0
 )
+
+replace github.com/hanwen/go-fuse/v2 v2.8.0 => github.com/darthShadow/go-fuse/v2 v2.0.0-20250616083416-dd9b725ff434
