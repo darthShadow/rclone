@@ -4,7 +4,6 @@ package crypt
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -303,6 +302,11 @@ func NewFs(ctx context.Context, name, rpath string, m configmap.Mapper) (fs.Fs, 
 	// Enable OpenChunkWriter if underlying backend supports it or OpenWriterAt
 	if wrappedFs.Features().OpenChunkWriter != nil || wrappedFs.Features().OpenWriterAt != nil {
 		f.features.OpenChunkWriter = f.OpenChunkWriter
+	}
+	
+	// Enable OpenWriterAt for NoDataEncryption mode if underlying backend supports it
+	if f.opt.NoDataEncryption && wrappedFs.Features().OpenWriterAt != nil {
+		f.features.OpenWriterAt = f.OpenWriterAt
 	}
 
 	return f, err
@@ -1160,17 +1164,15 @@ func (f *Fs) OpenChunkWriter(ctx context.Context, remote string, src fs.ObjectIn
 		return do(ctx, f.cipher.EncryptFileName(remote), f.newObjectInfo(src, nonce{}), options...)
 	}
 
-	// Check if underlying backend supports chunked writing
-	do := f.Fs.Features().OpenChunkWriter
-	if do == nil {
-		// Check if underlying backend supports OpenWriterAt
-		openWriterAt := f.Fs.Features().OpenWriterAt
-		if openWriterAt == nil {
-			return info, nil, fs.ErrorNotImplemented
-		}
-		// Use adapter to convert OpenWriterAt to OpenChunkWriter
-		do = f.openChunkWriterFromOpenWriterAt(openWriterAt)
+	// For encrypted data, always use OpenWriterAt adapter to handle header alignment correctly.
+	// The native OpenChunkWriter interface expects uniform chunk sizes, but encryption requires
+	// a 32-byte header which would make chunk 0 different from other chunks.
+	openWriterAt := f.Fs.Features().OpenWriterAt
+	if openWriterAt == nil {
+		return info, nil, fs.ErrorNotImplemented
 	}
+	// Use adapter to convert OpenWriterAt to OpenChunkWriter with proper header handling
+	do := f.openChunkWriterFromOpenWriterAt(openWriterAt)
 
 	// Generate a random nonce for this file
 	fileNonce, err := f.cipher.newNonce()
@@ -1178,36 +1180,46 @@ func (f *Fs) OpenChunkWriter(ctx context.Context, remote string, src fs.ObjectIn
 		return info, nil, fmt.Errorf("failed to generate nonce: %w", err)
 	}
 
-	// Create encrypted ObjectInfo
+	// Create encrypted ObjectInfo with proper size calculation
 	encryptedSrc := f.newObjectInfo(src, fileNonce)
 
-	// Get chunk writer info from underlying backend
-	underlyingInfo, underlyingWriter, err := do(ctx, f.cipher.EncryptFileName(remote), encryptedSrc, options...)
-	if err != nil {
-		return info, nil, err
+	// Use OpenWriterAt adapter with encryption support
+	return do(ctx, f.cipher.EncryptFileName(remote), encryptedSrc, append(options, &cryptOption{
+		cipher:    f.cipher,
+		fileNonce: fileNonce,
+	})...)
+}
+
+// OpenWriterAt opens a file for writing at offset for NoDataEncryption mode
+func (f *Fs) OpenWriterAt(ctx context.Context, remote string, size int64) (fs.WriterAtCloser, error) {
+	// Only support OpenWriterAt for NoDataEncryption mode
+	if !f.opt.NoDataEncryption {
+		return nil, fs.ErrorNotImplemented
 	}
+	
+	// Delegate to underlying backend with encrypted filename
+	return f.Fs.Features().OpenWriterAt(ctx, f.cipher.EncryptFileName(remote), size)
+}
 
-	// Calculate optimal chunk size aligned to encryption block boundaries
-	chunkSize := f.calculateOptimalChunkSize(underlyingInfo.ChunkSize, src.Size())
+// cryptOption passes encryption context to the OpenWriterAt adapter
+type cryptOption struct {
+	cipher    *Cipher
+	fileNonce nonce
+}
 
-	// Create our chunk writer
-	cryptWriter := &cryptChunkWriter{
-		cipher:           f.cipher,
-		fileNonce:        fileNonce,
-		chunkSize:        chunkSize,
-		underlyingWriter: underlyingWriter,
-		chunkHashes:      make([][]byte, 0),
-		completedChunks:  make(map[int]bool),
-	}
+// String implements fmt.Stringer for cryptOption
+func (co *cryptOption) String() string {
+	return "crypt-option"
+}
 
-	// Return adjusted chunk writer info
-	info = fs.ChunkWriterInfo{
-		ChunkSize:         chunkSize,
-		Concurrency:       underlyingInfo.Concurrency,
-		LeavePartsOnError: underlyingInfo.LeavePartsOnError,
-	}
+// Header implements fs.OpenOption interface - returns empty since this is internal
+func (co *cryptOption) Header() (string, string) {
+	return "", ""
+}
 
-	return info, cryptWriter, nil
+// Mandatory implements fs.OpenOption interface - not mandatory since it's internal
+func (co *cryptOption) Mandatory() bool {
+	return false
 }
 
 // calculateOptimalChunkSize calculates chunk size aligned to encryption block boundaries
@@ -1218,24 +1230,7 @@ func (f *Fs) calculateOptimalChunkSize(baseChunkSize int64, fileSize int64) int6
 
 	// Align to encryption block boundaries to avoid partial blocks
 	blocksPerChunk := (baseChunkSize + blockDataSize - 1) / blockDataSize
-	alignedChunkSize := blocksPerChunk * blockDataSize
-
-	// Ensure reasonable parallelism for smaller files
-	if fileSize > 0 && fileSize < alignedChunkSize*2 {
-		// For small files, use smaller chunks to enable parallelism
-		minChunks := int64(2)
-		if fileSize > alignedChunkSize {
-			minChunks = fileSize / alignedChunkSize
-		}
-		if minChunks > 1 {
-			alignedChunkSize = (fileSize + minChunks - 1) / minChunks
-			// Re-align to block boundaries
-			blocksPerChunk = (alignedChunkSize + blockDataSize - 1) / blockDataSize
-			alignedChunkSize = blocksPerChunk * blockDataSize
-		}
-	}
-
-	return alignedChunkSize
+	return blocksPerChunk * blockDataSize
 }
 
 // openChunkWriterFromOpenWriterAt adapts an OpenWriterAtFn into an OpenChunkWriterFn for crypt backend
@@ -1244,12 +1239,14 @@ func (f *Fs) openChunkWriterFromOpenWriterAt(openWriterAt fs.OpenWriterAtFn) fs.
 	return func(ctx context.Context, remote string, src fs.ObjectInfo, options ...fs.OpenOption) (info fs.ChunkWriterInfo, writer fs.ChunkWriter, err error) {
 		ci := fs.GetConfig(ctx)
 
-		// Extract chunk size from options, default to config value
+		// Extract options
 		baseChunkSize := int64(ci.MultiThreadChunkSize)
+		var cryptOpt *cryptOption
 		for _, option := range options {
 			if chunkOption, ok := option.(*fs.ChunkOption); ok {
 				baseChunkSize = chunkOption.ChunkSize
-				break
+			} else if co, ok := option.(*cryptOption); ok {
+				cryptOpt = co
 			}
 		}
 
@@ -1270,6 +1267,7 @@ func (f *Fs) openChunkWriterFromOpenWriterAt(openWriterAt fs.OpenWriterAtFn) fs.
 			writtenChunks: make(map[int]bool),
 			maxBufferedChunks: ci.MultiThreadStreams * 2, // Limit memory usage
 			currentBuffered:   0,
+			cryptOpt:     cryptOpt,
 		}
 
 		info = fs.ChunkWriterInfo{
@@ -1301,6 +1299,13 @@ type parallelWriterAtChunkWriter struct {
 	maxBufferedChunks int // maximum chunks to buffer
 	currentBuffered   int // current buffered chunks
 	bufferCond        *sync.Cond // condition variable for buffer management
+
+	// Encryption support (nil for unencrypted data)
+	cryptOpt *cryptOption
+	
+	// Header tracking for encryption
+	headerWritten sync.Once
+	headerError   error
 }
 
 // WriteChunk writes chunkNumber from reader directly to calculated file position
@@ -1333,16 +1338,37 @@ func (w *parallelWriterAtChunkWriter) WriteChunk(ctx context.Context, chunkNumbe
 		w.mu.Unlock()
 	}()
 
-	// Read chunk data
+	// Handle encryption header first if needed
+	if w.cryptOpt != nil {
+		w.headerWritten.Do(func() {
+			w.headerError = w.writeEncryptionHeader(ctx)
+		})
+		if w.headerError != nil {
+			return 0, w.headerError
+		}
+	}
+
+	// Read and process chunk data
 	chunkData, err := io.ReadAll(reader)
 	if err != nil {
 		return 0, fmt.Errorf("failed to read chunk %d: %w", chunkNumber, err)
 	}
 
-	// Calculate file position for this chunk
-	fileOffset := int64(chunkNumber) * w.chunkSize
+	// Apply encryption if enabled
+	if w.cryptOpt != nil {
+		chunkData, err = w.encryptChunk(chunkNumber, chunkData)
+		if err != nil {
+			return 0, fmt.Errorf("failed to encrypt chunk %d: %w", chunkNumber, err)
+		}
+	}
 
-	// Write directly to calculated position - this is the key fix!
+	// Calculate file position for this chunk (header-aware)
+	fileOffset := int64(chunkNumber) * w.chunkSize
+	if w.cryptOpt != nil {
+		fileOffset += int64(fileHeaderSize) // Account for 32-byte header
+	}
+
+	// Write to calculated position
 	n, err := w.writerAt.WriteAt(chunkData, fileOffset)
 	if err != nil {
 		return int64(n), fmt.Errorf("failed to write chunk %d at offset %d: %w", chunkNumber, fileOffset, err)
@@ -1430,142 +1456,77 @@ func calculateNumChunks(size, chunkSize int64) int {
 	return int((size + chunkSize - 1) / chunkSize)
 }
 
-// cryptChunkWriter implements chunked writing with encryption
-type cryptChunkWriter struct {
-	cipher           *Cipher
-	fileNonce        nonce
-	chunkSize        int64
-	underlyingWriter fs.ChunkWriter
-
-	// Thread-safe hash collection
-	hashMu      sync.Mutex
-	chunkHashes [][]byte
-
-	// Header coordination
-	headerWritten sync.Once
-	headerError   error
-	headerData    []byte
-
-	// Chunk tracking
-	completedChunks map[int]bool
-	completedMu     sync.Mutex
-}
-
-// WriteChunk encrypts and writes a chunk with correct nonce calculation for parallel processing
-func (c *cryptChunkWriter) WriteChunk(ctx context.Context, chunkNumber int, reader io.ReadSeeker) (int64, error) {
-	// Ensure header is written first
-	c.headerWritten.Do(func() {
-		c.headerError = c.writeFileHeader(ctx)
-	})
-	if c.headerError != nil {
-		return 0, c.headerError
-	}
-
-	// Calculate starting nonce for this chunk based on file position, not chunk order
-	// This is critical for parallel processing - nonce must be deterministic based on position
-	filePosition := int64(chunkNumber) * c.chunkSize
-	blockOffset := filePosition / blockDataSize
-	
-	// Create nonce for this chunk's starting position
-	chunkNonce := c.fileNonce
-	chunkNonce.add(uint64(blockOffset))
-
-	// Encrypt data in blocks
-	var encryptedChunk bytes.Buffer
-	blockNonce := chunkNonce
-	bytesRead := int64(0)
-	chunkHasher := sha256.New()
-
-	// If this is chunk 0, prepend the header
-	if chunkNumber == 0 && c.headerData != nil {
-		encryptedChunk.Write(c.headerData)
-		chunkHasher.Write(c.headerData)
-	}
-
-	for {
-		// Read block data
-		blockData := make([]byte, blockDataSize)
-		n, err := reader.Read(blockData)
-		if n == 0 {
-			break
-		}
-
-		// Encrypt block with position-specific nonce
-		blockData = blockData[:n]
-		encryptedBlock := c.cipher.encryptBlock(blockData, &blockNonce)
-
-		// Write to chunk buffer and hash
-		encryptedChunk.Write(encryptedBlock)
-		chunkHasher.Write(encryptedBlock)
-
-		// Increment nonce for next block within this chunk
-		blockNonce.increment()
-		bytesRead += int64(n)
-
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return bytesRead, err
-		}
-	}
-
-	// Store chunk hash for integrity verification
-	c.storeChunkHash(chunkNumber, chunkHasher.Sum(nil))
-
-	// Write encrypted chunk to underlying writer
-	chunkReader := bytes.NewReader(encryptedChunk.Bytes())
-	written, err := c.underlyingWriter.WriteChunk(ctx, chunkNumber, chunkReader)
+// writeEncryptionHeader writes the file header at position 0 using cipher.newEncrypter
+func (w *parallelWriterAtChunkWriter) writeEncryptionHeader(ctx context.Context) error {
+	// Use cipher.newEncrypter to create proper header
+	emptyReader := bytes.NewReader(nil)
+	encrypter, err := w.cryptOpt.cipher.newEncrypter(emptyReader, &w.cryptOpt.fileNonce)
 	if err != nil {
-		return written, err
+		return fmt.Errorf("failed to create encrypter for header: %w", err)
 	}
-
-	// Mark chunk as completed
-	c.completedMu.Lock()
-	c.completedChunks[chunkNumber] = true
-	c.completedMu.Unlock()
-
-	fs.Debugf("crypt", "chunk %d encrypted and written, file pos %d, block offset %d", chunkNumber, filePosition, blockOffset)
-	return bytesRead, nil
-}
-
-// Close finalizes the chunked writer
-func (c *cryptChunkWriter) Close(ctx context.Context) error {
-	return c.underlyingWriter.Close(ctx)
-}
-
-// Abort aborts the chunked writer
-func (c *cryptChunkWriter) Abort(ctx context.Context) error {
-	return c.underlyingWriter.Abort(ctx)
-}
-
-// writeFileHeader writes the file header with magic and nonce
-func (c *cryptChunkWriter) writeFileHeader(ctx context.Context) error {
+	
+	// Read header from encrypter
 	header := make([]byte, fileHeaderSize)
-
-	// Write magic bytes
-	copy(header[:fileMagicSize], fileMagicBytes)
-
-	// Write file nonce
-	copy(header[fileMagicSize:], c.fileNonce[:])
-
-	// Store header for merging with first chunk
-	c.headerData = header
+	n, err := encrypter.Read(header)
+	if err != nil && err != io.EOF {
+		return fmt.Errorf("failed to read header from encrypter: %w", err)
+	}
+	if n != fileHeaderSize {
+		return fmt.Errorf("incomplete header read: got %d, expected %d", n, fileHeaderSize)
+	}
+	
+	// Write header at position 0
+	n, err = w.writerAt.WriteAt(header, 0)
+	if err != nil {
+		return fmt.Errorf("failed to write encryption header: %w", err)
+	}
+	if n != fileHeaderSize {
+		return fmt.Errorf("incomplete header write: wrote %d, expected %d", n, fileHeaderSize)
+	}
+	
+	fs.Debugf(w.remote, "encryption header written (%d bytes)", n)
 	return nil
 }
 
-// storeChunkHash stores hash for a chunk in thread-safe manner
-func (c *cryptChunkWriter) storeChunkHash(chunkNumber int, hash []byte) {
-	c.hashMu.Lock()
-	defer c.hashMu.Unlock()
-
-	// Ensure slice is large enough
-	for len(c.chunkHashes) <= chunkNumber {
-		c.chunkHashes = append(c.chunkHashes, nil)
+// encryptChunk encrypts chunk data using position-based nonce calculation
+func (w *parallelWriterAtChunkWriter) encryptChunk(chunkNumber int, data []byte) ([]byte, error) {
+	if w.cryptOpt == nil {
+		return data, nil
 	}
-
-	c.chunkHashes[chunkNumber] = hash
+	
+	// Calculate starting nonce for this chunk based on file position
+	filePosition := int64(chunkNumber) * w.chunkSize
+	blockOffset := filePosition / blockDataSize
+	
+	// Create nonce for this chunk's starting position
+	chunkNonce := w.cryptOpt.fileNonce
+	chunkNonce.add(uint64(blockOffset))
+	
+	// Encrypt data in blocks
+	var result bytes.Buffer
+	offset := 0
+	blockNonce := chunkNonce
+	
+	for offset < len(data) {
+		// Get block data (up to blockDataSize)
+		end := offset + blockDataSize
+		if end > len(data) {
+			end = len(data)
+		}
+		blockData := data[offset:end]
+		
+		// Encrypt block with position-specific nonce
+		encryptedBlock := w.cryptOpt.cipher.encryptBlock(blockData, &blockNonce)
+		result.Write(encryptedBlock)
+		
+		// Increment nonce for next block
+		blockNonce.increment()
+		offset = end
+	}
+	
+	return result.Bytes(), nil
 }
+
 
 // ObjectInfo describes a wrapped fs.ObjectInfo for being the source
 //
