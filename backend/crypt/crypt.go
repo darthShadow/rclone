@@ -1239,6 +1239,7 @@ func (f *Fs) calculateOptimalChunkSize(baseChunkSize int64, fileSize int64) int6
 }
 
 // openChunkWriterFromOpenWriterAt adapts an OpenWriterAtFn into an OpenChunkWriterFn for crypt backend
+// This implementation enables true parallel chunk writing by calculating file positions directly
 func (f *Fs) openChunkWriterFromOpenWriterAt(openWriterAt fs.OpenWriterAtFn) fs.OpenChunkWriterFn {
 	return func(ctx context.Context, remote string, src fs.ObjectInfo, options ...fs.OpenOption) (info fs.ChunkWriterInfo, writer fs.ChunkWriter, err error) {
 		ci := fs.GetConfig(ctx)
@@ -1259,17 +1260,16 @@ func (f *Fs) openChunkWriterFromOpenWriterAt(openWriterAt fs.OpenWriterAtFn) fs.
 			return info, nil, err
 		}
 
-		chunkWriter := &writerAtChunkWriter{
-			remote:        remote,
-			size:          src.Size(),
-			chunkSize:     chunkSize,
-			chunks:        calculateNumChunks(src.Size(), chunkSize),
-			writerAt:      writerAt,
-			f:             f.Fs,
-			chunkOffsets:  make(map[int]int64),
-			pendingChunks: make(map[int][]byte),
-			nextOffset:    0,
-			nextChunk:     0,
+		chunkWriter := &parallelWriterAtChunkWriter{
+			remote:       remote,
+			size:         src.Size(),
+			chunkSize:    chunkSize,
+			totalChunks:  calculateNumChunks(src.Size(), chunkSize),
+			writerAt:     writerAt,
+			f:            f.Fs,
+			writtenChunks: make(map[int]bool),
+			maxBufferedChunks: ci.MultiThreadStreams * 2, // Limit memory usage
+			currentBuffered:   0,
 		}
 
 		info = fs.ChunkWriterInfo{
@@ -1282,124 +1282,117 @@ func (f *Fs) openChunkWriterFromOpenWriterAt(openWriterAt fs.OpenWriterAtFn) fs.
 	}
 }
 
-// writerAtChunkWriter converts a WriterAtCloser into a ChunkWriter for crypt backend
-type writerAtChunkWriter struct {
-	remote    string
-	size      int64
-	chunkSize int64
-	chunks    int
-	writerAt  fs.WriterAtCloser
-	f         fs.Fs
-	closed    bool
+// parallelWriterAtChunkWriter converts a WriterAtCloser into a ChunkWriter for crypt backend
+// This implementation supports true parallel chunk writing by calculating file positions directly
+type parallelWriterAtChunkWriter struct {
+	remote       string
+	size         int64
+	chunkSize    int64
+	totalChunks  int
+	writerAt     fs.WriterAtCloser
+	f            fs.Fs
+	closed       bool
 
-	// Track chunk ordering for variable-sized chunks (encryption)
-	chunkOffsets  map[int]int64  // chunk number -> file offset
-	pendingChunks map[int][]byte // buffered chunks waiting to be written
-	mu            sync.Mutex
-	nextOffset    int64
-	nextChunk     int // next chunk number we expect to write
+	// Thread-safe chunk tracking
+	mu            sync.RWMutex
+	writtenChunks map[int]bool // track which chunks have been written
+
+	// Memory pressure control
+	maxBufferedChunks int // maximum chunks to buffer
+	currentBuffered   int // current buffered chunks
+	bufferCond        *sync.Cond // condition variable for buffer management
 }
 
-// WriteChunk writes chunkNumber from reader
-func (w *writerAtChunkWriter) WriteChunk(ctx context.Context, chunkNumber int, reader io.ReadSeeker) (int64, error) {
-	fs.Debugf(w.remote, "writing chunk %v", chunkNumber)
+// WriteChunk writes chunkNumber from reader directly to calculated file position
+// This enables true parallel chunk writing without sequential ordering
+func (w *parallelWriterAtChunkWriter) WriteChunk(ctx context.Context, chunkNumber int, reader io.ReadSeeker) (int64, error) {
+	fs.Debugf(w.remote, "writing chunk %d in parallel", chunkNumber)
 
-	// Read the chunk data into memory
+	// Validate chunk number
+	if chunkNumber < 0 || chunkNumber >= w.totalChunks {
+		return 0, fmt.Errorf("invalid chunk number %d, expected 0-%d", chunkNumber, w.totalChunks-1)
+	}
+
+	// Wait for buffer space if needed
+	w.mu.Lock()
+	for w.currentBuffered >= w.maxBufferedChunks {
+		if w.bufferCond == nil {
+			w.bufferCond = sync.NewCond(&w.mu)
+		}
+		w.bufferCond.Wait()
+	}
+	w.currentBuffered++
+	w.mu.Unlock()
+
+	defer func() {
+		w.mu.Lock()
+		w.currentBuffered--
+		if w.bufferCond != nil {
+			w.bufferCond.Signal()
+		}
+		w.mu.Unlock()
+	}()
+
+	// Read chunk data
 	chunkData, err := io.ReadAll(reader)
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("failed to read chunk %d: %w", chunkNumber, err)
 	}
 
-	w.mu.Lock()
-	defer w.mu.Unlock()
+	// Calculate file position for this chunk
+	fileOffset := int64(chunkNumber) * w.chunkSize
 
-	// If this is the next chunk we're waiting for, write it immediately
-	if chunkNumber == w.nextChunk {
-		bytesWritten, err := w.writeChunkData(chunkNumber, chunkData)
-		if err != nil {
-			return 0, err
-		}
-
-		// Try to write any pending chunks that are now ready
-		w.writePendingChunks()
-
-		return bytesWritten, nil
-	}
-
-	// This chunk is out of order, buffer it for later
-	fs.Debugf(w.remote, "buffering chunk %d (waiting for chunk %d)", chunkNumber, w.nextChunk)
-	w.pendingChunks[chunkNumber] = chunkData
-
-	return int64(len(chunkData)), nil
-}
-
-// writeChunkData writes a chunk at the current offset (must be called with lock held)
-func (w *writerAtChunkWriter) writeChunkData(chunkNumber int, data []byte) (int64, error) {
-	// Store the offset for this chunk
-	w.chunkOffsets[chunkNumber] = w.nextOffset
-
-	// Write the chunk at the calculated offset
-	writer := io.NewOffsetWriter(w.writerAt, w.nextOffset)
-	n, err := writer.Write(data)
+	// Write directly to calculated position - this is the key fix!
+	n, err := w.writerAt.WriteAt(chunkData, fileOffset)
 	if err != nil {
-		return int64(n), err
+		return int64(n), fmt.Errorf("failed to write chunk %d at offset %d: %w", chunkNumber, fileOffset, err)
 	}
 
-	// Update tracking
-	w.nextOffset += int64(n)
-	w.nextChunk++
+	// Mark chunk as written
+	w.mu.Lock()
+	w.writtenChunks[chunkNumber] = true
+	w.mu.Unlock()
 
-	fs.Debugf(w.remote, "chunk %d written at offset %d, size %d, next offset %d", chunkNumber, w.chunkOffsets[chunkNumber], n, w.nextOffset)
-
+	fs.Debugf(w.remote, "chunk %d written at offset %d, size %d", chunkNumber, fileOffset, n)
 	return int64(n), nil
 }
 
-// writePendingChunks writes any buffered chunks that are now ready (must be called with lock held)
-func (w *writerAtChunkWriter) writePendingChunks() {
-	for {
-		chunkData, exists := w.pendingChunks[w.nextChunk]
-		if !exists {
-			break // No more consecutive chunks available
-		}
+// verifyAllChunksWritten checks that all expected chunks have been written
+func (w *parallelWriterAtChunkWriter) verifyAllChunksWritten() error {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
 
-		// Write this pending chunk
-		_, err := w.writeChunkData(w.nextChunk, chunkData)
-		if err != nil {
-			fs.Errorf(w.remote, "failed to write pending chunk %d: %v", w.nextChunk, err)
-			break
+	missing := make([]int, 0)
+	for i := 0; i < w.totalChunks; i++ {
+		if !w.writtenChunks[i] {
+			missing = append(missing, i)
 		}
-
-		// Remove from pending list
-		delete(w.pendingChunks, w.nextChunk-1) // nextChunk was already incremented in writeChunkData
 	}
+
+	if len(missing) > 0 {
+		return fmt.Errorf("missing chunks: %v", missing)
+	}
+
+	return nil
 }
 
 // Close the chunk writing
-func (w *writerAtChunkWriter) Close(ctx context.Context) error {
+func (w *parallelWriterAtChunkWriter) Close(ctx context.Context) error {
+	w.mu.Lock()
 	if w.closed {
+		w.mu.Unlock()
 		return nil
 	}
+	w.closed = true
+	w.mu.Unlock()
 
-	w.mu.Lock()
-	defer w.mu.Unlock()
-
-	// Check for any remaining pending chunks - this indicates missing chunks
-	if len(w.pendingChunks) > 0 {
-		missing := make([]int, 0)
-		for i := w.nextChunk; i < w.chunks; i++ {
-			if _, exists := w.pendingChunks[i]; !exists {
-				missing = append(missing, i)
-			}
-		}
-		if len(missing) > 0 {
-			fs.Errorf(w.remote, "missing chunks on close: %v, have pending: %v", missing, getKeys(w.pendingChunks))
-		}
-
-		// Try to write remaining pending chunks in order
-		w.writePendingChunks()
+	// Verify all chunks were written
+	if err := w.verifyAllChunksWritten(); err != nil {
+		// Don't close the underlying writer if chunks are missing
+		return fmt.Errorf("incomplete upload: %w", err)
 	}
 
-	w.closed = true
+	fs.Debugf(w.remote, "all %d chunks written successfully", w.totalChunks)
 	return w.writerAt.Close()
 }
 
@@ -1413,14 +1406,18 @@ func getKeys(m map[int][]byte) []int {
 }
 
 // Abort the chunk writing
-func (w *writerAtChunkWriter) Abort(ctx context.Context) error {
-	err := w.Close(ctx)
-	if err != nil {
-		fs.Errorf(w.remote, "chunk writer: failed to close file before aborting: %v", err)
-	}
+func (w *parallelWriterAtChunkWriter) Abort(ctx context.Context) error {
+	w.mu.Lock()
+	w.closed = true
+	w.mu.Unlock()
+
+	// Close the underlying writer (ignore errors since we're aborting)
+	_ = w.writerAt.Close()
+
+	// Try to remove the partial file
 	obj, err := w.f.NewObject(ctx, w.remote)
 	if err != nil {
-		return fmt.Errorf("chunk writer: failed to find temp file when aborting chunk writer: %w", err)
+		return fmt.Errorf("chunk writer: failed to find temp file when aborting: %w", err)
 	}
 	return obj.Remove(ctx)
 }
@@ -1454,7 +1451,7 @@ type cryptChunkWriter struct {
 	completedMu     sync.Mutex
 }
 
-// WriteChunk encrypts and writes a chunk
+// WriteChunk encrypts and writes a chunk with correct nonce calculation for parallel processing
 func (c *cryptChunkWriter) WriteChunk(ctx context.Context, chunkNumber int, reader io.ReadSeeker) (int64, error) {
 	// Ensure header is written first
 	c.headerWritten.Do(func() {
@@ -1464,10 +1461,14 @@ func (c *cryptChunkWriter) WriteChunk(ctx context.Context, chunkNumber int, read
 		return 0, c.headerError
 	}
 
-	// Calculate starting nonce for this chunk
-	blocksPerChunk := c.chunkSize / blockDataSize
+	// Calculate starting nonce for this chunk based on file position, not chunk order
+	// This is critical for parallel processing - nonce must be deterministic based on position
+	filePosition := int64(chunkNumber) * c.chunkSize
+	blockOffset := filePosition / blockDataSize
+	
+	// Create nonce for this chunk's starting position
 	chunkNonce := c.fileNonce
-	chunkNonce.add(uint64(chunkNumber) * uint64(blocksPerChunk))
+	chunkNonce.add(uint64(blockOffset))
 
 	// Encrypt data in blocks
 	var encryptedChunk bytes.Buffer
@@ -1489,7 +1490,7 @@ func (c *cryptChunkWriter) WriteChunk(ctx context.Context, chunkNumber int, read
 			break
 		}
 
-		// Encrypt block
+		// Encrypt block with position-specific nonce
 		blockData = blockData[:n]
 		encryptedBlock := c.cipher.encryptBlock(blockData, &blockNonce)
 
@@ -1497,7 +1498,7 @@ func (c *cryptChunkWriter) WriteChunk(ctx context.Context, chunkNumber int, read
 		encryptedChunk.Write(encryptedBlock)
 		chunkHasher.Write(encryptedBlock)
 
-		// Increment nonce for next block
+		// Increment nonce for next block within this chunk
 		blockNonce.increment()
 		bytesRead += int64(n)
 
@@ -1509,7 +1510,7 @@ func (c *cryptChunkWriter) WriteChunk(ctx context.Context, chunkNumber int, read
 		}
 	}
 
-	// Store chunk hash
+	// Store chunk hash for integrity verification
 	c.storeChunkHash(chunkNumber, chunkHasher.Sum(nil))
 
 	// Write encrypted chunk to underlying writer
@@ -1524,6 +1525,7 @@ func (c *cryptChunkWriter) WriteChunk(ctx context.Context, chunkNumber int, read
 	c.completedChunks[chunkNumber] = true
 	c.completedMu.Unlock()
 
+	fs.Debugf("crypt", "chunk %d encrypted and written, file pos %d, block offset %d", chunkNumber, filePosition, blockOffset)
 	return bytesRead, nil
 }
 
