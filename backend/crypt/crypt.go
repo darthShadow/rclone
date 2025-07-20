@@ -1349,7 +1349,7 @@ func (w *parallelWriterAtChunkWriter) WriteChunk(ctx context.Context, chunkNumbe
 
 	// Validate chunk number
 	if chunkNumber < 0 || chunkNumber >= w.totalChunks {
-		return 0, fmt.Errorf("invalid chunk number %d, expected 0-%d", chunkNumber, w.totalChunks-1)
+		return 0, fmt.Errorf("invalid chunk number %d, expected 0--%d", chunkNumber, w.totalChunks-1)
 	}
 
 	// Wait for buffer space if needed
@@ -1372,16 +1372,16 @@ func (w *parallelWriterAtChunkWriter) WriteChunk(ctx context.Context, chunkNumbe
 		w.mu.Unlock()
 	}()
 
-	// Handle encryption header first if needed - ONLY for chunk 0
-	// This ensures the header is written before any data chunks and maintains file structure integrity
+	// Handle encryption header first if needed
+	// Any chunk can trigger header writing, but only the first one actually writes it
 	if w.cryptOpt != nil {
 		w.mu.Lock()
-		if chunkNumber == 0 && !w.headerWritten {
+		if !w.headerWritten {
 			w.headerError = w.writeEncryptionHeader(ctx)
 			w.headerWritten = true
 			w.headerCond.Broadcast() // Wake up all waiting chunks
-		} else if chunkNumber > 0 {
-			// For non-zero chunks, wait for header to be written by chunk 0
+		} else {
+			// For subsequent chunks, wait for header to be written
 			for !w.headerWritten {
 				w.headerCond.Wait()
 			}
@@ -1530,8 +1530,9 @@ func (w *parallelWriterAtChunkWriter) writeEncryptionHeader(ctx context.Context)
 	return nil
 }
 
+
 // streamEncryptAndWrite encrypts data from reader in blocks and writes directly to writerAt
-// This reduces memory usage by processing data in blockDataSize chunks instead of loading entire chunk
+// Returns the number of unencrypted bytes read from the reader
 func (w *parallelWriterAtChunkWriter) streamEncryptAndWrite(chunkNumber int, reader io.ReadSeeker, fileOffset int64) (int64, error) {
 	// Calculate starting nonce for this chunk based on file position
 	filePosition := int64(chunkNumber) * w.chunkSize
@@ -1561,7 +1562,7 @@ func (w *parallelWriterAtChunkWriter) streamEncryptAndWrite(chunkNumber int, rea
 	}
 
 	// Stream encrypt and write in blocks to reduce memory usage
-	var totalWritten int64
+	var totalBytesRead int64 // Track original unencrypted bytes read
 	writeOffset := fileOffset
 
 	for {
@@ -1575,8 +1576,11 @@ func (w *parallelWriterAtChunkWriter) streamEncryptAndWrite(chunkNumber int, rea
 			if err == io.EOF {
 				break
 			}
-			return totalWritten, fmt.Errorf("failed to read block data: %w", err)
+			return totalBytesRead, fmt.Errorf("failed to read block data: %w", err)
 		}
+
+		// Track unencrypted bytes read
+		totalBytesRead += int64(n)
 
 		// Get the actual data read (may be less than blockDataSize for last block)
 		blockData := blockBuffer[:n]
@@ -1589,14 +1593,13 @@ func (w *parallelWriterAtChunkWriter) streamEncryptAndWrite(chunkNumber int, rea
 
 		// Write encrypted block directly to file
 		written, writeErr := w.writerAt.WriteAt(encryptedBlock, writeOffset)
-		totalWritten += int64(written)
 
 		if writeErr != nil {
-			return totalWritten, fmt.Errorf("failed to write encrypted block at offset %d: %w", writeOffset, writeErr)
+			return totalBytesRead, fmt.Errorf("failed to write encrypted block at offset %d: %w", writeOffset, writeErr)
 		}
 
 		// Move to next block position
-		writeOffset += int64(len(encryptedBlock))
+		writeOffset += int64(written)
 		blockNonce.increment()
 
 		// If we read less than a full block, we're done
@@ -1604,11 +1607,11 @@ func (w *parallelWriterAtChunkWriter) streamEncryptAndWrite(chunkNumber int, rea
 			if err == io.EOF {
 				break
 			}
-			return totalWritten, fmt.Errorf("unexpected read error: %w", err)
+			return totalBytesRead, fmt.Errorf("unexpected read error: %w", err)
 		}
 	}
 
-	return totalWritten, nil
+	return totalBytesRead, nil
 }
 
 // ObjectInfo describes a wrapped fs.ObjectInfo for being the source
