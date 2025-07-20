@@ -23,7 +23,6 @@ func TestIntegration(t *testing.T) {
 		NilObject:  (*hasher.Object)(nil),
 		UnimplementableFsMethods: []string{
 			"OpenWriterAt",
-			"OpenChunkWriter",
 		},
 		UnimplementableObjectMethods: []string{},
 	}

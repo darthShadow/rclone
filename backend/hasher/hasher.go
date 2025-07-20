@@ -2,11 +2,14 @@
 package hasher
 
 import (
+	"bytes"
 	"context"
 	"encoding/gob"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
+	"math"
 	"path"
 	"strings"
 	"sync"
@@ -17,8 +20,9 @@ import (
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/config/configstruct"
 	"github.com/rclone/rclone/fs/fspath"
-	"github.com/rclone/rclone/fs/hash"
+	rclonehash "github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/fs/list"
+	"github.com/rclone/rclone/fs/operations"
 	"github.com/rclone/rclone/lib/kv"
 )
 
@@ -73,14 +77,14 @@ type Fs struct {
 	opt      *Options
 	db       *kv.DB
 	// fingerprinting
-	fpTime bool      // true if using time in fingerprints
-	fpHash hash.Type // hash type to use in fingerprints or None
+	fpTime bool               // true if using time in fingerprints
+	fpHash rclonehash.Type    // hash type to use in fingerprints or None
 	// hash types triaged by groups
-	suppHashes hash.Set // all supported checksum types
-	passHashes hash.Set // passed directly to the base without caching
-	slowHashes hash.Set // passed to the base and then cached
-	autoHashes hash.Set // calculated in-house and cached
-	keepHashes hash.Set // checksums to keep in cache (slow + auto)
+	suppHashes rclonehash.Set // all supported checksum types
+	passHashes rclonehash.Set // passed directly to the base without caching
+	slowHashes rclonehash.Set // passed to the base and then cached
+	autoHashes rclonehash.Set // calculated in-house and cached
+	keepHashes rclonehash.Set // checksums to keep in cache (slow + auto)
 }
 
 var warnExperimental sync.Once
@@ -136,7 +140,7 @@ func NewFs(ctx context.Context, fsname, rpath string, cmap configmap.Mapper) (fs
 	f.suppHashes.Add(f.slowHashes.Array()...)
 
 	for _, hashName := range opt.Hashes {
-		var ht hash.Type
+		var ht rclonehash.Type
 		if err := ht.Set(hashName); err != nil {
 			return nil, fmt.Errorf("invalid token %q in hash string %q", hashName, opt.Hashes.String())
 		}
@@ -150,7 +154,7 @@ func NewFs(ctx context.Context, fsname, rpath string, cmap configmap.Mapper) (fs
 	fs.Debugf(f, "Groups by usage: cached %s, passed %s, auto %s, slow %s, supported %s",
 		f.keepHashes, f.passHashes, f.autoHashes, f.slowHashes, f.suppHashes)
 
-	var nilSet hash.Set
+	var nilSet rclonehash.Set
 	if f.keepHashes == nilSet {
 		return nil, errors.New("configured hash_names have nothing to keep in cache")
 	}
@@ -186,6 +190,11 @@ func NewFs(ctx context.Context, fsname, rpath string, cmap configmap.Mapper) (fs
 	// Enable ListP always
 	f.features.ListP = f.ListP
 
+	// Enable OpenChunkWriter if underlying backend supports it or OpenWriterAt
+	if f.Fs.Features().OpenChunkWriter != nil || f.Fs.Features().OpenWriterAt != nil {
+		f.features.OpenChunkWriter = f.OpenChunkWriter
+	}
+
 	cache.PinUntilFinalized(f.Fs, f)
 	return f, err
 }
@@ -204,7 +213,7 @@ func (f *Fs) Root() string { return f.root }
 func (f *Fs) Features() *fs.Features { return f.features }
 
 // Hashes returns the supported hash sets.
-func (f *Fs) Hashes() hash.Set { return f.suppHashes }
+func (f *Fs) Hashes() rclonehash.Set { return f.suppHashes }
 
 // String returns a description of the FS
 // The "hasher::" prefix is a distinctive feature.
@@ -489,6 +498,113 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 	return f.wrapObject(o, err)
 }
 
+// OpenChunkWriter opens a writer for chunked uploads
+func (f *Fs) OpenChunkWriter(ctx context.Context, remote string, src fs.ObjectInfo, options ...fs.OpenOption) (fs.ChunkWriterInfo, fs.ChunkWriter, error) {
+	// Check if underlying backend supports chunked writing
+	do := f.Fs.Features().OpenChunkWriter
+	if do == nil {
+		// Check if underlying backend supports OpenWriterAt
+		openWriterAt := f.Fs.Features().OpenWriterAt
+		if openWriterAt == nil {
+			return fs.ChunkWriterInfo{}, nil, fs.ErrorNotImplemented
+		}
+		// Use standard multithread adapter pattern
+		do = f.createOpenWriterAtAdapter(openWriterAt)
+	}
+
+	// Get underlying chunk writer
+	underlyingInfo, underlyingWriter, err := do(ctx, remote, src, options...)
+	if err != nil {
+		return fs.ChunkWriterInfo{}, nil, err
+	}
+
+	// Calculate number of chunks
+	numChunks := int(math.Ceil(float64(src.Size()) / float64(underlyingInfo.ChunkSize)))
+
+	// Get active hash types for this backend
+	activeHashTypes := f.getActiveHashTypes()
+
+	// Initialize hash tracking
+	hashTracker := newHashOrderTracker(activeHashTypes, numChunks)
+
+	writer := &hasherChunkWriter{
+		underlyingWriter: underlyingWriter,
+		hashTracker:      hashTracker,
+		f:                f,
+		remote:           remote,
+		chunkSize:        underlyingInfo.ChunkSize,
+		totalSize:        src.Size(),
+		numChunks:        numChunks,
+	}
+
+	// Prune any existing hash for this remote
+	_ = f.pruneHash(remote)
+
+	return underlyingInfo, writer, nil
+}
+
+// createOpenWriterAtAdapter creates an adapter from OpenWriterAt to OpenChunkWriter
+func (f *Fs) createOpenWriterAtAdapter(openWriterAt fs.OpenWriterAtFn) fs.OpenChunkWriterFn {
+	return func(ctx context.Context, remote string, src fs.ObjectInfo, options ...fs.OpenOption) (info fs.ChunkWriterInfo, writer fs.ChunkWriter, err error) {
+		ci := fs.GetConfig(ctx)
+
+		// Use standard multithread chunk size
+		chunkSize := int64(ci.MultiThreadChunkSize)
+
+		// Extract chunk size from options if provided
+		for _, option := range options {
+			if chunkOption, ok := option.(*fs.ChunkOption); ok {
+				chunkSize = chunkOption.ChunkSize
+				break
+			}
+		}
+
+		writerAt, err := openWriterAt(ctx, remote, src.Size())
+		if err != nil {
+			return info, nil, err
+		}
+
+		// Use standard positioning: chunkNumber * chunkSize
+		adapter := &standardChunkWriterAdapter{
+			remote:    remote,
+			size:      src.Size(),
+			chunkSize: chunkSize,
+			writerAt:  writerAt,
+		}
+
+		info = fs.ChunkWriterInfo{
+			ChunkSize:   chunkSize,
+			Concurrency: ci.MultiThreadStreams,
+		}
+
+		return info, adapter, nil
+	}
+}
+
+// getActiveHashTypes returns the hash types that should be calculated
+func (f *Fs) getActiveHashTypes() []rclonehash.Type {
+	var activeHashes []rclonehash.Type
+	for _, hashType := range f.keepHashes.Array() {
+		activeHashes = append(activeHashes, hashType)
+	}
+	return activeHashes
+}
+
+// makeFingerprint creates a fingerprint for the given remote and size
+func (f *Fs) makeFingerprint(ctx context.Context, remote string, size int64) string {
+	timeStr := "-"
+	if f.fpTime {
+		// Use current time for new uploads
+		timeStr = time.Now().UTC().Format(timeFormat)
+	}
+	hashStr := "-"
+	// For new uploads, we don't have a hash yet, so use placeholder
+	if size < 0 {
+		return fmt.Sprintf("%d,%s,%s", -1, timeStr, hashStr)
+	}
+	return fmt.Sprintf("%d,%s,%s", size, timeStr, hashStr)
+}
+
 //
 // Object
 //
@@ -590,6 +706,321 @@ func (o *Object) Fd(ctx context.Context, flags int) (uintptr, error) {
 	return do.Fd(ctx, flags)
 }
 
+//
+// OpenChunkWriter support
+//
+
+// chunkData represents a chunk of data for hash calculation
+type chunkData struct {
+	number int
+	data   []byte
+	size   int64
+}
+
+// hashState tracks state for a single hash algorithm
+type hashState struct {
+	hasher       hash.Hash
+	algorithm    rclonehash.Type
+	bytesHashed  int64
+}
+
+// hashOrderTracker manages ordered hash processing across chunks
+type hashOrderTracker struct {
+	// Hash algorithms
+	multiHasher *rclonehash.MultiHasher
+	hashTypes   []rclonehash.Type
+
+	// Ordering for deterministic results
+	chunkBuffer map[int]*chunkData
+	nextChunk   int  // Next chunk number to process
+	numChunks   int  // Total number of chunks expected
+
+	// Synchronization
+	mu          sync.Mutex
+	completed   []bool
+	finalized   bool
+	finalHashes map[rclonehash.Type]string
+}
+
+// newHashOrderTracker creates a new hash order tracker
+func newHashOrderTracker(hashTypes []rclonehash.Type, numChunks int) *hashOrderTracker {
+	tracker := &hashOrderTracker{
+		chunkBuffer: make(map[int]*chunkData),
+		completed:   make([]bool, numChunks),
+		numChunks:   numChunks,
+		hashTypes:   hashTypes,
+	}
+
+	// Initialize hash algorithms using a single MultiHasher
+	var hashSet rclonehash.Set
+	for _, hashType := range hashTypes {
+		hashSet.Add(hashType)
+	}
+	
+	multiHasher, err := rclonehash.NewMultiHasherTypes(hashSet)
+	if err != nil {
+		// If we can't create hashers, just skip them
+		return tracker
+	}
+
+	tracker.multiHasher = multiHasher
+	return tracker
+}
+
+// processChunkForHash processes a chunk for hash calculation
+func (ht *hashOrderTracker) processChunkForHash(chunk *chunkData) {
+	ht.mu.Lock()
+	defer ht.mu.Unlock()
+
+	// Mark this chunk as received
+	if chunk.number >= 0 && chunk.number < len(ht.completed) {
+		ht.completed[chunk.number] = true
+	}
+
+	// If this is the next chunk we're waiting for, process immediately
+	if chunk.number == ht.nextChunk {
+		ht.processChunkData(chunk)
+		ht.nextChunk++
+
+		// Process any buffered chunks that are now ready
+		ht.processBufferedChunks()
+	} else {
+		// Buffer this chunk for later processing
+		ht.chunkBuffer[chunk.number] = chunk
+	}
+}
+
+// processChunkData updates hash algorithms with chunk data
+func (ht *hashOrderTracker) processChunkData(chunk *chunkData) {
+	// Update the MultiHasher with this chunk's data
+	if ht.multiHasher != nil {
+		ht.multiHasher.Write(chunk.data)
+	}
+}
+
+// processBufferedChunks processes any buffered chunks that are now ready
+func (ht *hashOrderTracker) processBufferedChunks() {
+	for {
+		chunk, exists := ht.chunkBuffer[ht.nextChunk]
+		if !exists {
+			break
+		}
+
+		ht.processChunkData(chunk)
+		delete(ht.chunkBuffer, ht.nextChunk)
+		ht.nextChunk++
+	}
+}
+
+// waitForCompletion waits for all chunks to be processed
+func (ht *hashOrderTracker) waitForCompletion(ctx context.Context) error {
+	for {
+		ht.mu.Lock()
+		done := ht.nextChunk >= ht.numChunks
+		ht.mu.Unlock()
+
+		if done {
+			break
+		}
+
+		// Check for context cancellation
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		// Brief wait before checking again
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	return nil
+}
+
+// finalizeHashes computes final hash values
+func (ht *hashOrderTracker) finalizeHashes() map[rclonehash.Type]string {
+	ht.mu.Lock()
+	defer ht.mu.Unlock()
+
+	if ht.finalized {
+		return ht.finalHashes
+	}
+
+	ht.finalHashes = make(map[rclonehash.Type]string)
+	
+	if ht.multiHasher != nil {
+		// Get hashes from the MultiHasher
+		hashSums := ht.multiHasher.Sums()
+		for _, hashType := range ht.hashTypes {
+			if hashValue, ok := hashSums[hashType]; ok {
+				ht.finalHashes[hashType] = hashValue
+			}
+		}
+	}
+
+	ht.finalized = true
+	return ht.finalHashes
+}
+
+// reset clears all state for reuse or cleanup
+func (ht *hashOrderTracker) reset() {
+	ht.mu.Lock()
+	defer ht.mu.Unlock()
+
+	// Clear all buffers and reset state
+	ht.chunkBuffer = make(map[int]*chunkData)
+	ht.nextChunk = 0
+	ht.finalized = false
+	ht.finalHashes = nil
+
+	// Reset the MultiHasher by recreating it
+	if len(ht.hashTypes) > 0 {
+		var hashSet rclonehash.Set
+		for _, hashType := range ht.hashTypes {
+			hashSet.Add(hashType)
+		}
+		
+		if multiHasher, err := rclonehash.NewMultiHasherTypes(hashSet); err == nil {
+			ht.multiHasher = multiHasher
+		}
+	}
+}
+
+// hasherChunkWriter implements fs.ChunkWriter for the hasher backend
+type hasherChunkWriter struct {
+	// Storage delegation
+	underlyingWriter fs.ChunkWriter
+
+	// Hash calculation (independent from storage)
+	hashTracker *hashOrderTracker
+
+	// Configuration
+	f         *Fs
+	remote    string
+	chunkSize int64
+	totalSize int64
+	numChunks int
+}
+
+// WriteChunk writes a chunk of data
+func (w *hasherChunkWriter) WriteChunk(ctx context.Context, chunkNumber int, reader io.ReadSeeker) (int64, error) {
+	// Validate chunk number
+	if chunkNumber < 0 || chunkNumber >= w.numChunks {
+		return 0, fmt.Errorf("invalid chunk number: %d", chunkNumber)
+	}
+
+	// Read all data from the reader first to capture for hash calculation
+	data, err := io.ReadAll(reader)
+	if err != nil {
+		return 0, fmt.Errorf("failed to read chunk %d data: %w", chunkNumber, err)
+	}
+
+	// Create a new reader from the data for the underlying writer
+	dataReader := bytes.NewReader(data)
+
+	// 1. Storage happens immediately using standard patterns
+	bytesWritten, err := w.underlyingWriter.WriteChunk(ctx, chunkNumber, dataReader)
+	if err != nil {
+		return 0, fmt.Errorf("underlying writer failed for chunk %d: %w", chunkNumber, err)
+	}
+
+	// 2. Hash calculation happens in parallel (non-blocking)
+	chunkData := &chunkData{
+		number: chunkNumber,
+		data:   data,
+		size:   int64(len(data)),
+	}
+
+	go w.hashTracker.processChunkForHash(chunkData)
+
+	return bytesWritten, nil
+}
+
+// Close finalizes the chunk writer and stores calculated hashes
+func (w *hasherChunkWriter) Close(ctx context.Context) error {
+	// First, close the underlying writer
+	if err := w.underlyingWriter.Close(ctx); err != nil {
+		return fmt.Errorf("failed to close underlying writer: %w", err)
+	}
+
+	// Wait for all hash calculations to complete
+	if err := w.hashTracker.waitForCompletion(ctx); err != nil {
+		return fmt.Errorf("hash calculation interrupted: %w", err)
+	}
+
+	// Finalize hashes and store in hasher backend cache
+	finalHashes := w.hashTracker.finalizeHashes()
+
+	// Store hashes in hasher backend's database
+	return w.storeHashesInCache(finalHashes)
+}
+
+// Abort cancels the chunk writer operation
+func (w *hasherChunkWriter) Abort(ctx context.Context) error {
+	// First, abort the underlying writer
+	if err := w.underlyingWriter.Abort(ctx); err != nil {
+		return fmt.Errorf("failed to abort underlying writer: %w", err)
+	}
+
+	// Clear hash state
+	w.hashTracker.reset()
+
+	return nil
+}
+
+// storeHashesInCache stores calculated hashes in the hasher backend's cache
+func (w *hasherChunkWriter) storeHashesInCache(hashes map[rclonehash.Type]string) error {
+	if w.f.db == nil {
+		// No database configured, skip caching
+		return nil
+	}
+
+	// Convert to hasher backend's expected format (operations.HashSums uses string keys)
+	hashSums := make(operations.HashSums)
+	for hashType, hashValue := range hashes {
+		hashSums[hashType.String()] = hashValue
+	}
+
+	// Create fingerprint for the uploaded file
+	fp := w.f.makeFingerprint(context.Background(), w.remote, w.totalSize)
+
+	// Store in hasher backend's key-value database using existing kvPut operation
+	return w.f.db.Do(true, &kvPut{
+		key:    path.Join(w.f.Fs.Root(), w.remote),
+		fp:     fp,
+		hashes: hashSums,
+		age:    time.Duration(w.f.opt.MaxAge),
+	})
+}
+
+// standardChunkWriterAdapter adapts OpenWriterAt to ChunkWriter interface
+type standardChunkWriterAdapter struct {
+	remote    string
+	size      int64
+	chunkSize int64
+	writerAt  fs.WriterAtCloser
+}
+
+// WriteChunk implements the ChunkWriter interface using OpenWriterAt
+func (w *standardChunkWriterAdapter) WriteChunk(ctx context.Context, chunkNumber int, reader io.ReadSeeker) (int64, error) {
+	// Standard positioning - chunks can be written in any order
+	offset := int64(chunkNumber) * w.chunkSize
+
+	// Use OffsetWriter for positioned writes
+	writer := io.NewOffsetWriter(w.writerAt, offset)
+	return io.Copy(writer, reader)
+}
+
+// Close closes the underlying writer
+func (w *standardChunkWriterAdapter) Close(ctx context.Context) error {
+	return w.writerAt.Close()
+}
+
+// Abort closes the underlying writer (same as Close for WriterAt)
+func (w *standardChunkWriterAdapter) Abort(ctx context.Context) error {
+	return w.writerAt.Close()
+}
+
 // Check the interfaces are satisfied
 var (
 	_ fs.Fs              = (*Fs)(nil)
@@ -615,4 +1046,6 @@ var (
 	_ fs.Disconnecter    = (*Fs)(nil)
 	_ fs.Shutdowner      = (*Fs)(nil)
 	_ fs.FullObject      = (*Object)(nil)
+	_ fs.ChunkWriter     = (*hasherChunkWriter)(nil)
+	_ fs.ChunkWriter     = (*standardChunkWriterAdapter)(nil)
 )
