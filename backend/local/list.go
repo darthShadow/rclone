@@ -280,7 +280,18 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 			entries = nil // Reset entries to start from beginning
 		}
 
+		fdStat, err := fd.Stat()
+		if err != nil {
+			return nil, fmt.Errorf("failed to stat directory %q: %w", dir, err)
+		}
+		fdModTime := fdStat.ModTime()
+
+		timeNow := time.Now()
+		directoryRecentlyChanged := !fdModTime.IsZero() && !fdModTime.After(timeNow.Add(1*time.Hour)) &&
+			fdModTime.Add(3*time.Hour).After(timeNow)
+
 		var fis []os.FileInfo
+
 		fis, err = f.listFileInfos(ctx, fd, func(entry os.DirEntry) os.FileInfo {
 			newRemote := f.cleanRemote(dir, entry.Name())
 			// Skip excluded files
@@ -288,7 +299,7 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 				return nil
 			}
 			namepath := join.FilePathJoin(fsDirPath, entry.Name())
-			fi, fierr := os.Lstat(namepath)
+			fi, fierr := entry.Info()
 			if os.IsNotExist(fierr) {
 				// Skip entry removed by a concurrent goroutine
 				return nil
@@ -303,6 +314,26 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 				_ = accounting.Stats(ctx).Error(fserrors.NoRetryError(fierr)) // fail the sync
 				return nil
 			}
+
+			// Skip files created in the last 5 minutes, if the option is enabled
+			// This is to avoid listing files that are being created or modified
+			// Only perform the check if the time is not zero and not in the future
+			if entry.Type().IsRegular() && f.opt.SkipRecent {
+				// Check if there's been recent directory activity (creates/deletes/renames)
+				// Directory modtime is more reliable than file modtime since file modtime can be manipulated
+				if directoryRecentlyChanged {
+					// Directory had recent activity, check if this specific file was recently updated
+					fileCTime := readTime(cTime, fi)
+					fileRecentlyChanged := !fileCTime.IsZero() &&
+						!fileCTime.After(timeNow.Add(1*time.Hour)) &&
+						fileCTime.Add(5*time.Minute).After(timeNow)
+
+					if fileRecentlyChanged {
+						return nil // Skip recently updated files when directory shows recent activity
+					}
+				}
+			}
+
 			return fi
 		})
 		// If the error is a timeout or deadline exceeded, close the current fd and set it to nil,
