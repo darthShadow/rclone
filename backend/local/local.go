@@ -211,6 +211,16 @@ the direct stat value and setting this flag will disable that.
 				Advanced: true,
 			},
 			{
+				Name: "skip_recent",
+				Help: `Skip listing files that are less than 5 minutes old.
+
+This flag skips listing files that are less than 5 minutes old. This is useful
+for skipping files that are being written to by another process and thus may
+cause deadlocks (especially on Ceph).`,
+				Default:  false,
+				Advanced: true,
+			},
+			{
 				Name: "case_sensitive",
 				Help: `Force the filesystem to report itself as case sensitive.
 
@@ -392,6 +402,7 @@ type Options struct {
 	Enc                    encoder.MultiEncoder `config:"encoding"`
 	NoClone                bool                 `config:"no_clone"`
 	MetadataRestoreSpecial bool                 `config:"metadata_restore_special_bits"`
+	SkipRecent             bool                 `config:"skip_recent"`
 }
 
 // Fs represents a local filesystem rooted at root
