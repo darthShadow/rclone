@@ -60,6 +60,10 @@ const (
 	defaultWorkerQueueSize = 64
 )
 
+const (
+	discardCache = false
+)
+
 func newFadvise(o *Object, fd int, offset int64) *fadvise {
 	f := &fadvise{
 		o:          o,
@@ -112,6 +116,10 @@ func (f *fadvise) freePages() {
 
 func (f *fadvise) worker() {
 	for p := range f.freePagesCh {
+		if !discardCache {
+			continue
+		}
+
 		if err := unix.Fadvise(f.fd, p.offset, p.length, unix.FADV_DONTNEED); err != nil {
 			fs.Debugf(f.o, "fadvise dontneed failed on file descriptor %d: %s", f.fd, err)
 		}
