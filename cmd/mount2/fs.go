@@ -87,21 +87,21 @@ func getMode(node os.FileInfo) uint32 {
 }
 
 // fill in attr from node
-func setAttr(node vfs.Node, attr *fuse.Attr) {
-	Size := uint64(node.Size())
-	const BlockSize = 512
-	Blocks := (Size + BlockSize - 1) / BlockSize
+func (f *FS) setAttr(node vfs.Node, attr *fuse.Attr) {
+	size := uint64(node.Size())
+	vfs := node.VFS()
+	dataBlockSize, ioBlockSize := vfs.GetBlockSizes()
+	blocks := (size + uint64(dataBlockSize) - 1) / uint64(dataBlockSize)
 	modTime := node.ModTime()
 	// set attributes
-	vfs := node.VFS()
 	attr.Owner.Gid = vfs.Opt.GID
 	attr.Owner.Uid = vfs.Opt.UID
 	attr.Ino = node.Inode()
 	attr.Mode = getMode(node)
-	attr.Size = Size
+	attr.Size = size
 	attr.Nlink = 1
-	attr.Blocks = Blocks
-	// attr.Blksize = BlockSize // not supported in freebsd/darwin, defaults to 4k if not set
+	attr.Blocks = blocks
+	attr.Blksize = uint32(ioBlockSize)
 	s := uint64(modTime.Unix())
 	ns := uint32(modTime.Nanosecond())
 	attr.Atime = s
@@ -115,13 +115,13 @@ func setAttr(node vfs.Node, attr *fuse.Attr) {
 
 // fill in AttrOut from node
 func (f *FS) setAttrOut(node vfs.Node, out *fuse.AttrOut) {
-	setAttr(node, &out.Attr)
+	f.setAttr(node, &out.Attr)
 	out.SetTimeout(time.Duration(f.opt.AttrTimeout))
 }
 
 // fill in EntryOut from node
 func (f *FS) setEntryOut(node vfs.Node, out *fuse.EntryOut) {
-	setAttr(node, &out.Attr)
+	f.setAttr(node, &out.Attr)
 	out.SetEntryTimeout(time.Duration(f.opt.AttrTimeout))
 	out.SetAttrTimeout(time.Duration(f.opt.AttrTimeout))
 }
