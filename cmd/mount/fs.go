@@ -55,16 +55,17 @@ var _ fusefs.FSStatfser = (*FS)(nil)
 // It should write that data to resp.
 func (f *FS) Statfs(ctx context.Context, req *fuse.StatfsRequest, resp *fuse.StatfsResponse) (err error) {
 	defer log.Trace("", "")("stat=%+v, err=%v", resp, &err)
-	const blockSize = 4096
+	_, ioBlockSize := f.VFS.GetBlockSizes()
+	blockSize := uint64(ioBlockSize)
 	total, _, free := f.VFS.Statfs()
 	resp.Blocks = uint64(total) / blockSize // Total data blocks in file system.
 	resp.Bfree = uint64(free) / blockSize   // Free blocks in file system.
 	resp.Bavail = resp.Bfree                // Free blocks in file system if you're not root.
 	resp.Files = 1e9                        // Total files in file system.
 	resp.Ffree = 1e9                        // Free files in file system.
-	resp.Bsize = blockSize                  // Block size
+	resp.Bsize = uint32(blockSize)          // Block size
 	resp.Namelen = 255                      // Maximum file name length?
-	resp.Frsize = blockSize                 // Fragment size, smallest addressable data size in the file system.
+	resp.Frsize = uint32(blockSize)         // Fragment size, smallest addressable data size in the file system.
 	mountlib.ClipBlocks(&resp.Blocks)
 	mountlib.ClipBlocks(&resp.Bfree)
 	mountlib.ClipBlocks(&resp.Bavail)

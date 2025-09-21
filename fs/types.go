@@ -365,16 +365,32 @@ func NewUsageValue[T interface {
 	return p
 }
 
+// NewUsageValue32 makes a valid int32 value
+func NewUsageValue32[T interface {
+	int64 | int32 | int
+}](value T) *int32 {
+	p := new(int32)
+	if value > T(int32(math.MaxInt32)) {
+		*p = math.MaxInt32
+	} else if value < 0 {
+		*p = 0
+	} else {
+		*p = int32(value)
+	}
+	return p
+}
+
 // Usage is returned by the About call
 //
 // If a value is nil then it isn't supported by that backend
 type Usage struct {
-	Total   *int64 `json:"total,omitempty"`   // quota of bytes that can be used
-	Used    *int64 `json:"used,omitempty"`    // bytes in use
-	Trashed *int64 `json:"trashed,omitempty"` // bytes in trash
-	Other   *int64 `json:"other,omitempty"`   // other usage e.g. gmail in drive
-	Free    *int64 `json:"free,omitempty"`    // bytes which can be uploaded before reaching the quota
-	Objects *int64 `json:"objects,omitempty"` // objects in the storage system
+	Total       *int64 `json:"total,omitempty"`       // quota of bytes that can be used
+	Used        *int64 `json:"used,omitempty"`        // bytes in use
+	Trashed     *int64 `json:"trashed,omitempty"`     // bytes in trash
+	Other       *int64 `json:"other,omitempty"`       // other usage e.g. gmail in drive
+	Free        *int64 `json:"free,omitempty"`        // bytes which can be uploaded before reaching the quota
+	Objects     *int64 `json:"objects,omitempty"`     // objects in the storage system
+	IOBlockSize *int32 `json:"ioblocksize,omitempty"` // preferred IO block size for this filesystem
 }
 
 // WriterAtCloser wraps io.WriterAt and io.Closer

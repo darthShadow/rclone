@@ -730,6 +730,28 @@ func (vfs *VFS) Statfs() (total, used, free int64) {
 	return
 }
 
+// GetBlockSizes returns both the data block size and IO block size.
+// DataBlockSize is always 512 for POSIX compatibility.
+// IOBlockSize is obtained from the filesystem via About() call, or 4096 as default.
+func (vfs *VFS) GetBlockSizes() (int32, int32) {
+	const dataBlockSize = int32(512)
+
+	// Call Statfs to ensure we have up-to-date usage information
+	_, _, _ = vfs.Statfs()
+
+	vfs.usageMu.Lock()
+	defer vfs.usageMu.Unlock()
+
+	var ioBlockSize int32 = 4096 // Default
+	if vfs.usage != nil && vfs.usage.IOBlockSize != nil {
+		if *vfs.usage.IOBlockSize > 0 {
+			ioBlockSize = *vfs.usage.IOBlockSize
+		}
+	}
+
+	return dataBlockSize, ioBlockSize
+}
+
 // Remove removes the named file or (empty) directory.
 func (vfs *VFS) Remove(name string) error {
 	node, err := vfs.Stat(name)

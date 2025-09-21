@@ -644,12 +644,13 @@ func (f *Fs) PutStream(ctx context.Context, in io.Reader, src fs.ObjectInfo, opt
 // About gets quota information from the Fs
 func (f *Fs) About(ctx context.Context) (*fs.Usage, error) {
 	usage := &fs.Usage{
-		Total:   new(int64),
-		Used:    new(int64),
-		Trashed: new(int64),
-		Other:   new(int64),
-		Free:    new(int64),
-		Objects: new(int64),
+		Total:       new(int64),
+		Used:        new(int64),
+		Trashed:     new(int64),
+		Other:       new(int64),
+		Free:        new(int64),
+		Objects:     new(int64),
+		IOBlockSize: new(int32),
 	}
 	for _, u := range f.upstreams {
 		usg, err := u.About(ctx)
@@ -689,6 +690,15 @@ func (f *Fs) About(ctx context.Context) (*fs.Usage, error) {
 		} else {
 			usage.Objects = nil
 		}
+		if usg.IOBlockSize != nil && usage.IOBlockSize != nil {
+			*usage.IOBlockSize = min(*usage.IOBlockSize, *usg.IOBlockSize)
+		} else {
+			usage.IOBlockSize = nil
+		}
+	}
+	// If no upstream provided IOBlockSize, set to nil
+	if usage.IOBlockSize != nil && *usage.IOBlockSize == 0 {
+		usage.IOBlockSize = nil
 	}
 	return usage, nil
 }

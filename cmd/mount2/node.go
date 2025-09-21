@@ -101,16 +101,17 @@ func (n *Node) lookupDir(leaf string) (*vfs.Dir, syscall.Errno) {
 // will not work.
 func (n *Node) Statfs(ctx context.Context, out *fuse.StatfsOut) syscall.Errno {
 	defer log.Trace(n, "")("out=%+v", &out)
-	const blockSize = 4096
 	total, _, free := n.VFS().Statfs()
+	_, ioBlockSize := n.VFS().GetBlockSizes()
+	blockSize := uint64(ioBlockSize)
 	out.Blocks = uint64(total) / blockSize // Total data blocks in file system.
 	out.Bfree = uint64(free) / blockSize   // Free blocks in file system.
 	out.Bavail = out.Bfree                 // Free blocks in file system if you're not root.
 	out.Files = 1e9                        // Total files in file system.
 	out.Ffree = 1e9                        // Free files in file system.
-	out.Bsize = blockSize                  // Block size
+	out.Bsize = uint32(blockSize)          // Block size
 	out.NameLen = 255                      // Maximum file name length?
-	out.Frsize = blockSize                 // Fragment size, smallest addressable data size in the file system.
+	out.Frsize = uint32(blockSize)         // Fragment size, smallest addressable data size in the file system.
 	mountlib.ClipBlocks(&out.Blocks)
 	mountlib.ClipBlocks(&out.Bfree)
 	mountlib.ClipBlocks(&out.Bavail)

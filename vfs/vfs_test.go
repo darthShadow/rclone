@@ -350,6 +350,12 @@ func TestVFSStatfs(t *testing.T) {
 		assert.Equal(t, int64(0), used)
 	}
 
+	// Validate IOBlockSize
+	if vfs.usage.IOBlockSize != nil {
+		assert.True(t, *vfs.usage.IOBlockSize > 0, "IOBlockSize should be positive")
+		assert.True(t, *vfs.usage.IOBlockSize%512 == 0, "IOBlockSize should be a multiple of 512")
+	}
+
 	// read cached
 	oldUsage := vfs.usage
 	oldTime := vfs.usageTime
@@ -359,6 +365,40 @@ func TestVFSStatfs(t *testing.T) {
 	assert.Equal(t, used, used2)
 	assert.Equal(t, free, free2)
 	assert.Equal(t, oldTime, vfs.usageTime)
+}
+
+func TestVFSGetBlockSizes(t *testing.T) {
+	r, vfs := newTestVFS(t)
+
+	dataBlockSize, ioBlockSize := vfs.GetBlockSizes()
+
+	// DataBlockSize should always be 512
+	assert.Equal(t, int32(512), dataBlockSize, "DataBlockSize should always be 512")
+
+	// IOBlockSize should be positive and a multiple of 512
+	assert.True(t, ioBlockSize > 0, "IOBlockSize should be positive")
+	assert.True(t, ioBlockSize%512 == 0, "IOBlockSize should be a multiple of 512")
+
+	// If About is supported, IOBlockSize should match the usage
+	if r.Fremote.Features().About != nil {
+		// Call Statfs to populate usage
+		_, _, _ = vfs.Statfs()
+
+		if vfs.usage != nil && vfs.usage.IOBlockSize != nil {
+			assert.Equal(t, *vfs.usage.IOBlockSize, ioBlockSize, "IOBlockSize should match usage.IOBlockSize")
+		} else {
+			// If no IOBlockSize in usage, should default to 4096
+			assert.Equal(t, int32(4096), ioBlockSize, "IOBlockSize should default to 4096")
+		}
+	} else {
+		// If About not supported, should default to 4096
+		assert.Equal(t, int32(4096), ioBlockSize, "IOBlockSize should default to 4096 when About not supported")
+	}
+
+	// Test that multiple calls return the same values (caching)
+	dataBlockSize2, ioBlockSize2 := vfs.GetBlockSizes()
+	assert.Equal(t, dataBlockSize, dataBlockSize2, "DataBlockSize should be consistent")
+	assert.Equal(t, ioBlockSize, ioBlockSize2, "IOBlockSize should be consistent")
 }
 
 func TestVFSMkdir(t *testing.T) {

@@ -30,9 +30,10 @@ func (f *Fs) About(ctx context.Context) (*fs.Usage, error) {
 		return nil, fmt.Errorf("failed to read disk usage: %w", e1)
 	}
 	usage := &fs.Usage{
-		Total: fs.NewUsageValue(total),        // quota of bytes that can be used
-		Used:  fs.NewUsageValue(total - free), // bytes in use
-		Free:  fs.NewUsageValue(available),    // bytes which can be uploaded before reaching the quota
+		Total:       fs.NewUsageValue(total),        // quota of bytes that can be used
+		Used:        fs.NewUsageValue(total - free), // bytes in use
+		Free:        fs.NewUsageValue(available),    // bytes which can be uploaded before reaching the quota
+		IOBlockSize: fs.NewUsageValue32(4096),       // use 4KB default for Windows
 	}
 	return usage, nil
 }
