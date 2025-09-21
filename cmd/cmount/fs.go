@@ -139,8 +139,9 @@ func (fsys *FS) getNode(path string, fh uint64) (node vfs.Node, handle vfs.Handl
 
 // stat fills up the stat block for Node
 func (fsys *FS) stat(node vfs.Node, stat *fuse.Stat_t) (errc int) {
-	Size := uint64(node.Size())
-	Blocks := (Size + 511) / 512
+	size := uint64(node.Size())
+	dataBlockSize, ioBlockSize := fsys.VFS.GetBlockSizes()
+	blocks := (size + uint64(dataBlockSize) - 1) / uint64(dataBlockSize)
 	modTime := node.ModTime()
 	//stat.Dev = 1
 	stat.Ino = node.Inode() // FIXME do we need to set the inode number?
@@ -149,13 +150,13 @@ func (fsys *FS) stat(node vfs.Node, stat *fuse.Stat_t) (errc int) {
 	stat.Uid = fsys.VFS.Opt.UID
 	stat.Gid = fsys.VFS.Opt.GID
 	//stat.Rdev
-	stat.Size = int64(Size)
+	stat.Size = int64(size)
 	t := fuse.NewTimespec(modTime)
 	stat.Atim = t
 	stat.Mtim = t
 	stat.Ctim = t
-	stat.Blksize = 512
-	stat.Blocks = int64(Blocks)
+	stat.Blocks = int64(blocks)
+	stat.Blksize = int64(ioBlockSize)
 	stat.Birthtim = t
 	// fs.Debugf(nil, "stat = %+v", *stat)
 	return 0
@@ -265,16 +266,17 @@ func (fsys *FS) Releasedir(path string, fh uint64) (errc int) {
 // Statfs reads overall stats on the filesystem
 func (fsys *FS) Statfs(path string, stat *fuse.Statfs_t) (errc int) {
 	defer log.Trace(path, "")("stat=%+v, errc=%d", stat, &errc)
-	const blockSize = 4096
+	_, ioBlockSize := fsys.VFS.GetBlockSizes()
+	blockSize := uint64(ioBlockSize)
 	total, _, free := fsys.VFS.Statfs()
 	stat.Blocks = uint64(total) / blockSize // Total data blocks in file system.
 	stat.Bfree = uint64(free) / blockSize   // Free blocks in file system.
 	stat.Bavail = stat.Bfree                // Free blocks in file system if you're not root.
 	stat.Files = 1e9                        // Total files in file system.
 	stat.Ffree = 1e9                        // Free files in file system.
-	stat.Bsize = blockSize                  // Block size
+	stat.Bsize = uint64(blockSize)          // Block size
 	stat.Namemax = 255                      // Maximum file name length?
-	stat.Frsize = blockSize                 // Fragment size, smallest addressable data size in the file system.
+	stat.Frsize = uint64(blockSize)         // Fragment size, smallest addressable data size in the file system.
 	mountlib.ClipBlocks(&stat.Blocks)
 	mountlib.ClipBlocks(&stat.Bfree)
 	mountlib.ClipBlocks(&stat.Bavail)

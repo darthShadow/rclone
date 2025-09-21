@@ -28,16 +28,18 @@ func (f *File) Attr(ctx context.Context, a *fuse.Attr) (err error) {
 	defer log.Trace(f, "")("a=%+v, err=%v", a, &err)
 	a.Valid = time.Duration(f.fsys.opt.AttrTimeout)
 	modTime := f.File.ModTime()
-	Size := uint64(f.File.Size())
-	Blocks := (Size + 511) / 512
+	size := uint64(f.File.Size())
+	dataBlockSize, ioBlockSize := f.VFS().GetBlockSizes()
+	blocks := (size + uint64(dataBlockSize) - 1) / uint64(dataBlockSize)
 	a.Gid = f.VFS().Opt.GID
 	a.Uid = f.VFS().Opt.UID
 	a.Mode = f.File.Mode() &^ os.ModeAppend
-	a.Size = Size
+	a.Size = size
 	a.Atime = modTime
 	a.Mtime = modTime
 	a.Ctime = modTime
-	a.Blocks = Blocks
+	a.Blocks = blocks
+	a.BlockSize = uint32(ioBlockSize)
 	return nil
 }
 
