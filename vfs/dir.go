@@ -535,17 +535,26 @@ func (d *Dir) DelVirtual(leaf string) {
 	d.delObject(leaf)
 }
 
-// read the directory and sets d.items - must be called with the lock held
+// read the directory and sets d.items
 func (d *Dir) _readDir() error {
 	when := time.Now()
-	if age, stale := d._age(when); stale {
-		if age != 0 {
-			fs.Debugf(d.path, "Re-reading directory (%v old)", age)
-		}
-	} else {
+
+	// Quick staleness check
+	d.mu.RLock()
+	age, stale := d._age(when)
+	if !stale {
+		d.mu.RUnlock()
 		return nil
 	}
-	entries, err := list.DirSorted(d.vfs.ctx, d.f, false, d.path)
+	if age != 0 {
+		fs.Debugf(d.path, "Re-reading directory (%v old)", age)
+	}
+	// Capture references for unlocked operations
+	path, f, vfsCtx, vfsOpt := d.path, d.f, d.vfs.ctx, d.vfs.Opt
+	d.mu.RUnlock()
+
+	// Expensive I/O operations without lock
+	entries, err := list.DirSorted(vfsCtx, f, false, path)
 	if errors.Is(err, fs.ErrorDirNotFound) {
 		// We treat directory not found as empty because we
 		// create directories on the fly
@@ -553,8 +562,9 @@ func (d *Dir) _readDir() error {
 		return err
 	}
 
-	if d.vfs.Opt.BlockNormDupes { // do this only if requested, as it will have a performance hit
-		ci := fs.GetConfig(d.vfs.ctx)
+	// Unicode normalization processing
+	if vfsOpt.BlockNormDupes { // do this only if requested, as it will have a performance hit
+		ci := fs.GetConfig(vfsCtx)
 
 		// sort entries such that NFD comes before NFC of same name
 		slices.SortFunc(entries, func(entryA, entryB fs.DirEntry) int {
@@ -575,7 +585,7 @@ func (d *Dir) _readDir() error {
 		normalizedNames := make(map[string]struct{}, entries.Len())
 		filteredEntries := make(fs.DirEntries, 0)
 		for _, e := range entries {
-			normName := fmt.Sprintf("%s-%T", operations.ToNormal(e.Remote(), !ci.NoUnicodeNormalization, (ci.IgnoreCaseSync || d.vfs.Opt.CaseInsensitive)), e) // include type to track objects and dirs separately
+			normName := fmt.Sprintf("%s-%T", operations.ToNormal(e.Remote(), !ci.NoUnicodeNormalization, (ci.IgnoreCaseSync || vfsOpt.CaseInsensitive)), e) // include type to track objects and dirs separately
 			_, found := normalizedNames[normName]
 			if found {
 				fs.Errorf(e.Remote(), "duplicate normalized names detected - skipping")
@@ -587,12 +597,24 @@ func (d *Dir) _readDir() error {
 		entries = filteredEntries
 	}
 
+	when = time.Now()
+
+	// Atomic state update
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	// Double-check staleness to prevent duplicate work
+	if _, stale := d._age(when); !stale {
+		return nil
+	}
+
+	// Apply changes
 	err = d._readDirFromEntries(entries, nil, time.Time{})
 	if err != nil {
 		return err
 	}
 
-	d.read = time.Now()
+	d.read = when
 	d.statRead = make(map[string]time.Time)
 	d.cleanupTimer.Reset(time.Duration(d.vfs.Opt.DirCacheTime * 2))
 
@@ -841,9 +863,11 @@ func (d *Dir) readDirTree() error {
 
 // readDir forces a refresh of the directory
 func (d *Dir) readDir() error {
+	// Force refresh
 	d.mu.Lock()
-	defer d.mu.Unlock()
 	d.read = time.Time{}
+	d.mu.Unlock()
+
 	return d._readDir()
 }
 
@@ -897,26 +921,39 @@ func (d *Dir) statMetadata(leaf, baseLeaf string) (metaNode Node, err error) {
 // returns false if not found.
 func (d *Dir) _stat(leaf string) bool {
 	when := time.Now()
+
+	// Quick staleness check
+	d.mu.RLock()
 	if _, stale := d._age(when); !stale {
+		d.mu.RUnlock()
 		return true
 	}
 
 	stater, ok := d.f.(fs.Stater)
 	if !ok {
+		d.mu.RUnlock()
 		return false
 	}
 
 	// Use statRead to cache the stat time and avoid doing it again
-	statTime, ok := d.statRead[leaf]
-	if ok {
+	statTime, cached := d.statRead[leaf]
+	if cached {
 		age := when.Sub(statTime)
 		stale := age > time.Duration(d.vfs.Opt.DirCacheTime)
 		if !stale {
+			d.mu.RUnlock()
 			return true
 		}
 	}
 
-	entry, err := stater.Stat(d.vfs.ctx, d.path, leaf)
+	// Capture references for unlocked operations
+	dirPath := d.path
+	vfsOptDirCacheTime := d.vfs.Opt.DirCacheTime
+	vfsCtx := d.vfs.ctx
+	d.mu.RUnlock()
+
+	// Expensive I/O operations without lock
+	entry, err := stater.Stat(vfsCtx, dirPath, leaf)
 	if err != nil {
 		switch {
 		case errors.Is(err, ENOENT) || errors.Is(err, os.ErrNotExist):
@@ -926,15 +963,15 @@ func (d *Dir) _stat(leaf string) bool {
 		case errors.Is(err, fs.ErrorNotImplemented):
 			return false
 		default:
-			fs.Errorf(d.path, "stat error: %q: %v", leaf, err)
+			fs.Errorf(dirPath, "stat error: %q: %v", leaf, err)
 			return false
 		}
 	}
 
-	fi := filter.GetConfig(d.vfs.ctx)
-	excluded, err := fi.DirContainsExcludeFile(d.vfs.ctx, d.f, d.path)
+	fi := filter.GetConfig(vfsCtx)
+	excluded, err := fi.DirContainsExcludeFile(vfsCtx, d.f, dirPath)
 	if err != nil {
-		fs.Errorf(d.path, "stat filter error: %q: %v", leaf, err)
+		fs.Errorf(dirPath, "stat filter error: %q: %v", leaf, err)
 		return false
 	}
 	if excluded {
@@ -943,13 +980,13 @@ func (d *Dir) _stat(leaf string) bool {
 
 	switch item := entry.(type) {
 	case fs.Object:
-		if !fi.IncludeObject(d.vfs.ctx, item) {
+		if !fi.IncludeObject(vfsCtx, item) {
 			return false
 		}
 	case fs.Directory:
-		include, err := fi.IncludeDirectory(d.vfs.ctx, d.f)(item.Remote())
+		include, err := fi.IncludeDirectory(vfsCtx, d.f)(item.Remote())
 		if err != nil {
-			fs.Errorf(d.path, "stat filter error: %q: %v", leaf, err)
+			fs.Errorf(dirPath, "stat filter error: %q: %v", leaf, err)
 			return false
 		}
 		if !include {
@@ -957,9 +994,36 @@ func (d *Dir) _stat(leaf string) bool {
 		}
 	}
 
+	when = time.Now()
+
+	// Atomic state update
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	// Double-check staleness to prevent duplicate work
+	if _, stale := d._age(when); !stale {
+		return true
+	}
+
 	entryName := path.Base(entry.Remote())
+
+	// Double-check stat time for both requested and actual names
+	checkNames := []string{leaf}
+	if entryName != leaf {
+		checkNames = append(checkNames, entryName)
+	}
+	for _, name := range checkNames {
+		if statTime, ok := d.statRead[name]; ok {
+			age := when.Sub(statTime)
+			stale := age > time.Duration(vfsOptDirCacheTime)
+			if !stale {
+				return true
+			}
+		}
+	}
+
 	if err = d._processEntry(entry, nil, nil, when); err != nil {
-		fs.Errorf(d.path, "processing entry: %q: %v", entryName, err)
+		fs.Errorf(dirPath, "processing entry: %q: %v", entryName, err)
 		return false
 	}
 
@@ -977,24 +1041,18 @@ func (d *Dir) _stat(leaf string) bool {
 // returns a custom error if directory on a case-insensitive file system
 // contains files with names that differ only by case.
 func (d *Dir) stat(leaf string) (Node, error) {
-	d.mu.Lock()
-
-	var (
-		ok   bool
-		item Node
-	)
-
-	ok = d._stat(leaf)
+	ok := d._stat(leaf)
 
 	if !ok {
+		// Fallback to full directory read
 		err := d._readDir()
 		if err != nil {
-			d.mu.Unlock()
 			return nil, err
 		}
 	}
 
-	item, ok = d.items[leaf]
+	d.mu.Lock()
+	item, ok := d.items[leaf]
 	d.mu.Unlock()
 
 	// Look for a metadata file
@@ -1040,13 +1098,16 @@ func (d *Dir) stat(leaf string) (Node, error) {
 
 // Check to see if a directory is empty
 func (d *Dir) isEmpty() (bool, error) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
 	err := d._readDir()
 	if err != nil {
 		return false, err
 	}
-	return len(d.items) == 0, nil
+
+	d.mu.Lock()
+	empty := len(d.items) == 0
+	d.mu.Unlock()
+
+	return empty, nil
 }
 
 // ModTime returns the modification time of the directory
@@ -1408,15 +1469,14 @@ func (d *Dir) Truncate(size int64) error {
 // MapReadDir applies a conversion function to all nodes returned from a readdir of the directory
 // and returns a slice of results
 func MapReadDir[T any](d *Dir, convertNode func(Node) (T, error), existingItemCount int) (items []T, err error) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-
 	err = d._readDir()
 	if err != nil {
 		return nil, err
 	}
 
-	// Initialize slice with existingItemCount length to preserve existing items
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
 	items = make([]T, existingItemCount, existingItemCount+len(d.items))
 
 	for _, item := range d.items {
