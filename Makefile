@@ -56,9 +56,9 @@ endif
 ifeq ($(GO_OS),windows)
 	rm resource_windows_`go env GOARCH`.syso
 endif
-	mkdir -p `go env GOPATH`/bin/
-	cp -av rclone`go env GOEXE` `go env GOPATH`/bin/rclone`go env GOEXE`.new
-	mv -v `go env GOPATH`/bin/rclone`go env GOEXE`.new `go env GOPATH`/bin/rclone`go env GOEXE`
+	mkdir -p `go env GOPATH | cut -d: -f1`/bin/
+	cp -av rclone`go env GOEXE` `go env GOPATH | cut -d: -f1`/bin/rclone`go env GOEXE`.new
+	mv -v `go env GOPATH | cut -d: -f1`/bin/rclone`go env GOEXE`.new `go env GOPATH | cut -d: -f1`/bin/rclone`go env GOEXE`
 
 fetch-gui:
 	$(SHELL) ./bin/fetch-gui-dist.sh
@@ -192,7 +192,7 @@ rcdocs: rclone
 
 install: rclone
 	install -d ${DESTDIR}/usr/bin
-	install ${GOPATH}/bin/rclone ${DESTDIR}/usr/bin
+	install `go env GOPATH | cut -d: -f1`/bin/rclone ${DESTDIR}/usr/bin
 
 clean:
 	go clean ./...
