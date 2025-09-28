@@ -378,14 +378,23 @@ func (f *File) ModTime() (modTime time.Time) {
 	// Note that we only cache modtime values that we have returned to the OS
 	// if we haven't returned a value to the OS then we can change it
 	defer func() {
-		if f.d.f.Precision() == fs.ModTimeNotSupported && (virtualModTime == nil || !virtualModTime.Equal(modTime)) {
-			f.virtualModTime = &modTime
-			fs.Debugf(f._path(), "Set virtual modtime to %v", f.virtualModTime)
+		if f.d.f.Precision() == fs.ModTimeNotSupported {
+			f.mu.Lock()
+			// Re-check virtualModTime under lock to avoid race condition
+			if f.virtualModTime == nil || !f.virtualModTime.Equal(modTime) {
+				f.virtualModTime = &modTime
+				fs.Debugf(f._path(), "Set virtual modtime to %v", f.virtualModTime)
+			}
+			f.mu.Unlock()
 		}
 	}()
 
 	if d.vfs.Opt.NoModTime {
 		return d.ModTime()
+	}
+	// Check pending modtime first (explicit SetModTime calls take precedence)
+	if !pendingModTime.IsZero() {
+		return f._roundModTime(pendingModTime)
 	}
 	// Read the modtime from a dirty item if it exists
 	if f.d.vfs.Opt.CacheMode >= vfscommon.CacheModeMinimal {
@@ -398,11 +407,8 @@ func (f *File) ModTime() (modTime time.Time) {
 			}
 		}
 	}
-	if !pendingModTime.IsZero() {
-		return f._roundModTime(pendingModTime)
-	}
 	if virtualModTime != nil && !virtualModTime.IsZero() {
-		fs.Debugf(f._path(), "Returning virtual modtime %v", f.virtualModTime)
+		fs.Debugf(f._path(), "Returning virtual modtime %v", *virtualModTime)
 		return f._roundModTime(*virtualModTime)
 	}
 	if o == nil {

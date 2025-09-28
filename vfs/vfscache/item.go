@@ -371,9 +371,8 @@ func (item *Item) Truncate(size int64) (err error) {
 //
 // Call with mutex held
 func (item *Item) _stat() (fi os.FileInfo, err error) {
-	if item.fd != nil {
-		return item.fd.Stat()
-	}
+	// Always use os.Stat() to avoid stale file descriptor cache
+	// after os.Chtimes() calls in _setModTime()
 	osPath := item.c.toOSPath(item.name) // No locking in Cache
 	return os.Stat(osPath)
 }
@@ -670,6 +669,28 @@ func (item *Item) _store(ctx context.Context, storeFn StoreFn) (err error) {
 		item.mu.Lock()
 	}
 
+	// Ensure remote modtime matches cache metadata
+	// This handles the implicit modtime case where no explicit SetModTime was called
+	// For explicit SetModTime, storeFn already updated both item.info.ModTime and remote
+	if item.o != nil {
+		intendedModTime := item.info.ModTime
+		actualModTime := item.o.ModTime(ctx)
+		precision := item.o.Fs().Precision()
+
+		// Check if modtimes differ beyond precision tolerance
+		dt := intendedModTime.Sub(actualModTime)
+		if dt >= precision || dt <= -precision {
+			fs.Debugf(item.name, "vfs cache: setting remote modtime to %v (was %v)", intendedModTime, actualModTime)
+			err = item.o.SetModTime(ctx, intendedModTime)
+			if err != nil {
+				// Don't fail the upload if we can't set modtime
+				if !errors.Is(err, fs.ErrorCantSetModTime) && !errors.Is(err, fs.ErrorCantSetModTimeWithoutDelete) {
+					fs.Errorf(item.name, "vfs cache: failed to set remote modtime: %v", err)
+				}
+			}
+		}
+	}
+
 	// Show item is clean and is eligible for cache removal
 	item.info.Dirty = false
 	err = item._save()
@@ -756,6 +777,7 @@ func (item *Item) closeAfterGrace() {
 // Call with item.mu held. May temporarily unlock item.mu.
 func (item *Item) _actualClose(storeFn StoreFn, syncWriteBack bool) (err error) {
 	var dls *downloaders.Downloaders
+	wasDirty := item.info.Dirty
 
 	// Update the size on close
 	_, _ = item._getSize()
@@ -813,7 +835,7 @@ func (item *Item) _actualClose(storeFn StoreFn, syncWriteBack bool) (err error) 
 	// if the item hasn't been changed but has been completed then
 	// set the modtime from the object otherwise set it from the info
 	if item._exists() {
-		if !item.info.Dirty && item.o != nil {
+		if !wasDirty && item.o != nil {
 			item._setModTime(item.o.ModTime(item.c.ctx))
 		} else {
 			item._setModTime(item.info.ModTime)
@@ -1337,14 +1359,21 @@ func (item *Item) _setModTime(modTime time.Time) {
 func (item *Item) setModTime(modTime time.Time) {
 	// defer log.Trace(item.name, "modTime=%v", modTime)("")
 	item.mu.Lock()
+	defer item.mu.Unlock()
+
 	item._updateFingerprint()
 	item._setModTime(modTime)
+
+	// Only update in-memory metadata if disk save succeeds
+	// to maintain consistency between in-memory and disk state
+	oldModTime := item.info.ModTime
 	item.info.ModTime = modTime
 	err := item._save()
 	if err != nil {
+		// Rollback in-memory state on save failure
+		item.info.ModTime = oldModTime
 		fs.Errorf(item.name, "vfs cache: setModTime: failed to save item info: %v", err)
 	}
-	item.mu.Unlock()
 }
 
 // GetModTime of the cache file
@@ -1352,6 +1381,14 @@ func (item *Item) GetModTime() (modTime time.Time, err error) {
 	// defer log.Trace(item.name, "modTime=%v", modTime)("")
 	item.mu.Lock()
 	defer item.mu.Unlock()
+
+	// For dirty files, use the metadata modtime as the authoritative source
+	// to avoid race conditions with filesystem modtime updates
+	if item.info.Dirty {
+		return item.info.ModTime, nil
+	}
+
+	// For clean files, use the filesystem modtime
 	fi, err := item._stat()
 	if err == nil {
 		modTime = fi.ModTime()
