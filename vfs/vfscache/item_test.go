@@ -869,3 +869,33 @@ func TestItemHandleCachingStaleReopenReadsRemote(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, contents, string(buf[:n]))
 }
+
+func TestItemStoreFingerprintAfterSetModTime(t *testing.T) {
+	r, c := newItemTestCache(t)
+	if r.Fremote.Precision() == fs.ModTimeNotSupported {
+		t.Skip("backend does not support modtime")
+	}
+	item, _ := c.get("modtime")
+	require.NoError(t, item.Open(nil))
+	_, err := item.WriteAt([]byte("contents"), 0)
+	require.NoError(t, err)
+	intended := time.Date(2001, 2, 3, 4, 5, 6, 0, time.UTC)
+	require.NoError(t, item.Close(func(o fs.Object) {
+		item.mu.Lock()
+		item.info.ModTime = intended
+		item.mu.Unlock()
+	}))
+	o, err := r.Fremote.NewObject(context.Background(), "modtime")
+	require.NoError(t, err)
+	assert.WithinDuration(t, intended, o.ModTime(context.Background()), r.Fremote.Precision())
+	item.mu.Lock()
+	defer item.mu.Unlock()
+	assert.Equal(t, fs.Fingerprint(c.ctx, o, c.opt.FastFingerprint), item.info.Fingerprint)
+	require.NoError(t, item._checkObject(o))
+	assert.True(t, item._exists(), "checking the uploaded object must retain the clean cache file")
+	assert.True(t, item._present(), "checking the uploaded object must retain its cached ranges")
+	data, err := os.ReadFile(c.toOSPath(item.name))
+	require.NoError(t, err)
+	assert.Equal(t, "contents", string(data))
+	assert.False(t, item.info.Dirty)
+}
