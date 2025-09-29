@@ -18,7 +18,6 @@ import (
 	"unicode/utf8"
 
 	"github.com/rclone/rclone/fs"
-	"github.com/rclone/rclone/fs/accounting"
 	"github.com/rclone/rclone/fs/config"
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/config/configstruct"
@@ -649,157 +648,6 @@ func (f *Fs) newDirectory(dir string, fi os.FileInfo) (*Directory, error) {
 	}, nil
 }
 
-// List the objects and directories in dir into entries.  The
-// entries can be returned in any order but should be for a
-// complete directory.
-//
-// dir should be "" to list the root, and should not have
-// trailing slashes.
-//
-// This should return ErrDirNotFound if the directory isn't
-// found.
-func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err error) {
-	filter, useFilter := filter.GetConfig(ctx), filter.GetUseFilter(ctx)
-
-	fsDirPath, err := f.localPath(dir)
-	if err != nil {
-		return nil, err
-	}
-	_, err = os.Stat(fsDirPath)
-	if err != nil {
-		return nil, fs.ErrorDirNotFound
-	}
-
-	fd, err := os.Open(fsDirPath)
-	if err != nil {
-		isPerm := os.IsPermission(err)
-		err = fmt.Errorf("failed to open directory %q: %w", dir, err)
-		fs.Errorf(dir, "%v", err)
-		if isPerm {
-			_ = accounting.Stats(ctx).Error(fserrors.NoRetryError(err))
-			err = nil // ignore error but fail sync
-		}
-		return nil, err
-	}
-	defer func() {
-		cerr := fd.Close()
-		if cerr != nil && err == nil {
-			err = fmt.Errorf("failed to close directory %q:: %w", dir, cerr)
-		}
-	}()
-
-	for {
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return nil, ctxErr
-		}
-		var fis []os.FileInfo
-		if useReadDir {
-			// Windows and Plan9 read the directory entries with the stat information in which
-			// shouldn't fail because of unreadable entries.
-			fis, err = fd.Readdir(1024)
-			if err == io.EOF && len(fis) == 0 {
-				break
-			}
-		} else {
-			// For other OSes we read the names only (which shouldn't fail) then stat the
-			// individual ourselves so we can log errors but not fail the directory read.
-			var names []string
-			names, err = fd.Readdirnames(1024)
-			if err == io.EOF && len(names) == 0 {
-				break
-			}
-			if err == nil {
-				// TODO: Parallelise this loop
-				for _, name := range names {
-					namepath := join.FilePathJoin(fsDirPath, name)
-					fi, fierr := os.Lstat(namepath)
-					if os.IsNotExist(fierr) {
-						// skip entry removed by a concurrent goroutine
-						continue
-					}
-					if fierr != nil {
-						// Don't report errors on any file names that are excluded
-						if useFilter {
-							newRemote := f.cleanRemote(dir, name)
-							if !filter.IncludeRemote(newRemote) {
-								continue
-							}
-						}
-						fierr = fmt.Errorf("failed to get info about directory entry %q: %w", namepath, fierr)
-						fs.Errorf(dir, "%v", fierr)
-						_ = accounting.Stats(ctx).Error(fserrors.NoRetryError(fierr)) // fail the sync
-						continue
-					}
-					fis = append(fis, fi)
-				}
-			}
-		}
-		if err != nil {
-			return nil, fmt.Errorf("failed to read directory entry: %w", err)
-		}
-
-		// TODO: Parallelise this loop
-		for _, fi := range fis {
-			name := fi.Name()
-			mode := fi.Mode()
-			newRemote := f.cleanRemote(dir, name)
-			symlinkFlag := os.ModeSymlink
-			if runtime.GOOS == "windows" {
-				symlinkFlag |= os.ModeIrregular
-			}
-			// Follow symlinks if required
-			if f.opt.FollowSymlinks && (mode&symlinkFlag) != 0 {
-				localPath := join.FilePathJoin(fsDirPath, name)
-				fi, err = os.Stat(localPath)
-				// Quietly skip errors on excluded files and directories
-				if err != nil && useFilter && !filter.IncludeRemote(newRemote) {
-					continue
-				}
-				if os.IsNotExist(err) || isCircularSymlinkError(err) {
-					// Skip bad symlinks and circular symlinks
-					err = fserrors.NoRetryError(fmt.Errorf("symlink: %w", err))
-					fs.Errorf(newRemote, "Listing error: %v", err)
-					err = accounting.Stats(ctx).Error(err)
-					continue
-				}
-				if err != nil {
-					return nil, err
-				}
-				mode = fi.Mode()
-			}
-			if fi.IsDir() {
-				// Ignore directories which are symlinks.  These are junction points under windows which
-				// are kind of a souped up symlink. Unix doesn't have directories which are symlinks.
-				if (mode&symlinkFlag) == 0 && f.dev == readDevice(fi, f.opt.OneFileSystem) {
-					d, err := f.newDirectory(newRemote, fi)
-					if err != nil {
-						return nil, err
-					}
-					entries = append(entries, d)
-				}
-			} else {
-				// Check whether this link should be translated
-				if f.opt.TranslateSymlinks && fi.Mode()&symlinkFlag != 0 {
-					newRemote += fs.LinkSuffix
-				}
-				// Don't include non directory if not included
-				// we leave directory filtering to the layer above
-				if useFilter && !filter.IncludeRemote(newRemote) {
-					continue
-				}
-				fso, err := f.newObjectWithInfo(newRemote, fi)
-				if err != nil {
-					return nil, err
-				}
-				if fso.Storable() {
-					entries = append(entries, fso)
-				}
-			}
-		}
-	}
-	return entries, nil
-}
-
 func (f *Fs) cleanRemote(dir, filename string) (remote string) {
 	if f.opt.UTFNorm {
 		filename = norm.NFC.String(filename)
@@ -979,7 +827,7 @@ func (f *Fs) MkdirMetadata(ctx context.Context, dir string, metadata fs.Metadata
 			return nil, fmt.Errorf("mkdir metadata: failed to set metadata on directory: %w", err)
 		}
 		// Re-read info now we have finished setting stuff
-		err = d.lstat()
+		err = d.lstatWithContext(ctx)
 		if err != nil {
 			return nil, fmt.Errorf("mkdir metadata: failed to re-read info: %w", err)
 		}
@@ -1100,7 +948,7 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	dstObj.fs.objectMetaMu.RUnlock()
 
 	// Check it is a file if it exists
-	err = dstObj.lstat()
+	err = dstObj.lstatWithContext(ctx)
 	if os.IsNotExist(err) {
 		// OK
 	} else if err != nil {
@@ -1144,7 +992,7 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	}
 
 	// Update the info
-	err = dstObj.lstat()
+	err = dstObj.lstatWithContext(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -1379,7 +1227,7 @@ func (o *Object) Hash(ctx context.Context, r hash.Type) (string, error) {
 	oldtime := o.modTime
 	oldsize := o.size
 	o.fs.objectMetaMu.RUnlock()
-	err := o.lstat()
+	err := o.lstatWithContext(ctx)
 	var changed bool
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -1473,7 +1321,7 @@ func (o *Object) SetModTime(ctx context.Context, modTime time.Time) error {
 		return err
 	}
 	// Re-read metadata
-	return o.lstat()
+	return o.lstatWithContext(ctx)
 }
 
 // Storable returns a boolean showing if this object is storable
@@ -1598,7 +1446,7 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 	}
 
 	// Update the file info before we start reading
-	err = o.lstat()
+	err = o.lstatWithContext(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -1898,7 +1746,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	}
 
 	// ReRead info now that we have finished
-	return o.lstat()
+	return o.lstatWithContext(ctx)
 }
 
 var sparseWarning sync.Once
@@ -1985,7 +1833,12 @@ func (o *Object) clearHashCache() {
 
 // Stat an Object into info
 func (o *Object) lstat() error {
-	info, err := o.fs.lstat(o.path)
+	return o.lstatWithContext(context.Background())
+}
+
+// Stat an Object into info with context for timeout protection
+func (o *Object) lstatWithContext(ctx context.Context) error {
+	info, err := o.fs.asyncLstat(ctx, o.path)
 	if err == nil {
 		o.setMetadata(info)
 	}
@@ -2035,7 +1888,7 @@ func (o *Object) SetMetadata(ctx context.Context, metadata fs.Metadata) error {
 		return fmt.Errorf("SetMetadata failed on Object: %w", err)
 	}
 	// Re-read info now we have finished setting stuff
-	return o.lstat()
+	return o.lstatWithContext(ctx)
 }
 
 func cleanRootPath(s string, noUNC bool, enc encoder.MultiEncoder) string {
@@ -2126,7 +1979,7 @@ func (d *Directory) SetMetadata(ctx context.Context, metadata fs.Metadata) error
 		return fmt.Errorf("SetMetadata failed on Directory: %w", err)
 	}
 	// Re-read info now we have finished setting stuff
-	return d.lstat()
+	return d.lstatWithContext(ctx)
 }
 
 // Hash does nothing on a directory
