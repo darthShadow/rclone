@@ -180,3 +180,33 @@ func TestOpenWriterAtSetupError(t *testing.T) {
 		})
 	}
 }
+
+func TestOpenWriterAtSyncWritesAndFatalIfNoSpace(t *testing.T) {
+	f, root := newTestLocalFs(t)
+	f.opt.SyncWrites = true
+	f.opt.FatalIfNoSpace = true
+	f.opt.NoPreAllocate = true
+	writer, err := f.OpenWriterAt(context.Background(), "both", 0)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = writer.Close() })
+	fatal, ok := writer.(*fatalIfNoSpaceWriterAt)
+	require.True(t, ok, "the writer must classify disk-full failures")
+	assert.True(t, fatal.enabled)
+	syncing, ok := fatal.WriterAtCloser.(*syncingWriterAtCloser)
+	require.True(t, ok, "the writer must sync on close")
+	assert.Equal(t, filepath.Join(root, "both"), syncing.path)
+	n, err := writer.WriteAt([]byte("contents"), 0)
+	require.NoError(t, err)
+	assert.Equal(t, 8, n)
+	require.NoError(t, writer.Close())
+	data, err := os.ReadFile(filepath.Join(root, "both"))
+	require.NoError(t, err)
+	assert.Equal(t, "contents", string(data))
+	fatal.WriterAtCloser = &diskFullWriterAtCloser{writeErr: syscall.ENOSPC, closeErr: syscall.ENOSPC}
+	_, err = writer.WriteAt([]byte("x"), 0)
+	assert.ErrorIs(t, err, syscall.ENOSPC)
+	assert.True(t, fserrors.IsFatalError(err))
+	err = writer.Close()
+	assert.ErrorIs(t, err, syscall.ENOSPC)
+	assert.True(t, fserrors.IsFatalError(err))
+}
