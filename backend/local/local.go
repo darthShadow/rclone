@@ -221,6 +221,47 @@ cause deadlocks (especially on Ceph).`,
 				Advanced: true,
 			},
 			{
+				Name: "sync_writes",
+				Help: `Sync files and directories after writes for distributed filesystem coherence.
+
+This option is primarily designed for CephFS on Linux. It may also help with
+other distributed filesystems like GlusterFS or Lustre, but CephFS is the
+main target.
+
+Enable this when multiple clients need to see file changes immediately.
+Without this, other clients may experience significant delays (determined
+by the dirty page writeback interval) when listing or accessing newly
+created/modified files.
+
+File data is synced immediately after each write. Directory metadata syncs
+are batched (see --local-sync-writes-interval) so other clients may not see
+new files in directory listings for up to the batch interval after the file
+write completes.
+
+This option is only effective on Linux where distributed filesystem
+kernel clients are available. It will be ignored on other platforms.`,
+				Default:  false,
+				Advanced: true,
+			},
+			{
+				Name: "sync_writes_interval",
+				Help: `Interval for batching directory syncs when using --local-sync-writes.
+
+Directory syncs are batched and deduplicated for efficiency. This sets
+the maximum delay before a directory sync is performed after a file write.
+Other clients may not see new files in directory listings until this
+interval elapses.
+
+Set to 0 for immediate (unbatched) directory syncs if you need other
+clients to see files immediately after write, at the cost of reduced
+throughput for bulk operations.
+
+Default is 100ms which provides a good balance between responsiveness
+and efficiency.`,
+				Default:  fs.Duration(100 * time.Millisecond),
+				Advanced: true,
+			},
+			{
 				Name: "case_sensitive",
 				Help: `Force the filesystem to report itself as case sensitive.
 
@@ -403,6 +444,8 @@ type Options struct {
 	NoClone                bool                 `config:"no_clone"`
 	MetadataRestoreSpecial bool                 `config:"metadata_restore_special_bits"`
 	SkipRecent             bool                 `config:"skip_recent"`
+	SyncWrites             bool                 `config:"sync_writes"`
+	SyncWritesInterval     fs.Duration          `config:"sync_writes_interval"`
 }
 
 // Fs represents a local filesystem rooted at root
@@ -419,8 +462,9 @@ type Fs struct {
 	xattrSupported atomic.Int32        // whether xattrs are supported
 
 	// do os.Lstat or os.Stat
-	lstat        func(name string) (os.FileInfo, error)
-	objectMetaMu sync.RWMutex // global lock for Object metadata
+	lstat          func(name string) (os.FileInfo, error)
+	objectMetaMu   sync.RWMutex    // global lock for Object metadata
+	dirSyncManager *dirSyncManager // batches directory syncs; nil if SyncWrites disabled or unsupported
 }
 
 // Object represents a local filesystem object
@@ -500,6 +544,16 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	if opt.NoClone {
 		// Disable server-side copy when --local-no-clone is set
 		f.features.Copy = nil
+	}
+
+	// Initialize sync writes support (Linux only)
+	if f.opt.SyncWrites {
+		if syncWritesSupported() {
+			f.dirSyncManager = newDirSyncManager(time.Duration(f.opt.SyncWritesInterval), f.root)
+		} else {
+			fs.Infof(nil, "local: --local-sync-writes is only supported on Linux, ignoring")
+			f.opt.SyncWrites = false
+		}
 	}
 
 	// Check to see if this points to a file
@@ -742,6 +796,11 @@ func (f *Fs) mkParentDir(ctx context.Context, remote string, metadata fs.Metadat
 	if err != nil {
 		return fmt.Errorf("mkParentDir: %s: failed to make directory: %s: %w", remote, localPath, err)
 	}
+	// Queue parent directory sync for distributed FS coherence.
+	// This makes newly created directories visible to other clients.
+	if f.dirSyncManager != nil {
+		f.dirSyncManager.Queue(filepath.Dir(localDirPath))
+	}
 
 	if metadata != nil && remoteDir != "" && remoteDir != "." && remoteDir != ".." && remoteDir != "/" {
 		fi, err := f.lstat(localDirPath)
@@ -775,6 +834,11 @@ func (f *Fs) mkdir(ctx context.Context, dir string, metadata fs.Metadata) (os.Fi
 		err = f.mkdirAll(localPath)
 		if err != nil {
 			return nil, err
+		}
+		// Queue parent directory sync for distributed FS coherence.
+		// mkParentDir already synced ancestors; we just need the immediate parent.
+		if f.dirSyncManager != nil {
+			f.dirSyncManager.Queue(filepath.Dir(localPath))
 		}
 		fi, err = f.lstat(localPath)
 		if err != nil {
@@ -865,6 +929,10 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 		if os.Chmod(localPath, 0o600) == nil {
 			err = os.Remove(localPath)
 		}
+	}
+	// Queue directory sync so removal is visible to other clients
+	if err == nil && f.dirSyncManager != nil {
+		f.dirSyncManager.Queue(filepath.Dir(localPath))
 	}
 	return err
 }
@@ -996,6 +1064,17 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 		return nil, fs.ErrorCantMove
 	}
 
+	// From this point on, the rename succeeded. Ensure directory sync happens
+	// even if subsequent operations fail, so other clients can see the move.
+	defer func() {
+		if f.dirSyncManager != nil {
+			f.dirSyncManager.QueueMultiple(
+				filepath.Dir(srcObj.path),
+				filepath.Dir(dstObj.path),
+			)
+		}
+	}()
+
 	// Set metadata if --metadata is in use
 	err = dstObj.writeMetadata(meta)
 	if err != nil {
@@ -1061,6 +1140,15 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 		fs.Debugf(src, "Can't move dir: %v: trying copy", err)
 		return fs.ErrorCantDirMove
 	}
+
+	// Queue directory syncs for distributed FS coherence (both src and dst parents)
+	if f.dirSyncManager != nil {
+		f.dirSyncManager.QueueMultiple(
+			filepath.Dir(srcPath),
+			filepath.Dir(dstPath),
+		)
+	}
+
 	return nil
 }
 
@@ -1706,6 +1794,15 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	}
 
 	_, err = io.Copy(w, in)
+
+	// Sync file for distributed FS coherence (releases locks).
+	// Only sync on success - failed copies will be removed anyway.
+	if err == nil {
+		if f, ok := out.(*os.File); ok && o.fs.opt.SyncWrites {
+			syncFile(f, o.path)
+		}
+	}
+
 	closeErr := out.Close()
 	if err == nil {
 		err = closeErr
@@ -1730,6 +1827,10 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 		if removeErr := os.Remove(o.path); removeErr != nil {
 			fs.Errorf(o, "Failed to remove partially written file: %v", removeErr)
 		}
+		// Queue directory sync so removal is visible to other clients
+		if o.fs.dirSyncManager != nil {
+			o.fs.dirSyncManager.Queue(filepath.Dir(o.path))
+		}
 		return err
 	}
 
@@ -1739,6 +1840,14 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 		o.hashes = hasher.Sums()
 		o.fs.objectMetaMu.Unlock()
 	}
+
+	// From this point on, the file exists. Ensure directory sync happens
+	// even if subsequent operations fail, so other clients can see the file.
+	defer func() {
+		if o.fs.dirSyncManager != nil {
+			o.fs.dirSyncManager.Queue(filepath.Dir(o.path))
+		}
+	}()
 
 	// Set the mtime
 	err = o.SetModTime(ctx, src.ModTime(ctx))
@@ -1805,6 +1914,14 @@ func (f *Fs) OpenWriterAt(ctx context.Context, remote string, size int64) (fs.Wr
 		}
 	}
 
+	// Return wrapper for distributed FS coherence if enabled
+	if f.opt.SyncWrites {
+		return &syncingWriterAtCloser{
+			File:    out,
+			path:    o.path,
+			manager: f.dirSyncManager,
+		}, nil
+	}
 	return out, nil
 }
 
@@ -1859,7 +1976,12 @@ func (o *Object) lstatWithContext(ctx context.Context) error {
 // Remove an object
 func (o *Object) Remove(ctx context.Context) error {
 	o.clearHashCache()
-	return remove(o.path)
+	err := remove(o.path)
+	// Queue directory sync for distributed FS coherence
+	if err == nil && o.fs.dirSyncManager != nil {
+		o.fs.dirSyncManager.Queue(filepath.Dir(o.path))
+	}
+	return err
 }
 
 // Metadata returns metadata for an object
