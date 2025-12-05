@@ -290,4 +290,4 @@ require (
 	golang.org/x/term v0.47.0
 )
 
-replace github.com/hanwen/go-fuse/v2 => github.com/darthShadow/go-fuse/v2 v2.0.0-20251219105733-59e4b7394caf
+replace github.com/hanwen/go-fuse/v2 => github.com/darthShadow/go-fuse/v2 v2.0.0-20261106103743-2b66e11a2a71

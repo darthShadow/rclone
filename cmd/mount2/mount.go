@@ -5,6 +5,7 @@ package mount2
 
 import (
 	"fmt"
+	"os"
 	"runtime"
 	"time"
 
@@ -24,17 +25,43 @@ func init() {
 //
 // man mount.fuse for more info and note the -o flag for other options
 func mountOptions(fsys *FS, f fs.Fs, opt *mountlib.Options) (mountOpts *fuse.MountOptions) {
+	// Get the kernel's effective max write size (1 MiB on Linux <6.13, tunable on 6.13+)
+	kernelMaxWrite := mountlib.GetEffectiveMaxWrite()
+
+	// Cap MaxWrite to kernel limit
+	requestedMaxWrite := int(fsys.opt.MaxWrite)
+	effectiveMaxWrite := requestedMaxWrite
+	if effectiveMaxWrite > kernelMaxWrite {
+		effectiveMaxWrite = kernelMaxWrite
+		fs.Infof(f, "MaxWrite %d exceeds kernel limit %d, capping to kernel limit",
+			requestedMaxWrite, kernelMaxWrite)
+	}
+
+	// Apply minimum readahead enforcement (128 KiB) for consistency with kernel sysfs tuning
+	readAheadKiB := mountlib.EnforceMinReadAheadKiB(int(fsys.opt.MaxReadAhead / 1024))
+	readAheadBytes := readAheadKiB * 1024
+
+	// Cap MaxReadAhead to effective MaxWrite (larger values can't be used in single requests)
+	requestedReadAhead := readAheadBytes
+	effectiveReadAhead := readAheadBytes
+	if effectiveReadAhead > effectiveMaxWrite {
+		effectiveReadAhead = effectiveMaxWrite
+		fs.Infof(f, "MaxReadAhead %d exceeds effective MaxWrite %d, capping to MaxWrite",
+			requestedReadAhead, effectiveMaxWrite)
+	}
+
 	mountOpts = &fuse.MountOptions{
 		AllowOther:         fsys.opt.AllowOther,
 		FsName:             opt.DeviceName,
 		Name:               "rclone",
 		DisableXAttrs:      true,
 		Debug:              fsys.opt.DebugFUSE,
-		MaxReadAhead:       int(fsys.opt.MaxReadAhead),
-		MaxWrite:           1024 * 1024, // Linux v4.20+ caps requests at 1 MiB
+		MaxReadAhead:       effectiveReadAhead,
+		MaxWrite:           effectiveMaxWrite,
 		DisableReadDirPlus: true,
 		IDMappedMount:      opt.AllowIDMap,
 		MaxStackDepth:      fsys.opt.MaxStackDepth,
+		ExtraCapabilities:  fuse.CAP_ASYNC_DIO,
 
 		// RememberInodes: true,
 		// SingleThreaded: true,
@@ -137,7 +164,6 @@ func mountOptions(fsys *FS, f fs.Fs, opt *mountlib.Options) (mountOpts *fuse.Mou
 
 	}
 	var opts []string
-	// FIXME doesn't work opts = append(opts, fmt.Sprintf("max_readahead=%d", maxReadAhead))
 	if fsys.opt.AllowOther {
 		opts = append(opts, "allow_other")
 	}
@@ -262,5 +288,20 @@ func mount(VFS *vfs.VFS, mountpoint string, opt *mountlib.Options) (<-chan error
 	}
 
 	fs.Debugf(f, "Mount started")
+
+	// Log effective FUSE settings for debugging
+	fs.Debugf(f, "FUSE: MaxWrite=%d (kernel limit %d) MaxReadAhead=%d",
+		mountOpts.MaxWrite, mountlib.GetEffectiveMaxWrite(), mountOpts.MaxReadAhead)
+
+	// Tune kernel readahead to match FUSE setting (Linux only, requires root)
+	// This makes --max-read-ahead actually work by setting the sysfs value.
+	// Only attempt if running as root to avoid warning spam for non-root users.
+	// Use mountOpts.MaxReadAhead (already capped) to ensure FUSE and sysfs match exactly.
+	if mountOpts.MaxReadAhead > 0 && os.Getuid() == 0 {
+		if err := mountlib.TuneKernelReadAhead(mountpoint, mountOpts.MaxReadAhead/1024); err != nil {
+			fs.LogLevelPrintf(fs.LogLevelWarning, nil, "Failed to tune kernel readahead: %v", err)
+		}
+	}
+
 	return errs, umount, mountpoint, nil
 }
