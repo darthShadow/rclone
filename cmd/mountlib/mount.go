@@ -105,9 +105,21 @@ var OptionsInfo = fs.Options{{
 	Groups:  "Mount",
 }, {
 	Name:    "max_read_ahead",
-	Default: fs.SizeSuffix(128 * 1024),
-	Help:    "The number of bytes that can be prefetched for sequential reads (not supported on Windows)",
-	Groups:  "Mount",
+	Default: fs.SizeSuffix(1024 * 1024),
+	Help: "The number of bytes that can be prefetched for sequential reads. " +
+		"On Linux as root, this also sets the kernel readahead via sysfs. " +
+		"On other platforms or as non-root, only the FUSE ceiling is set " +
+		"and actual readahead may remain at the kernel default (128 KiB). " +
+		"Set to 0 to use FUSE default and leave kernel sysfs unchanged. " +
+		"(not supported on Windows)",
+	Groups: "Mount",
+}, {
+	Name:    "max_write",
+	Default: fs.SizeSuffix(1024 * 1024),
+	Help: "Maximum size of a FUSE write request. The FUSE library caps this at the kernel limit. " +
+		"Linux kernels 4.20+ support up to 1 MiB. Kernel 6.13+ allows tuning via " +
+		"/proc/sys/fs/fuse/max_pages_limit. (not supported on Windows)",
+	Groups: "Mount",
 }, {
 	Name:    "write_back_cache",
 	Default: false,
@@ -188,6 +200,7 @@ type Options struct {
 	Daemon             bool          `config:"daemon"`
 	DaemonWait         fs.Duration   `config:"daemon_wait"` // time to wait for ready mount from daemon, maximum on Linux or constant on macOS/BSD
 	MaxReadAhead       fs.SizeSuffix `config:"max_read_ahead"`
+	MaxWrite           fs.SizeSuffix `config:"max_write"`
 	ExtraOptions       []string      `config:"option"`
 	ExtraFlags         []string      `config:"fuse_flag"`
 	AttrTimeout        fs.Duration   `config:"attr_timeout"` // how long the kernel caches attribute for

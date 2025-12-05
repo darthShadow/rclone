@@ -101,6 +101,9 @@ func mountOptions(VFS *vfs.VFS, device string, mountpoint string, opt *mountlib.
 		options = append(options, "-o", option)
 	}
 	options = append(options, opt.ExtraFlags...)
+	// FIXME: Use mountlib.Opt.MaxWrite and mountlib.Opt.MaxReadAhead options
+	// instead of hardcoded values for consistency with mount2.
+	// Also consider adding sysfs kernel readahead tuning via TuneKernelReadAhead.
 	if runtime.GOOS == "linux" {
 		options = append(options, "-o", "big_writes")
 		options = append(options, "-o", fmt.Sprintf("max_write=%d", 1048576))
