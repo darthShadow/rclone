@@ -59,15 +59,17 @@ of the size command.`,
 			}
 
 			results.Count, results.Bytes, results.Sizeless, err = operations.Count(context.Background(), fsrc)
-			if err != nil {
-				return err
-			}
+			// Don't return early on error - always show results
 			if results.Sizeless > 0 {
 				fs.Logf(fsrc, "Size may be underestimated due to %d objects with unknown size", results.Sizeless)
 			}
 			if jsonOutput {
 				results.Fs = args[0]
-				return json.NewEncoder(os.Stdout).Encode(results)
+				encErr := json.NewEncoder(os.Stdout).Encode(results)
+				if err != nil {
+					return err
+				}
+				return encErr
 			}
 			count := strconv.FormatInt(results.Count, 10)
 			countSuffix := fs.CountSuffix(results.Count).String()
@@ -80,7 +82,7 @@ of the size command.`,
 			if results.Sizeless > 0 {
 				operations.SyncPrintf("Total objects with unknown size: %s (%d)\n", fs.CountSuffix(results.Sizeless), results.Sizeless)
 			}
-			return nil
+			return err
 		})
 	},
 }
