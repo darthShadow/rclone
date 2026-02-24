@@ -48,7 +48,7 @@ const (
 	minSleep                = 100 * time.Millisecond
 	maxSleep                = 2 * time.Second
 	decayConstant           = 2           // bigger for slower decay, exponential
-	keepAliveInterval       = time.Minute // send keepalives every this long while running commands
+	keepAliveInterval       = time.Minute // send keepalives every this long while running commands or uploading
 	maxHostKeys             = 16          // caps the number of host_keys entries
 )
 
@@ -1789,7 +1789,11 @@ func (f *Fs) dirExists(ctx context.Context, dir string) (bool, error) {
 		if os.IsNotExist(err) {
 			return false, nil
 		}
-		return false, fmt.Errorf("dirExists stat failed: %w", err)
+		err = fmt.Errorf("dirExists stat failed: %w", err)
+		if sftpIsConnectionError(err) {
+			return false, fserrors.RetryError(err)
+		}
+		return false, err
 	}
 	if !info.IsDir() {
 		return false, fs.ErrorIsFile
@@ -1822,7 +1826,11 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 		if errors.Is(err, os.ErrNotExist) {
 			return nil, fs.ErrorDirNotFound
 		}
-		return nil, fmt.Errorf("error listing %q: %w", dir, err)
+		err = fmt.Errorf("error listing %q: %w", dir, err)
+		if sftpIsConnectionError(err) {
+			return nil, fserrors.RetryError(err)
+		}
+		return nil, err
 	}
 	for _, info := range infos {
 		remote := path.Join(dir, f.opt.Enc.ToStandardName(info.Name()))
@@ -1917,7 +1925,11 @@ func (f *Fs) mkdir(ctx context.Context, dirPath string) error {
 			fs.Debugf(f, "directory %q exists after Mkdir is attempted", dirPath)
 			return nil
 		}
-		return fmt.Errorf("mkdir %q failed: %w", dirPath, err)
+		err = fmt.Errorf("mkdir %q failed: %w", dirPath, err)
+		if sftpIsConnectionError(err) {
+			return fserrors.RetryError(err)
+		}
+		return err
 	}
 	return nil
 }
@@ -1956,6 +1968,9 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 	}
 	err = c.sftpClient.RemoveDirectory(root)
 	f.putSftpConnection(&c, err)
+	if sftpIsConnectionError(err) {
+		return fserrors.RetryError(err)
+	}
 	return err
 }
 
@@ -2647,6 +2662,9 @@ func (f *Fs) stat(ctx context.Context, remote string) (info os.FileInfo, err err
 	}
 	info, err = c.sftpClient.Stat(absPath)
 	f.putSftpConnection(&c, err)
+	if sftpIsConnectionError(err) {
+		return nil, fserrors.RetryError(err)
+	}
 	return info, err
 }
 
@@ -2680,7 +2698,11 @@ func (o *Object) SetModTime(ctx context.Context, modTime time.Time) error {
 	err = c.sftpClient.Chtimes(o.path(), modTime, modTime)
 	o.fs.putSftpConnection(&c, err)
 	if err != nil {
-		return fmt.Errorf("SetModTime failed: %w", err)
+		err = fmt.Errorf("SetModTime failed: %w", err)
+		if sftpIsConnectionError(err) {
+			return fserrors.RetryError(err)
+		}
+		return err
 	}
 	err = o.stat(ctx)
 	if err != nil && err != fs.ErrorIsDir {
@@ -2793,6 +2815,12 @@ func (sr *sizeReader) Size() int64 {
 	return sr.size
 }
 
+// sftpIsConnectionError checks whether err is an SFTP connection-level error
+// that should be retried (as opposed to a regular SFTP status error).
+func sftpIsConnectionError(err error) bool {
+	return errors.Is(err, sftp.ErrSSHFxConnectionLost) || errors.Is(err, sftp.ErrSSHFxNoConnection)
+}
+
 // Update a remote sftp file using the data <in> and ModTime from <src>
 func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
 	o.fs.addSession() // Show session in use
@@ -2809,11 +2837,17 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	if err != nil {
 		return fmt.Errorf("Update: %w", err)
 	}
+	// Send keepalives while the connection is held for the upload
+	defer close(c.sendKeepAlives(keepAliveInterval))
 	// Hang on to the connection for the whole upload so it doesn't get reused while we are uploading
 	file, err := c.sftpClient.OpenFile(o.path(), os.O_WRONLY|os.O_CREATE|os.O_TRUNC)
 	if err != nil {
 		o.fs.putSftpConnection(&c, err)
-		return fmt.Errorf("Update Create failed: %w", err)
+		err = fmt.Errorf("Update Create failed: %w", err)
+		if sftpIsConnectionError(err) {
+			return fserrors.RetryError(err)
+		}
+		return err
 	}
 	// remove the file if upload failed
 	remove := func() {
@@ -2834,13 +2868,21 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	if err != nil {
 		o.fs.putSftpConnection(&c, err)
 		remove()
-		return fmt.Errorf("Update ReadFrom failed: %w", err)
+		err = fmt.Errorf("Update ReadFrom failed: %w", err)
+		if sftpIsConnectionError(err) {
+			return fserrors.RetryError(err)
+		}
+		return err
 	}
 	err = file.Close()
 	if err != nil {
 		o.fs.putSftpConnection(&c, err)
 		remove()
-		return fmt.Errorf("Update Close failed: %w", err)
+		err = fmt.Errorf("Update Close failed: %w", err)
+		if sftpIsConnectionError(err) {
+			return fserrors.RetryError(err)
+		}
+		return err
 	}
 	// Release connection only when upload has finished so we don't upload multiple files on the same connection
 	o.fs.putSftpConnection(&c, err)
@@ -2877,6 +2919,9 @@ func (o *Object) Remove(ctx context.Context) error {
 	}
 	err = c.sftpClient.Remove(o.path())
 	o.fs.putSftpConnection(&c, err)
+	if sftpIsConnectionError(err) {
+		return fserrors.RetryError(err)
+	}
 	return err
 }
 

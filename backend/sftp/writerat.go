@@ -11,13 +11,27 @@ import (
 
 	"github.com/pkg/sftp"
 	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/fserrors"
 	"github.com/rclone/rclone/lib/filepool"
 )
 
+// writerAtKeepAliveInterval is the interval between keepalives for multi-thread uploads.
+// It is a variable so tests can shorten the interval.
+var writerAtKeepAliveInterval = keepAliveInterval
+
 // poolFile is a pooled write handle together with the connection it lives on.
 type poolFile struct {
-	file *sftp.File
-	c    *conn
+	file          *sftp.File
+	c             *conn
+	keepAliveDone chan struct{} // closed exactly once when the pooled handle is released
+}
+
+// retryWriterAtError marks connection failures as retryable and returns all other errors unchanged.
+func retryWriterAtError(err error) error {
+	if sftpIsConnectionError(err) {
+		return fserrors.RetryError(err)
+	}
+	return err
 }
 
 // openPoolFile opens a fresh write handle on its own connection for path. The
@@ -27,14 +41,17 @@ func (f *Fs) openPoolFile(path string) func(context.Context) (*poolFile, error) 
 	return func(ctx context.Context) (*poolFile, error) {
 		c, err := f.getSftpConnection(ctx)
 		if err != nil {
-			return nil, err
+			return nil, retryWriterAtError(err)
 		}
+		// Send keepalives while the connection is held by the pooled handle
+		keepAliveDone := c.sendKeepAlives(writerAtKeepAliveInterval)
 		file, err := c.sftpClient.OpenFile(path, os.O_WRONLY)
 		if err != nil {
 			f.putSftpConnection(&c, err)
-			return nil, err
+			close(keepAliveDone)
+			return nil, retryWriterAtError(err)
 		}
-		return &poolFile{file: file, c: c}, nil
+		return &poolFile{file: file, c: c, keepAliveDone: keepAliveDone}, nil
 	}
 }
 
@@ -45,7 +62,8 @@ func (f *Fs) releasePoolFile(pf *poolFile, err error) error {
 		err = closeErr
 	}
 	f.putSftpConnection(&pf.c, err)
-	return closeErr
+	close(pf.keepAliveDone)
+	return retryWriterAtError(closeErr)
 }
 
 // sftpWriterAt is the fs.WriterAtCloser used by the core's multi-thread copy.
@@ -77,7 +95,7 @@ func (w *sftpWriterAt) WriteAt(p []byte, off int64) (int, error) {
 	n, writeErr := pf.file.WriteAt(p, off)
 	w.pool.Put(pf, writeErr)
 	if writeErr != nil {
-		return n, fmt.Errorf("failed to write at offset %d: %w", off, writeErr)
+		return n, retryWriterAtError(fmt.Errorf("failed to write at offset %d: %w", off, writeErr))
 	}
 	return n, nil
 }
@@ -112,23 +130,25 @@ func (f *Fs) OpenWriterAt(ctx context.Context, remote string, size int64) (fs.Wr
 
 	c, err := f.getSftpConnection(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("OpenWriterAt: %w", err)
+		return nil, retryWriterAtError(fmt.Errorf("OpenWriterAt: %w", err))
 	}
+	// Send keepalives while the connection is held for writer setup
+	defer close(c.sendKeepAlives(writerAtKeepAliveInterval))
 	file, err := c.sftpClient.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC)
 	if err != nil {
 		f.putSftpConnection(&c, err)
-		return nil, fmt.Errorf("OpenWriterAt: create failed: %w", err)
+		return nil, retryWriterAtError(fmt.Errorf("OpenWriterAt: create failed: %w", err))
 	}
 	if size > 0 {
 		if truncErr := file.Truncate(size); truncErr != nil {
 			_ = file.Close()
 			f.putSftpConnection(&c, truncErr)
-			return nil, fmt.Errorf("OpenWriterAt: truncate failed (the server may not support multi-thread uploads; try without --sftp-multithread-upload): %w", truncErr)
+			return nil, retryWriterAtError(fmt.Errorf("OpenWriterAt: truncate failed (the server may not support multi-thread uploads; try without --sftp-multithread-upload): %w", truncErr))
 		}
 	}
 	if closeErr := file.Close(); closeErr != nil {
 		f.putSftpConnection(&c, closeErr)
-		return nil, fmt.Errorf("OpenWriterAt: close failed: %w", closeErr)
+		return nil, retryWriterAtError(fmt.Errorf("OpenWriterAt: close failed: %w", closeErr))
 	}
 	f.putSftpConnection(&c, nil)
 

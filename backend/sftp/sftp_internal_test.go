@@ -10,22 +10,142 @@ import (
 	"crypto/rsa"
 	"encoding/base64"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
+	pkgSFTP "github.com/pkg/sftp"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/config/obscure"
+	"github.com/rclone/rclone/fs/fserrors"
 	"github.com/rclone/rclone/fstest/fstests"
 	"github.com/rclone/rclone/lib/encoder"
+	"github.com/rclone/rclone/lib/filepool"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/crypto/ssh"
 )
+
+// writerAtTestSSHClient is a fake SSH client that records keepalives.
+type writerAtTestSSHClient struct {
+	keepAlives atomic.Int32
+}
+
+func (*writerAtTestSSHClient) Wait() error      { return nil }
+func (c *writerAtTestSSHClient) SendKeepAlive() { c.keepAlives.Add(1) }
+func (*writerAtTestSSHClient) Close() error     { return nil }
+func (*writerAtTestSSHClient) NewSession() (sshSession, error) {
+	return nil, fmt.Errorf("unexpected NewSession call")
+}
+func (*writerAtTestSSHClient) CanReuse() bool { return true }
+
+// writerAtTestDrop injects a connection loss and waits until the SFTP client records it.
+type writerAtTestDrop struct {
+	client       *pkgSFTP.Client
+	serverWriter *io.PipeWriter
+}
+
+// Close closes the server pipe and waits for the client's receive loop to exit;
+// closing the pipe alone races with the next operation, so the wait makes the injected fault deterministic.
+func (d *writerAtTestDrop) Close() error {
+	err := d.serverWriter.Close()
+	_ = d.client.Wait()
+	return err
+}
+
+// newWriterAtTestClient returns an in-memory SFTP client and a closer that waits for it to record a lost connection.
+func newWriterAtTestClient(t *testing.T) (*pkgSFTP.Client, io.Closer) {
+	t.Helper()
+	clientReader, serverWriter := io.Pipe()
+	serverReader, clientWriter := io.Pipe()
+	server := pkgSFTP.NewRequestServer(struct {
+		io.Reader
+		io.WriteCloser
+	}{serverReader, serverWriter}, pkgSFTP.InMemHandler())
+	go func() { _ = server.Serve() }()
+	client, err := pkgSFTP.NewClientPipe(clientReader, clientWriter)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_ = serverWriter.Close()
+		_ = client.Close()
+		_ = server.Close()
+	})
+	return client, &writerAtTestDrop{client: client, serverWriter: serverWriter}
+}
+
+// newWriterAtTestWriter returns a pooled writer and a closer that waits for its SFTP client to record a lost connection.
+func newWriterAtTestWriter(t *testing.T) (*sftpWriterAt, *writerAtTestSSHClient, io.Closer) {
+	t.Helper()
+	client, drop := newWriterAtTestClient(t)
+	file, err := client.OpenFile("/file", os.O_WRONLY|os.O_CREATE|os.O_TRUNC)
+	require.NoError(t, err)
+	require.NoError(t, file.Close())
+	sshClient := &writerAtTestSSHClient{}
+	f := &Fs{pool: []*conn{{sshClient: sshClient, sftpClient: client, err: make(chan error, 1)}}}
+	f.addSession()
+	w := &sftpWriterAt{fs: f, pool: filepool.New(context.Background(), f.openPoolFile("/file"), f.releasePoolFile)}
+	t.Cleanup(func() { _ = w.Close() })
+	return w, sshClient, drop
+}
+
+func TestWriterAtKeepsPooledConnectionsAliveAndStopsKeepAlives(t *testing.T) {
+	oldInterval := writerAtKeepAliveInterval
+	writerAtKeepAliveInterval = 50 * time.Millisecond
+	t.Cleanup(func() { writerAtKeepAliveInterval = oldInterval })
+
+	w, sshClient, _ := newWriterAtTestWriter(t)
+	_, err := w.WriteAt([]byte("a"), 0)
+	require.NoError(t, err)
+	// More than one keepalive proves the ticker repeats instead of firing only once.
+	require.Eventually(t, func() bool { return sshClient.keepAlives.Load() > 1 }, time.Second, 10*time.Millisecond)
+	_, err = w.WriteAt([]byte("b"), 1)
+	require.NoError(t, err)
+	require.NoError(t, w.Close())
+	time.Sleep(50 * time.Millisecond)
+	stoppedAt := sshClient.keepAlives.Load()
+	time.Sleep(250 * time.Millisecond)
+	assert.Equal(t, stoppedAt, sshClient.keepAlives.Load(), "keepalives continued after the pooled connection was released")
+}
+
+func TestWriterAtClassifiesDroppedConnections(t *testing.T) {
+	t.Run("OpenWriterAtCreate", func(t *testing.T) {
+		client, drop := newWriterAtTestClient(t)
+		f := &Fs{
+			mkdirLock: newStringLock(),
+			pool:      []*conn{{sshClient: &writerAtTestSSHClient{}, sftpClient: client, err: make(chan error, 1)}},
+		}
+		require.NoError(t, drop.Close())
+		_, err := f.OpenWriterAt(context.Background(), "file", 0)
+		require.Error(t, err)
+		assert.True(t, fserrors.IsRetryError(err), "OpenWriterAt create error is not retryable: %v", err)
+	})
+
+	for _, step := range []string{"PooledOpen", "Write", "Close"} {
+		t.Run(step, func(t *testing.T) {
+			w, _, drop := newWriterAtTestWriter(t)
+			if step != "PooledOpen" {
+				_, err := w.WriteAt([]byte("a"), 0)
+				require.NoError(t, err)
+			}
+			require.NoError(t, drop.Close())
+			var err error
+			if step == "Close" {
+				err = w.Close()
+			} else {
+				_, err = w.WriteAt([]byte("b"), 1)
+			}
+			require.Error(t, err)
+			assert.True(t, fserrors.IsRetryError(err), "%s error is not retryable: %v", step, err)
+		})
+	}
+}
 
 func TestShellEscapeUnix(t *testing.T) {
 	for i, test := range []struct {
