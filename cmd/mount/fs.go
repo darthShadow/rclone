@@ -45,7 +45,7 @@ func (f *FS) Root() (node fusefs.Node, err error) {
 	if err != nil {
 		return nil, translateError(err)
 	}
-	return &Dir{root, f}, nil
+	return newNode(f, root), nil
 }
 
 // Check interface satisfied

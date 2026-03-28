@@ -58,7 +58,7 @@ func mountOptions(fsys *FS, f fs.Fs, opt *mountlib.Options) (mountOpts *fuse.Mou
 		Debug:              fsys.opt.DebugFUSE,
 		MaxReadAhead:       effectiveReadAhead,
 		MaxWrite:           effectiveMaxWrite,
-		DisableReadDirPlus: true,
+		DisableReadDirPlus: false,
 		IDMappedMount:      opt.AllowIDMap,
 		MaxStackDepth:      fsys.opt.MaxStackDepth,
 		ExtraCapabilities:  fuse.CAP_ASYNC_DIO,
