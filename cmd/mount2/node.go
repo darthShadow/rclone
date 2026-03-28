@@ -6,8 +6,6 @@ import (
 	"context"
 	"os"
 	"path"
-	"slices"
-	"strings"
 	"syscall"
 
 	fusefs "github.com/hanwen/go-fuse/v2/fs"
@@ -292,9 +290,7 @@ func (n *Node) Readdir(ctx context.Context) (ds fusefs.DirStream, errno syscall.
 		Name: "..",
 		Ino:  0, // FIXME
 	}
-	slices.SortFunc(items, func(a, b fuse.DirEntry) int {
-		return strings.Compare(a.Name, b.Name)
-	})
+	// The result is unsorted because POSIX readdir does not require sorted output.
 	return fusefs.NewListDirStream(items), 0
 }
 

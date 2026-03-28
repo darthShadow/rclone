@@ -221,7 +221,9 @@ func (fsys *FS) Readdir(dirPath string,
 		return -fuse.ESPIPE
 	}
 
-	nodes, err := dir.ReadDirAll()
+	// POSIX/FUSE readdir does not require sorted output, so use MapReadDir
+	// directly to avoid ReadDirAll sorting overhead in mount paths.
+	nodes, err := vfs.MapReadDir[vfs.Node](dir, func(n vfs.Node) (vfs.Node, error) { return n, nil }, 0)
 	if err != nil {
 		return translateError(err)
 	}

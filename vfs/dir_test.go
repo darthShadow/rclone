@@ -363,6 +363,21 @@ func TestDirReadDirAll(t *testing.T) {
 
 	checkListing(t, dir, []string{"file1,14,false", "file2,15,false", "subdir,0,true"})
 
+	dir.mu.Lock()
+	dir.statRead["stale"] = time.Now()
+	beforePtr := fmt.Sprintf("%p", dir.statRead)
+	dir.read = time.Time{}
+	dir.mu.Unlock()
+
+	checkListing(t, dir, []string{"file1,14,false", "file2,15,false", "subdir,0,true"})
+
+	dir.mu.RLock()
+	_, stalePresent := dir.statRead["stale"]
+	assert.Equal(t, beforePtr, fmt.Sprintf("%p", dir.statRead))
+	assert.False(t, stalePresent, "expected refresh to clear cached stat timestamps")
+	assert.Empty(t, dir.statRead, "expected statRead to be empty after directory refresh")
+	dir.mu.RUnlock()
+
 	node, err = vfs.Stat("")
 	require.NoError(t, err)
 	root := node.(*Dir)

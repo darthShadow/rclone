@@ -79,6 +79,19 @@ func newDir(vfs *VFS, f fs.Fs, parent *Dir, fsDir fs.Directory) *Dir {
 	return d
 }
 
+// resetStatRead clears the per-entry stat cache.
+//
+// reuse=true preserves the existing map allocation for hot refresh paths.
+// reuse=false replaces the map so reset/invalidation paths can release any
+// oversized backing storage.
+func (d *Dir) resetStatRead(reuse bool) {
+	if reuse && d.statRead != nil {
+		clear(d.statRead)
+		return
+	}
+	d.statRead = make(map[string]time.Time)
+}
+
 func (d *Dir) cacheCleanup() {
 	defer func() {
 		// We should never panic here
@@ -245,7 +258,7 @@ func (d *Dir) ForgetAll() (hasVirtual bool) {
 	if !hasVirtual {
 		d.read = time.Time{}
 		d.items = make(map[string]Node)
-		d.statRead = make(map[string]time.Time)
+		d.resetStatRead(false)
 		d.cleanupTimer.Stop()
 	} else {
 		d.cleanupTimer.Reset(time.Duration(d.vfs.Opt.DirCacheTime * 2))
@@ -275,7 +288,7 @@ func (d *Dir) invalidateDir(absPath string) {
 		if !dir.read.IsZero() {
 			fs.Debugf(dir.path, "invalidating directory cache")
 			dir.read = time.Time{}
-			dir.statRead = make(map[string]time.Time)
+			dir.resetStatRead(false)
 		}
 		dir.mu.Unlock()
 	}
@@ -420,7 +433,7 @@ func (d *Dir) rename(newParent *Dir, fsDir fs.Directory) {
 	delete(d.parent.items, name(oldPath))
 	d.parent.items[name(d.path)] = d
 	d.read = time.Time{}
-	d.statRead = make(map[string]time.Time)
+	d.resetStatRead(false)
 	d.mu.Unlock()
 
 	// Rename any remaining items in the tree that we couldn't forget
@@ -615,7 +628,7 @@ func (d *Dir) _readDir() error {
 	}
 
 	d.read = when
-	d.statRead = make(map[string]time.Time)
+	d.resetStatRead(true)
 	d.cleanupTimer.Reset(time.Duration(d.vfs.Opt.DirCacheTime * 2))
 
 	return nil
@@ -798,7 +811,7 @@ func (d *Dir) _processEntry(entry fs.DirEntry, mv manageVirtuals, dirTree dirtre
 		dir.mu.Lock()
 		dir.modTime = item.ModTime(d.vfs.ctx)
 		dir.entry = item
-		dir.statRead = make(map[string]time.Time)
+		dir.resetStatRead(true)
 
 		if dirTree != nil {
 			err = dir._readDirFromDirTree(dirTree, when)
@@ -850,7 +863,7 @@ func (d *Dir) readDirTree() error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.read = time.Time{}
-	d.statRead = make(map[string]time.Time)
+	d.resetStatRead(false)
 	err = d._readDirFromDirTree(dt, when)
 	if err != nil {
 		return err
@@ -1180,14 +1193,16 @@ func (d *Dir) Stat(name string) (node Node, err error) {
 	return node, nil
 }
 
-// ReadDirAll reads the contents of the directory sorted
+// ReadDirAll reads the contents of the directory sorted by name.
 func (d *Dir) ReadDirAll() (items Nodes, err error) {
 	items, err = MapReadDir(d, func(n Node) (Node, error) { return n, nil }, 0)
 	if err != nil {
 		fs.Debugf(d.Path(), "Dir.ReadDirAll error: %v", err)
 		return nil, err
 	}
-	// Compare only the leaf strings of the nodes
+	// POSIX/FUSE readdir does not require sorted output, but ReadDirAll keeps
+	// deterministic ordering for general callers. Mount paths that need to skip
+	// this O(n log n) sort should call MapReadDir directly.
 	slices.SortFunc(items, func(a, b Node) int {
 		return strings.Compare(a.Name(), b.Name())
 	})

@@ -66,6 +66,36 @@ func (d *Dir) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse.
 // Check interface satisfied
 var _ fusefs.NodeRequestLookuper = (*Dir)(nil)
 
+// newNode returns the FUSE node attached to a VFS node, creating and attaching
+// one if needed. A VFS node maps to one attached FUSE node. If the owner slot
+// contains an unexpected type, newNode returns a new unattached FUSE node.
+func newNode(fsys *FS, vfsNode vfs.Node) fusefs.Node {
+	if node, ok := vfsNode.Aux(fsys).(fusefs.Node); ok {
+		return node
+	}
+	var node fusefs.Node
+	switch vfsNode := vfsNode.(type) {
+	case *vfs.File:
+		node = &File{vfsNode, fsys}
+	case *vfs.Dir:
+		node = &Dir{vfsNode, fsys}
+	default:
+		panic("bad type")
+	}
+	return attachNode(fsys, vfsNode, node)
+}
+
+// attachNode returns the FUSE node attached to vfsNode, attaching node if needed.
+// If the owner slot contains an unexpected type, it logs and returns node unattached.
+func attachNode(fsys *FS, vfsNode vfs.Node, node fusefs.Node) fusefs.Node {
+	actual, _ := vfsNode.LoadOrStoreAux(fsys, node)
+	if actualNode, ok := actual.(fusefs.Node); ok {
+		return actualNode
+	}
+	fs.Errorf(vfsNode, "Unexpected auxiliary value type %T for FUSE node", actual)
+	return node
+}
+
 // Lookup looks up a specific entry in the receiver.
 //
 // Lookup should return a Node corresponding to the entry.  If the
@@ -79,23 +109,7 @@ func (d *Dir) Lookup(ctx context.Context, req *fuse.LookupRequest, resp *fuse.Lo
 		return nil, translateError(err)
 	}
 	resp.EntryValid = time.Duration(d.fsys.opt.AttrTimeout)
-	// Check the mnode to see if it has a fuse Node cached
-	// We must return the same fuse nodes for vfs Nodes
-	node, ok := mnode.Aux(d.fsys).(fusefs.Node)
-	if ok {
-		return node, nil
-	}
-	switch x := mnode.(type) {
-	case *vfs.File:
-		node = &File{x, d.fsys}
-	case *vfs.Dir:
-		node = &Dir{x, d.fsys}
-	default:
-		panic("bad type")
-	}
-	// Cache the node for later
-	mnode.SetAux(d.fsys, node)
-	return node, nil
+	return newNode(d.fsys, mnode), nil
 }
 
 // Check interface satisfied
@@ -105,7 +119,9 @@ var _ fusefs.HandleReadDirAller = (*Dir)(nil)
 func (d *Dir) ReadDirAll(ctx context.Context) (dirents []fuse.Dirent, err error) {
 	itemsRead := -1
 	defer log.Trace(d, "")("item=%d, err=%v", &itemsRead, &err)
-	items, err := d.Dir.ReadDirAll()
+	// POSIX/FUSE readdir does not require sorted output, so use MapReadDir
+	// directly to avoid ReadDirAll sorting overhead in mount paths.
+	items, err := vfs.MapReadDir[vfs.Node](d.Dir, func(n vfs.Node) (vfs.Node, error) { return n, nil }, 0)
 	if err != nil {
 		return nil, translateError(err)
 	}
@@ -157,8 +173,7 @@ func (d *Dir) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.Cr
 	if err != nil {
 		return nil, nil, translateError(err)
 	}
-	node = &File{file, d.fsys}
-	file.SetAux(d.fsys, node) // cache the FUSE node for later
+	node = newNode(d.fsys, file)
 	return node, &FileHandle{fh}, err
 }
 
@@ -171,8 +186,7 @@ func (d *Dir) Mkdir(ctx context.Context, req *fuse.MkdirRequest) (node fusefs.No
 	if err != nil {
 		return nil, translateError(err)
 	}
-	node = &Dir{dir, d.fsys}
-	dir.SetAux(d.fsys, node) // cache the FUSE node for later
+	node = newNode(d.fsys, dir)
 	return node, nil
 }
 
@@ -261,7 +275,7 @@ func (d *Dir) Symlink(ctx context.Context, req *fuse.SymlinkRequest) (node fusef
 		return nil, err
 	}
 
-	node = &File{n.(*vfs.File), d.fsys}
+	node = newNode(d.fsys, n)
 	return node, nil
 }
 
