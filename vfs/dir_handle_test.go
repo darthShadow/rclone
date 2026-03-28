@@ -76,18 +76,17 @@ func TestDirHandleReaddir(t *testing.T) {
 	assert.False(t, fis[0].IsDir())
 	assert.False(t, fis[1].IsDir())
 
-	fis, err = fh.Readdir(2)
+	fis2, err := fh.Readdir(2)
 	require.NoError(t, err)
-	require.Equal(t, 1, len(fis))
-	assert.Equal(t, "subdir", fis[0].Name())
-	assert.True(t, fis[0].IsDir())
+	require.Equal(t, 1, len(fis2))
+	assert.Equal(t, "subdir", fis2[0].Name())
+	assert.True(t, fis2[0].IsDir())
 
-	fis, err = fh.Readdir(2)
+	fis3, err := fh.Readdir(2)
 	assert.Equal(t, io.EOF, err)
-	require.Equal(t, 0, len(fis))
+	require.Equal(t, 0, len(fis3))
 
 	require.NoError(t, fh.Close())
-
 }
 
 func TestDirHandleReaddirnames(t *testing.T) {
