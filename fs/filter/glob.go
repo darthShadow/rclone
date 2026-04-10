@@ -5,9 +5,8 @@ package filter
 import (
 	"bytes"
 	"fmt"
+	"regexp"
 	"strings"
-
-	regexp "github.com/wasilibs/go-re2"
 
 	"github.com/rclone/rclone/fs"
 )
