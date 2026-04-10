@@ -5,10 +5,11 @@ import (
 	"bytes"
 	"fmt"
 	"os"
+	"regexp"
+	"runtime/debug"
 	"slices"
 	"strings"
-
-	regexp "github.com/wasilibs/go-re2"
+	"sync/atomic"
 
 	"github.com/rclone/rclone/fs"
 )
@@ -27,6 +28,7 @@ type RulesOpt struct {
 type rule struct {
 	Include bool
 	Regexp  *regexp.Regexp
+	glob    string // post-mutation glob text (used by fast-path classification)
 }
 
 // Match returns true if rule matches path
@@ -45,20 +47,23 @@ func (r *rule) String() string {
 
 // rules is a slice of rules
 type rules struct {
-	rules    []rule
-	existing map[string]struct{}
+	rules      []rule
+	existing   map[string]struct{}
+	fused      atomic.Pointer[fusedRuleSet]
+	ignoreCase bool
 }
 
 type addFn func(Include bool, glob string) error
 
 // add adds a rule if it doesn't exist already
-func (rs *rules) add(Include bool, re *regexp.Regexp) {
+func (rs *rules) add(Include bool, re *regexp.Regexp, glob string) {
 	if rs.existing == nil {
 		rs.existing = make(map[string]struct{})
 	}
 	newRule := rule{
 		Include: Include,
 		Regexp:  re,
+		glob:    glob,
 	}
 	newRuleString := newRule.String()
 	if _, ok := rs.existing[newRuleString]; ok {
@@ -66,6 +71,7 @@ func (rs *rules) add(Include bool, re *regexp.Regexp) {
 	}
 	rs.rules = append(rs.rules, newRule)
 	rs.existing[newRuleString] = struct{}{}
+	rs.fused.Store(nil) // invalidate fused cache on mutation
 }
 
 // Add adds a filter rule with include or exclude status indicated
@@ -74,7 +80,7 @@ func (rs *rules) Add(Include bool, glob string) error {
 	if err != nil {
 		return err
 	}
-	rs.add(Include, re)
+	rs.add(Include, re, glob)
 	return nil
 }
 
@@ -84,6 +90,7 @@ type clearFn func()
 func (rs *rules) clear() {
 	rs.rules = nil
 	rs.existing = nil
+	rs.fused.Store(nil)
 }
 
 // len returns the number of rules
@@ -93,12 +100,49 @@ func (rs *rules) len() int {
 
 // include returns whether this remote passes the filter rules.
 func (rs *rules) include(remote string) bool {
-	for _, rule := range rs.rules {
-		if rule.Match(remote) {
-			return rule.Include
-		}
+	rs.ensureFused()
+	return rs.fused.Load().evaluate(remote)
+}
+
+// ensureFused lazily builds the fusedRuleSet for fast-path evaluation.
+// Thread-safe via atomic load/store. Double-build by concurrent goroutines
+// is benign - fusedRuleSet is immutable; last store wins.
+func (rs *rules) ensureFused() {
+	if rs.fused.Load() != nil {
+		return
 	}
-	return true
+	// Build fused rule set with recovery
+	var frs *fusedRuleSet
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				fs.Errorf(nil, "filter fast-path build panic (falling back to linear scan): %v\n%s", r, debug.Stack())
+				// Build fallback: one block per rule, preserving evaluation order
+				// and polarity. This is equivalent to the pre-optimization linear scan.
+				blocks := make([]fusedBlock, len(rs.rules))
+				for i, r := range rs.rules {
+					r := r // capture
+					blocks[i] = fusedBlock{
+						include: r.Include,
+						match: func(remote string, _ pathProps) bool {
+							return r.Regexp.MatchString(remote)
+						},
+					}
+				}
+				frs = &fusedRuleSet{blocks: blocks}
+			}
+		}()
+		classified := make([]classifiedRule, len(rs.rules))
+		for i, r := range rs.rules {
+			classified[i] = classifyPattern(r.glob, r.Regexp, rs.ignoreCase)
+			classified[i].Include = r.Include
+			if classified[i].Kind == fpUnclassified && r.glob != "" {
+				fs.Debugf(nil, "filter fast-path: unclassified pattern %q", r.glob)
+			}
+		}
+		frs = buildFusedRuleSet(classified)
+	}()
+	rs.fused.Store(frs)
 }
 
 // include returns whether this collection of strings remote passes

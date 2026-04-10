@@ -5,10 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"regexp"
 	"sort"
 	"strings"
-
-	regexp "github.com/wasilibs/go-re2"
 
 	"github.com/rclone/rclone/cmd"
 	"github.com/rclone/rclone/fs"

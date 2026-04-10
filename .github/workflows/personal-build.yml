@@ -40,7 +40,7 @@ jobs:
             os: ubuntu-24.04
             container: 'debian:13'
             go: '>=1.27.0-rc.1'
-            gotags: 'cmount,re2_cgo'
+            gotags: 'cmount'
             cgo: '1'
             job_packages: 'libfuse3-4'
             build_flags: '-include "^linux/"'
@@ -54,7 +54,7 @@ jobs:
             os: ubuntu-24.04
             container: 'ubuntu:22.04'
             go: '>=1.27.0-rc.1'
-            gotags: 'cmount,re2_cgo'
+            gotags: 'cmount'
             cgo: '1'
             job_packages: 'libfuse3-3'
             build_flags: '-include "^linux/"'
@@ -68,7 +68,7 @@ jobs:
             os: ubuntu-24.04
             container: ''
             go: '>=1.27.0-rc.1'
-            gotags: 'cmount,re2_cgo'
+            gotags: 'cmount'
             cgo: '1'
             job_packages: 'libfuse3-3'
             build_flags: '-include "^linux/"'

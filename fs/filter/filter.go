@@ -7,11 +7,13 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"maps"
 	"math/rand/v2"
 	"path"
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/rclone/rclone/fs"
@@ -175,7 +177,10 @@ var Opt = Options{
 // FilesMap describes the map of files to transfer
 type FilesMap map[string]struct{}
 
-// Filter describes any filtering in operation
+// Filter describes any filtering in operation.
+// Filter is safe for concurrent read operations (Include*, IncludeObjectBatch).
+// Mutations (Add, Clear, AddRule) invalidate internal caches and must not
+// race with other mutations, but are safe to interleave with reads.
 type Filter struct {
 	Opt         Options
 	ModTimeFrom time.Time
@@ -187,6 +192,8 @@ type Filter struct {
 	dirs        FilesMap // dirs from filesFrom
 	hashFilterN uint64   // if non 0 do hash filtering
 	hashFilterK uint64   // select partition K/N
+	batchEval   *batchListingEvaluator
+	batchMu     sync.Mutex // guards batchEval lazy init + invalidation
 }
 
 // NewFilter parses the command line options and creates a Filter
@@ -200,6 +207,11 @@ func NewFilter(opt *Options) (f *Filter, err error) {
 	} else {
 		f.Opt = Opt
 	}
+
+	// Propagate ignoreCase to rule sets for fast-path classification
+	f.fileRules.ignoreCase = f.Opt.IgnoreCase
+	f.dirRules.ignoreCase = f.Opt.IgnoreCase
+	f.metaRules.ignoreCase = f.Opt.IgnoreCase
 
 	// Filter flags
 	if f.Opt.MinAge.IsSet() {
@@ -324,7 +336,7 @@ func (f *Filter) addDirGlobs(Include bool, glob string) error {
 		if err != nil {
 			return err
 		}
-		f.dirRules.add(Include, dirRe)
+		f.dirRules.add(Include, dirRe, dirGlob)
 	}
 	return nil
 }
@@ -345,7 +357,7 @@ func (f *Filter) Add(Include bool, glob string) error {
 		return err
 	}
 	if isFileRule {
-		f.fileRules.add(Include, re)
+		f.fileRules.add(Include, re, glob)
 		// If include rule work out what directories are needed to scan
 		// if exclude rule, we can't rule anything out
 		// Unless it is `*` which matches everything
@@ -358,8 +370,12 @@ func (f *Filter) Add(Include bool, glob string) error {
 		}
 	}
 	if isDirRule {
-		f.dirRules.add(Include, re)
+		f.dirRules.add(Include, re, glob)
 	}
+	// Invalidate batch evaluator on rule mutation
+	f.batchMu.Lock()
+	f.batchEval = nil
+	f.batchMu.Unlock()
 	return nil
 }
 
@@ -417,6 +433,10 @@ func (f *Filter) Clear() {
 	f.fileRules.clear()
 	f.dirRules.clear()
 	f.metaRules.clear()
+	// Invalidate batch evaluator
+	f.batchMu.Lock()
+	f.batchEval = nil
+	f.batchMu.Unlock()
 }
 
 // InActive returns false if any filters are active
@@ -591,6 +611,140 @@ func (f *Filter) IncludeObject(ctx context.Context, o fs.Object) bool {
 	return f.Include(o.Remote(), o.Size(), modTime, metadata)
 }
 
+// IncludeObjectBatch evaluates filter rules for a batch of objects sharing the
+// same parent directory. Uses listing-batch evaluation for amortized performance.
+// Precondition: every object's Remote() must have parent as a prefix.
+// Returns a bool slice parallel to objects: true means include.
+// The returned slice always has len(objects) elements.
+// Violation of the parent-prefix precondition may panic.
+//
+// Post-hoc guards (hash filter, modtime, size, metadata) are applied per-object
+// after batch rule evaluation, only for objects that passed the rules.
+func (f *Filter) IncludeObjectBatch(ctx context.Context, parent string, objects []fs.Object) []bool {
+	if len(objects) == 0 {
+		return make([]bool, 0)
+	}
+	// Fast-path: no filters active — include everything
+	if f.InActive() {
+		results := make([]bool, len(objects))
+		for i := range results {
+			results[i] = true
+		}
+		return results
+	}
+	results := make([]bool, len(objects))
+
+	// filesFrom takes precedence - per-object lookup, skip batch eval
+	if f.files != nil {
+		for i, o := range objects {
+			_, results[i] = f.files[o.Remote()]
+		}
+		// Log excluded and return early
+		for i, o := range objects {
+			if !results[i] {
+				fs.Debugf(o, "Excluded")
+			}
+		}
+		return results
+	}
+
+	// Lazy-init batch evaluator - capture under lock to prevent use-after-nil
+	f.batchMu.Lock()
+	if f.batchEval == nil {
+		classified := make([]classifiedRule, len(f.fileRules.rules))
+		for i, r := range f.fileRules.rules {
+			classified[i] = classifyPattern(r.glob, r.Regexp, f.fileRules.ignoreCase)
+			classified[i].Include = r.Include
+		}
+		f.batchEval = &batchListingEvaluator{
+			cache: newFlatListingCache(classified, f.fileRules.ignoreCase),
+		}
+	}
+	be := f.batchEval // capture under lock
+	f.batchMu.Unlock()
+
+	// Extract leaf names
+	leaves := make([]string, len(objects))
+	for i, o := range objects {
+		leaves[i] = o.Remote()[len(parent):]
+	}
+
+	// Batch rule evaluation
+	be.runListing(ctx, parent, leaves, results)
+
+	// Post-hoc guards: apply per-object checks for included results
+	needModTime := !f.ModTimeFrom.IsZero() || !f.ModTimeTo.IsZero()
+	needSize := f.Opt.MinSize >= 0 || f.Opt.MaxSize >= 0
+	needMeta := f.metaRules.len() > 0
+	for i, o := range objects {
+		if !results[i] {
+			continue
+		}
+		// Hash filter
+		if f.hashFilterN != 0 {
+			normalized := norm.NFC.String(o.Remote())
+			normalized = strings.ToLower(normalized)
+			hashBytes := md5.Sum([]byte(normalized))
+			hash := binary.LittleEndian.Uint64(hashBytes[:])
+			if hash%f.hashFilterN != f.hashFilterK {
+				results[i] = false
+				continue
+			}
+		}
+		// ModTime filter
+		if needModTime {
+			modTime := o.ModTime(ctx)
+			if !f.ModTimeFrom.IsZero() && modTime.Before(f.ModTimeFrom) {
+				results[i] = false
+				continue
+			}
+			if !f.ModTimeTo.IsZero() && modTime.After(f.ModTimeTo) {
+				results[i] = false
+				continue
+			}
+		}
+		// Size filter
+		if needSize {
+			size := o.Size()
+			if f.Opt.MinSize >= 0 && size < int64(f.Opt.MinSize) {
+				results[i] = false
+				continue
+			}
+			if f.Opt.MaxSize >= 0 && size > int64(f.Opt.MaxSize) {
+				results[i] = false
+				continue
+			}
+		}
+		// Metadata filter
+		if needMeta {
+			metadata, err := fs.GetMetadata(ctx, o)
+			if err != nil {
+				fs.Errorf(o, "Failed to read metadata: %v", err)
+				metadata = nil
+			}
+			metadatas := make([]string, 0, len(metadata)+1)
+			for key, value := range metadata {
+				metadatas = append(metadatas, fmt.Sprintf("%s=%s", key, value))
+			}
+			if len(metadata) == 0 {
+				metadatas = append(metadatas, "\x00=\x00")
+			}
+			if !f.metaRules.includeMany(metadatas) {
+				results[i] = false
+				continue
+			}
+		}
+	}
+
+	// Log excluded objects
+	for i, o := range objects {
+		if !results[i] {
+			fs.Debugf(o, "Excluded")
+		}
+	}
+	return results
+}
+
 // DumpFilters dumps the filters in textual form, 1 per line
 func (f *Filter) DumpFilters() string {
 	rules := []string{}
@@ -724,13 +878,36 @@ func CopyConfig(dstCtx, srcCtx context.Context) context.Context {
 	return context.WithValue(dstCtx, configContextKey, c)
 }
 
+func copyRules(dst, src *rules) {
+	dst.rules = slices.Clone(src.rules)
+	dst.existing = maps.Clone(src.existing)
+	dst.ignoreCase = src.ignoreCase
+	dst.fused.Store(nil)
+}
+
+func copyFilterState(dst, src *Filter) {
+	dst.Opt = src.Opt
+	dst.ModTimeFrom = src.ModTimeFrom
+	dst.ModTimeTo = src.ModTimeTo
+	copyRules(&dst.fileRules, &src.fileRules)
+	copyRules(&dst.dirRules, &src.dirRules)
+	copyRules(&dst.metaRules, &src.metaRules)
+	dst.files = maps.Clone(src.files)
+	dst.dirs = maps.Clone(src.dirs)
+	dst.hashFilterN = src.hashFilterN
+	dst.hashFilterK = src.hashFilterK
+	dst.batchMu.Lock()
+	dst.batchEval = nil
+	dst.batchMu.Unlock()
+}
+
 // AddConfig returns a mutable config structure based on a shallow
 // copy of that found in ctx and returns a new context with that added
 // to it.
 func AddConfig(ctx context.Context) (context.Context, *Filter) {
 	c := GetConfig(ctx)
 	cCopy := new(Filter)
-	*cCopy = *c
+	copyFilterState(cCopy, c)
 	newCtx := context.WithValue(ctx, configContextKey, cCopy)
 	return newCtx, cCopy
 }
@@ -768,6 +945,22 @@ func SetUseFilter(ctx context.Context, useFilter bool) context.Context {
 	return context.WithValue(ctx, useFlagContextKey, pVal)
 }
 
+type preFilteredKey struct{}
+
+// SetPreFiltered signals that the backend already applied IncludeRemote
+// pre-filtering, so filterDir can skip batch re-evaluation.
+// NOTE: Placeholder for future optimization. Currently unused.
+func SetPreFiltered(ctx context.Context) context.Context {
+	return context.WithValue(ctx, preFilteredKey{}, true)
+}
+
+// GetPreFiltered returns true if the backend signaled pre-filtering.
+// NOTE: Placeholder for future optimization. Currently unused.
+func GetPreFiltered(ctx context.Context) bool {
+	v, _ := ctx.Value(preFilteredKey{}).(bool)
+	return v
+}
+
 // Reload the filters from the flags
 func Reload(ctx context.Context) (err error) {
 	fi := GetConfig(ctx)
@@ -775,6 +968,6 @@ func Reload(ctx context.Context) (err error) {
 	if err != nil {
 		return err
 	}
-	*fi = *newFilter
+	copyFilterState(fi, newFilter)
 	return nil
 }

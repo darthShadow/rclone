@@ -4,10 +4,9 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"regexp"
 	"sort"
 	"strings"
-
-	regexp "github.com/wasilibs/go-re2"
 
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config/configflags"

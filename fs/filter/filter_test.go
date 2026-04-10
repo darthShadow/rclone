@@ -405,9 +405,10 @@ func TestNewFilterMakeListR(t *testing.T) {
 	NewObject := func(ctx context.Context, remote string) (fs.Object, error) {
 		newObjectMu.Lock()
 		defer newObjectMu.Unlock()
-		if remote == "notfound" {
+		switch remote {
+		case "notfound":
 			return nil, fs.ErrorObjectNotFound
-		} else if remote == "error" {
+		case "error":
 			return nil, assert.AnError
 		}
 		newObjects[remote] = struct{}{}
@@ -1046,10 +1047,8 @@ func TestNewFilterUsesDirectoryFilters(t *testing.T) {
 func TestGetConfig(t *testing.T) {
 	ctx := context.Background()
 
-	// Check nil
-	//lint:ignore SA1012 false positive when running staticcheck, we want to test passing a nil Context and therefore ignore lint suggestion to use context.TODO
-	//nolint:staticcheck // Don't include staticcheck when running golangci-lint to avoid SA1012
-	config := GetConfig(nil)
+	// Check unset config (no filter config stored in context)
+	config := GetConfig(context.TODO())
 	assert.Equal(t, globalConfig, config)
 
 	// Check empty config
