@@ -37,10 +37,10 @@ func TestRulesDirectoryIndexMatchesLinear(t *testing.T) {
 			t.Run(fmt.Sprintf("rules=%d/offset=%d", count, offset), func(t *testing.T) {
 				var rs rules
 				for i := range count - len(patterns) {
-					rs.add(i%2 == 0, regexp.MustCompile(fmt.Sprintf(`^padding_%d/.*$`, i)))
+					rs.add(i%2 == 0, regexp.MustCompile(fmt.Sprintf(`^padding_%d/.*$`, i)), "")
 				}
 				for i := range patterns {
-					rs.add(i%2 == 0, regexp.MustCompile(patterns[(i+offset)%len(patterns)]))
+					rs.add(i%2 == 0, regexp.MustCompile(patterns[(i+offset)%len(patterns)]), "")
 				}
 				require.Len(t, rs.rules, count)
 				for _, remote := range remotes {
@@ -75,9 +75,9 @@ func TestRulesDirectoryIndexIgnoreCase(t *testing.T) {
 		t.Run(test.pattern, func(t *testing.T) {
 			var rs rules
 			for i := range minIndexedRules - 1 {
-				rs.add(false, regexp.MustCompile(fmt.Sprintf(`^padding_%d/.*$`, i)))
+				rs.add(false, regexp.MustCompile(fmt.Sprintf(`^padding_%d/.*$`, i)), "")
 			}
-			rs.add(false, regexp.MustCompile(`(?i)^`+regexp.QuoteMeta(test.pattern)+`/.*$`))
+			rs.add(false, regexp.MustCompile(`(?i)^`+regexp.QuoteMeta(test.pattern)+`/.*$`), "")
 			assert.Empty(t, rs.otherRules, "anchored ignore-case rules should use the index")
 			for _, directory := range test.matches {
 				assert.False(t, rs.include(directory+"/file"), "directory %q", directory)
@@ -201,5 +201,38 @@ func benchmarkFilterLiteralDirectoriesSetup(b *testing.B, ignoreCase bool) {
 				}
 			}
 		})
+	}
+}
+
+func TestCopyFilterRulesIndependent(t *testing.T) {
+	var src Filter
+	for _, rs := range []*rules{&src.fileRules, &src.dirRules, &src.metaRules} {
+		for i := range minIndexedRules {
+			require.NoError(t, rs.Add(false, fmt.Sprintf("/padding_%d/**", i)))
+		}
+		rs.add(false, regexp.MustCompile(`(?i)^target/.*$`), "")
+		require.NoError(t, rs.Add(false, "*.tmp"))
+		rs.include("padding_0/file")
+	}
+	var dst Filter
+	copyFilterState(&dst, &src)
+	for i, pair := range [][2]*rules{{&src.fileRules, &dst.fileRules}, {&src.dirRules, &dst.dirRules}, {&src.metaRules, &dst.metaRules}} {
+		original, copied := pair[0], pair[1]
+		require.Equal(t, original.byDirectory, copied.byDirectory, "rules %d", i)
+		require.Equal(t, original.foldedDirectory, copied.foldedDirectory, "rules %d", i)
+		require.Nil(t, copied.fused.Load())
+		require.NotNil(t, original.fused.Load())
+		require.Equal(t, original.otherRules, copied.otherRules)
+		copied.otherRules[0] = -1
+		assert.NotEqual(t, -1, original.otherRules[0])
+		copied.byDirectory["padding_0"][0] = -1
+		assert.Equal(t, 0, original.byDirectory["padding_0"][0])
+		copied.foldedDirectory[foldDirectory("target")][0] = -1
+		assert.NotEqual(t, -1, original.foldedDirectory[foldDirectory("target")][0])
+		require.NoError(t, copied.Add(false, "/extra/**"))
+		assert.NotContains(t, original.existing, "- ^extra/.*$")
+		require.NotNil(t, original.fused.Load())
+		assert.True(t, original.include("extra/file"))
+		assert.False(t, copied.include("extra/file"))
 	}
 }

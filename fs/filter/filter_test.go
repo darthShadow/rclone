@@ -2,7 +2,10 @@ package filter
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"os"
 	"strings"
 	"sync"
@@ -405,9 +408,10 @@ func TestNewFilterMakeListR(t *testing.T) {
 	NewObject := func(ctx context.Context, remote string) (fs.Object, error) {
 		newObjectMu.Lock()
 		defer newObjectMu.Unlock()
-		if remote == "notfound" {
+		switch remote {
+		case "notfound":
 			return nil, fs.ErrorObjectNotFound
-		} else if remote == "error" {
+		case "error":
 			return nil, assert.AnError
 		}
 		newObjects[remote] = struct{}{}
@@ -1102,10 +1106,8 @@ func TestAddConfigRulesIndependent(t *testing.T) {
 func TestGetConfig(t *testing.T) {
 	ctx := context.Background()
 
-	// Check nil
-	//lint:ignore SA1012 false positive when running staticcheck, we want to test passing a nil Context and therefore ignore lint suggestion to use context.TODO
-	//nolint:staticcheck // Don't include staticcheck when running golangci-lint to avoid SA1012
-	config := GetConfig(nil)
+	// Check unset config (no filter config stored in context)
+	config := GetConfig(context.TODO())
 	assert.Equal(t, globalConfig, config)
 
 	// Check empty config
@@ -1126,4 +1128,47 @@ func TestGetConfig(t *testing.T) {
 	require.NoError(t, err)
 	ctx3 := ReplaceConfig(ctx, f)
 	assert.Equal(t, globalConfig, GetConfig(ctx3))
+}
+
+type jobLogKey struct{}
+type jobLogHandler struct {
+	slog.Handler
+	contexts []context.Context
+}
+
+func (h *jobLogHandler) Handle(ctx context.Context, record slog.Record) error {
+	h.contexts = append(h.contexts, ctx)
+	return nil
+}
+
+type metadataErrorObject struct{ fs.Object }
+
+func (o metadataErrorObject) Metadata(context.Context) (fs.Metadata, error) {
+	return nil, errors.New("metadata read failed")
+}
+
+func TestIncludeObjectBatchLogContext(t *testing.T) {
+	ctx, ci := fs.AddConfig(context.WithValue(context.Background(), jobLogKey{}, "job/42"))
+	ci.LogLevel = fs.LogLevelDebug
+	h := &jobLogHandler{Handler: slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelDebug})}
+	fs.SetLogger(h)
+	t.Cleanup(func() { fs.SetLogger(slog.Default().Handler()) })
+	for _, filesFrom := range []bool{false, true} {
+		fi, err := NewFilter(nil)
+		require.NoError(t, err)
+		if filesFrom {
+			require.NoError(t, fi.AddFile("keep"))
+		} else {
+			require.NoError(t, fi.Add(false, "skip"))
+		}
+		assert.Equal(t, []bool{false}, fi.IncludeObjectBatch(ctx, "", []fs.Object{mockobject.Object("skip")}))
+	}
+	fi, err := NewFilter(nil)
+	require.NoError(t, err)
+	require.NoError(t, fi.metaRules.Add(false, "key=value"))
+	assert.Equal(t, []bool{true}, fi.IncludeObjectBatch(ctx, "", []fs.Object{metadataErrorObject{mockobject.Object("metadata")}}))
+	require.Len(t, h.contexts, 3)
+	for _, got := range h.contexts {
+		assert.Equal(t, "job/42", got.Value(jobLogKey{}))
+	}
 }

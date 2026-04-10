@@ -6,13 +6,14 @@ import (
 	"fmt"
 	"maps"
 	"os"
+	"regexp"
 	"regexp/syntax"
+	"runtime/debug"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"unicode"
 	"unicode/utf8"
-
-	regexp "github.com/wasilibs/go-re2"
 
 	"github.com/rclone/rclone/fs"
 )
@@ -31,6 +32,7 @@ type RulesOpt struct {
 type rule struct {
 	Include bool
 	Regexp  *regexp.Regexp
+	glob    string // post-mutation glob text (used by fast-path classification)
 }
 
 // Match returns true if rule matches path
@@ -54,6 +56,8 @@ type rules struct {
 	byDirectory     map[string][]int
 	foldedDirectory map[string][]int
 	otherRules      []int
+	fused           atomic.Pointer[fusedRuleSet]
+	ignoreCase      bool
 }
 
 // Small rule sets are faster to scan without maintaining an index.
@@ -62,13 +66,14 @@ const minIndexedRules = 64
 type addFn func(Include bool, glob string) error
 
 // add adds a rule if it doesn't exist already
-func (rs *rules) add(Include bool, re *regexp.Regexp) {
+func (rs *rules) add(Include bool, re *regexp.Regexp, glob string) {
 	if rs.existing == nil {
 		rs.existing = make(map[string]struct{})
 	}
 	newRule := rule{
 		Include: Include,
 		Regexp:  re,
+		glob:    glob,
 	}
 	newRuleString := newRule.String()
 	if _, ok := rs.existing[newRuleString]; ok {
@@ -76,6 +81,7 @@ func (rs *rules) add(Include bool, re *regexp.Regexp) {
 	}
 	rs.rules = append(rs.rules, newRule)
 	rs.existing[newRuleString] = struct{}{}
+	rs.fused.Store(nil) // invalidate fused cache on mutation
 	if rs.byDirectory != nil {
 		rs.index(len(rs.rules) - 1)
 	} else if len(rs.rules) == minIndexedRules {
@@ -130,7 +136,7 @@ func (rs *rules) Add(Include bool, glob string) error {
 	if err != nil {
 		return err
 	}
-	rs.add(Include, re)
+	rs.add(Include, re, glob)
 	return nil
 }
 
@@ -143,17 +149,7 @@ func (rs *rules) clear() {
 	rs.byDirectory = nil
 	rs.foldedDirectory = nil
 	rs.otherRules = nil
-}
-
-// clone copies the mutable rule storage, including directory buckets.
-func (rs *rules) clone() rules {
-	copy := *rs
-	copy.rules = slices.Clone(rs.rules)
-	copy.existing = maps.Clone(rs.existing)
-	copy.otherRules = slices.Clone(rs.otherRules)
-	copy.byDirectory = cloneDirectoryIndex(rs.byDirectory)
-	copy.foldedDirectory = cloneDirectoryIndex(rs.foldedDirectory)
-	return copy
+	rs.fused.Store(nil)
 }
 
 func cloneDirectoryIndex(index map[string][]int) map[string][]int {
@@ -171,46 +167,49 @@ func (rs *rules) len() int {
 
 // include returns whether this remote passes the filter rules.
 func (rs *rules) include(remote string) bool {
-	if len(rs.byDirectory) != 0 || len(rs.foldedDirectory) != 0 {
-		directory, _, _ := strings.Cut(remote, "/")
-		// Regexp decodes invalid UTF-8 bytes as U+FFFD, which can match a
-		// literal U+FFFD. Use the linear scan when byte lookup could miss it.
-		if !utf8.ValidString(directory) {
-			for _, rule := range rs.rules {
-				if rule.Match(remote) {
-					return rule.Include
-				}
-			}
-			return true
-		}
-		candidates := [3][]int{rs.byDirectory[directory], nil, rs.otherRules}
-		if len(rs.foldedDirectory) != 0 {
-			candidates[1] = rs.foldedDirectory[foldDirectory(directory)]
-		}
-		for {
-			// Merge the sorted buckets to preserve first-match precedence.
-			first := -1
-			for j, bucket := range candidates {
-				if len(bucket) != 0 && (first == -1 || bucket[0] < candidates[first][0]) {
-					first = j
-				}
-			}
-			if first == -1 {
-				return true
-			}
-			i := candidates[first][0]
-			candidates[first] = candidates[first][1:]
-			if rs.rules[i].Match(remote) {
-				return rs.rules[i].Include
-			}
-		}
+	rs.ensureFused()
+	return rs.fused.Load().evaluate(remote)
+}
+
+// ensureFused lazily builds the fusedRuleSet for fast-path evaluation.
+// Thread-safe via atomic load/store. Double-build by concurrent goroutines
+// is benign - fusedRuleSet is immutable; last store wins.
+func (rs *rules) ensureFused() {
+	if rs.fused.Load() != nil {
+		return
 	}
-	for _, rule := range rs.rules {
-		if rule.Match(remote) {
-			return rule.Include
+	// Build fused rule set with recovery
+	var frs *fusedRuleSet
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				fs.Errorf(nil, "filter fast-path build panic (falling back to linear scan): %v\n%s", r, debug.Stack())
+				// Build fallback: one block per rule, preserving evaluation order
+				// and polarity. This is equivalent to the pre-optimization linear scan.
+				blocks := make([]fusedBlock, len(rs.rules))
+				for i, r := range rs.rules {
+					r := r // capture
+					blocks[i] = fusedBlock{
+						include: r.Include,
+						match: func(remote string, _ pathProps) bool {
+							return r.Regexp.MatchString(remote)
+						},
+					}
+				}
+				frs = &fusedRuleSet{blocks: blocks}
+			}
+		}()
+		classified := make([]classifiedRule, len(rs.rules))
+		for i, r := range rs.rules {
+			classified[i] = classifyPattern(r.glob, r.Regexp, rs.ignoreCase)
+			classified[i].Include = r.Include
+			if classified[i].Kind == fpUnclassified && r.glob != "" {
+				fs.Debugf(nil, "filter fast-path: unclassified pattern %q", r.glob)
+			}
 		}
-	}
-	return true
+		frs = buildFusedRuleSet(classified)
+	}()
+	rs.fused.Store(frs)
 }
 
 // include returns whether this collection of strings remote passes
