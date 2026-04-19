@@ -1209,3 +1209,50 @@ func TestStatScheduler_SubmitOneReturnsWhenSchedulerCloses(t *testing.T) {
 		t.Fatal("scheduler close did not finish after releasing blocked stat")
 	}
 }
+
+func TestStatScheduler_CloseCancelsQueuedBatchJobs(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	scheduler := &statScheduler{
+		opts: statSchedulerOptions{
+			MaxWorkers:   1,
+			QueueDepth:   4,
+			LeaseTimeout: time.Second,
+		},
+		ctx:         ctx,
+		cancel:      cancel,
+		normalQueue: make(chan *statJob, 4),
+		retryQueue:  make(chan *statJob, 4),
+		active:      make(map[statLeaseKey]*activeLease),
+	}
+
+	batch := newBatchController(context.Background(), []cachedDirEntry{
+		{DirEntry: fakeDirEntry{name: "alpha"}},
+	}, invalidStatDirFD, 1, func(entry *cachedDirEntry, nameBuf []byte) (os.FileInfo, []byte, error) {
+		return fakeFileInfo{name: entry.Name()}, nameBuf, nil
+	})
+	defer batch.Close()
+
+	require.NoError(t, batch.Schedule(scheduler))
+
+	resultCh := make(chan error, 1)
+	go func() {
+		_, _, err := batch.Wait(context.Background())
+		resultCh <- err
+	}()
+
+	scheduler.Close()
+
+	select {
+	case err := <-resultCh:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(time.Second):
+		t.Fatal("queued batch did not unblock when scheduler closed")
+	}
+
+	batch.mu.Lock()
+	assert.True(t, batch.canceled)
+	require.ErrorIs(t, batch.firstErr, context.Canceled)
+	batch.mu.Unlock()
+}
