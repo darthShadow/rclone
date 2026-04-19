@@ -1,4 +1,4 @@
-// Package local provides a filesystem interface
+// Package local provides the local filesystem backend.
 package local
 
 import (
@@ -461,18 +461,37 @@ type Options struct {
 	SyncWritesInterval     fs.Duration          `config:"sync_writes_interval"`
 }
 
-// Fs represents a local filesystem rooted at root
+// Fs represents a local-filesystem backend rooted at root.
+//
+// The production target for this fork includes CephFS/FUSE deployments where
+// individual stat, fstatat, readdir, and close syscalls can block indefinitely
+// with no kernel-side timeout or cancellation path.
+//
+// To keep ordinary file operations bounded in that environment, Fs routes
+// directory-listing stat work and standalone stat/lstat calls through a shared
+// scheduler. Timed-out workers are accounted as stuck and left behind as
+// read-only observers while fresh workers replace them, so callers can keep
+// making progress without waiting for blocked kernel primitives to return.
 type Fs struct {
-	name           string              // the name of the remote
-	root           string              // The root directory (OS path)
-	opt            Options             // parsed config options
-	features       *fs.Features        // optional features
-	dev            uint64              // device number of root node
-	precisionOk    sync.Once           // Whether we need to read the precision
-	precision      time.Duration       // precision of local filesystem
-	warnedMu       sync.Mutex          // used for locking access to 'warned'.
-	warned         map[string]struct{} // whether we have warned about this string
-	xattrSupported atomic.Int32        // whether xattrs are supported
+	name string // the name of the remote
+	root string // The root directory (OS path)
+	opt  Options
+	// validateUtf8 gates invalid-UTF-8 warnings on EncodeInvalidUtf8. On Linux
+	// with the default Base encoder that bit is off, so invalid names no longer
+	// warn; macOS/Windows defaults include EncodeInvalidUtf8 and keep warning.
+	// If unconditional warnings are preferred again, delete the gate and
+	// initialize this field to true.
+	validateUtf8   bool
+	features       *fs.Features
+	dev            uint64
+	precisionOk    sync.Once
+	precision      time.Duration
+	warnedMu       sync.Mutex
+	warned         map[string]struct{}
+	xattrSupported atomic.Int32
+
+	statSchedulerMu sync.Mutex
+	statScheduler   atomic.Pointer[statScheduler] // shared per-Fs scheduler for list stat microbatches
 
 	// do os.Lstat or os.Stat
 	lstat          func(name string) (os.FileInfo, error)
@@ -534,6 +553,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		dev:    devUnset,
 		lstat:  os.Lstat,
 	}
+	f.validateUtf8 = (f.opt.Enc & encoder.EncodeInvalidUtf8) != 0
 	if xattrSupported {
 		f.xattrSupported.Store(1)
 	}
@@ -587,12 +607,14 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		if !hasLinkSuffix && opt.TranslateSymlinks && fi.Mode()&os.ModeSymlink != 0 {
 			return nil, errLinksNeedsSuffix
 		}
+		f.statScheduler.Store(newStatScheduler(f, statSchedulerOptions{}))
 		// It is a file, so use the parent as the root
 		f.root = filepath.Dir(f.root)
 		// return an error with an fs which points to the parent
 		return f, fs.ErrorIsFile
 	}
 
+	f.statScheduler.Store(newStatScheduler(f, statSchedulerOptions{}))
 	return f, nil
 }
 
@@ -630,6 +652,20 @@ func (f *Fs) Features() *fs.Features {
 	return f.features
 }
 
+// Shutdown closes the per-Fs stat scheduler and is safe to call multiple times.
+// It returns ctx.Err() if the caller context is canceled during shutdown.
+//
+// lib/cache finalization can invoke Shutdown while long-lived callers still
+// retain *Fs references (for example VFS or rc fscache/clear). After that
+// point SubmitOne returns context.Canceled on the closed scheduler. That cache
+// pinning surprise is documented here; the fix belongs upstream in cache.
+func (f *Fs) Shutdown(ctx context.Context) error {
+	if f.statScheduler != nil {
+		f.statScheduler.Close()
+	}
+	return ctx.Err()
+}
+
 // caseInsensitive returns whether the remote is case insensitive or not
 func (f *Fs) caseInsensitive() bool {
 	if f.opt.CaseSensitive {
@@ -645,6 +681,22 @@ func (f *Fs) caseInsensitive() bool {
 	// desirable.
 	return runtime.GOOS == "windows" || runtime.GOOS == "darwin"
 }
+
+func localPathPrefix(path string) string {
+	if path == "" {
+		return ""
+	}
+	if os.IsPathSeparator(path[len(path)-1]) {
+		return path
+	}
+	return path + string(filepath.Separator)
+}
+
+// NOTE: sync.Pool was evaluated and rejected for *Object:
+// Callers, including VFS, retain fs.Object values in long-lived structures without
+// an explicit release hook. A pooled Object could be reused while still reachable,
+// leaking remote/path identity or hashes state protected by objectMetaMu.
+// The lifetime/ownership risk dominates any allocation benefit.
 
 // newObject makes a half completed Object
 func (f *Fs) newObject(remote string) (*Object, error) {
@@ -674,6 +726,28 @@ func (f *Fs) newObject(remote string) (*Object, error) {
 	}, nil
 }
 
+func (f *Fs) newListedObject(remote string, localPath string, translatedLink bool, info os.FileInfo) (fs.Object, error) {
+	var o *Object
+	if translatedLink {
+		var err error
+		o, err = f.newObject(remote)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		o = &Object{
+			fs:     f,
+			remote: remote,
+			path:   localPath,
+		}
+	}
+	o.setMetadataNoLock(info)
+	if o.mode.IsDir() {
+		return nil, fs.ErrorIsDir
+	}
+	return o, nil
+}
+
 // Return an Object from a path
 //
 // May return nil if an error occurred
@@ -683,7 +757,7 @@ func (f *Fs) newObjectWithInfo(remote string, info os.FileInfo) (fs.Object, erro
 		return nil, err
 	}
 	if info != nil {
-		o.setMetadata(info)
+		o.setMetadataNoLock(info)
 	} else {
 		err := o.lstat()
 		if err != nil {
@@ -729,15 +803,15 @@ func (f *Fs) newDirectory(dir string, fi os.FileInfo) (*Directory, error) {
 			path:   localPath,
 		},
 	}
-	d.setMetadata(fi)
+	d.setMetadataNoLock(fi)
 	return d, nil
 }
 
 // statParents returns the info for dirPath and each of its parents up
 // to the root of the file system, skipping any which can't be read.
-func statParents(dirPath string) (parents []os.FileInfo) {
+func (f *Fs) statParents(ctx context.Context, dirPath string) (parents []os.FileInfo) {
 	for {
-		if fi, err := os.Stat(dirPath); err == nil {
+		if fi, err := f.getStatScheduler().SubmitOne(ctx, dirPath, false); err == nil {
 			parents = append(parents, fi)
 		}
 		parent := filepath.Dir(dirPath)
@@ -748,6 +822,27 @@ func statParents(dirPath string) (parents []os.FileInfo) {
 	}
 }
 
+func (f *Fs) newListedDirectory(remote string, localPath string, info os.FileInfo) *Directory {
+	d := &Directory{
+		Object: Object{
+			fs:     f,
+			remote: remote,
+			path:   localPath,
+		},
+	}
+	d.setMetadataNoLock(info)
+	return d
+}
+
+func (f *Fs) warnInvalidUtf8(remote string) {
+	f.warnedMu.Lock()
+	if _, ok := f.warned[remote]; !ok {
+		fs.Logf(f, "Replacing invalid UTF-8 characters in %q", remote)
+		f.warned[remote] = struct{}{}
+	}
+	f.warnedMu.Unlock()
+}
+
 func (f *Fs) cleanRemote(dir, filename string) (remote string) {
 	if f.opt.UTFNorm {
 		filename = norm.NFC.String(filename)
@@ -755,13 +850,8 @@ func (f *Fs) cleanRemote(dir, filename string) (remote string) {
 
 	remote = join.PathJoin(dir, f.opt.Enc.ToStandardName(filename))
 
-	if !utf8.ValidString(filename) {
-		f.warnedMu.Lock()
-		if _, ok := f.warned[remote]; !ok {
-			fs.Logf(f, "Replacing invalid UTF-8 characters in %q", remote)
-			f.warned[remote] = struct{}{}
-		}
-		f.warnedMu.Unlock()
+	if f.validateUtf8 && !utf8.ValidString(filename) {
+		f.warnInvalidUtf8(remote)
 	}
 
 	return
@@ -771,6 +861,20 @@ func (f *Fs) cleanRemote(dir, filename string) (remote string) {
 // relative to f.root, without cleaning it.
 func (f *Fs) nativePath(name string) string {
 	return filepath.FromSlash(f.opt.Enc.FromStandardPath(name))
+}
+
+func (f *Fs) cleanRemoteWithPrefix(prefix, filename string) (remote string) {
+	if f.opt.UTFNorm {
+		filename = norm.NFC.String(filename)
+	}
+
+	remote = prefix + f.opt.Enc.ToStandardName(filename)
+
+	if f.validateUtf8 && !utf8.ValidString(filename) {
+		f.warnInvalidUtf8(remote)
+	}
+
+	return remote
 }
 
 // localPath returns the OS path for the object called name, which is
@@ -2061,17 +2165,17 @@ func (f *Fs) OpenWriterAt(ctx context.Context, remote string, size int64) (write
 	}, nil
 }
 
-// setMetadata sets the file info from the os.FileInfo passed in
-func (o *Object) setMetadata(info os.FileInfo) {
+// setMetadataNoLock sets the file info from the os.FileInfo passed in.
+// The object must not yet be shared with other goroutines (e.g., freshly
+// allocated by newObject). Use setMetadata for objects visible to concurrent readers.
+func (o *Object) setMetadataNoLock(info os.FileInfo) {
 	// if not checking updated then don't update the stat
 	if o.fs.opt.NoCheckUpdated && !o.modTime.IsZero() {
 		return
 	}
-	o.fs.objectMetaMu.Lock()
 	o.size = info.Size()
 	o.modTime = readTime(o.fs.opt.TimeType, info)
 	o.mode = info.Mode()
-	o.fs.objectMetaMu.Unlock()
 	// Read the size of the link.
 	//
 	// The value in info.Size() is not always correct
@@ -2088,6 +2192,17 @@ func (o *Object) setMetadata(info os.FileInfo) {
 	}
 }
 
+// setMetadata sets the file info from the os.FileInfo passed in
+func (o *Object) setMetadata(info os.FileInfo) {
+	// if not checking updated then don't update the stat
+	if o.fs.opt.NoCheckUpdated && !o.modTime.IsZero() {
+		return
+	}
+	o.fs.objectMetaMu.Lock()
+	o.setMetadataNoLock(info)
+	o.fs.objectMetaMu.Unlock()
+}
+
 // clearHashCache wipes any cached hashes for the object
 func (o *Object) clearHashCache() {
 	o.fs.objectMetaMu.Lock()
@@ -2102,7 +2217,7 @@ func (o *Object) lstat() error {
 
 // Stat an Object into info with context for timeout protection
 func (o *Object) lstatWithContext(ctx context.Context) error {
-	info, err := o.fs.asyncLstat(ctx, o.path)
+	info, err := o.fs.getStatScheduler().SubmitOne(ctx, o.path, !o.fs.opt.FollowSymlinks)
 	if err == nil {
 		o.setMetadata(info)
 	}
