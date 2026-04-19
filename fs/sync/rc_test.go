@@ -15,7 +15,7 @@ func rcNewRun(t *testing.T, method string) (*fstest.Run, *rc.Call) {
 	if *fstest.RemoteName != "" {
 		t.Skip("Skipping test on non local remote")
 	}
-	r := fstest.NewRun(t)
+	r := fstest.NewRunIndividual(t)
 	call := rc.Calls.Get(method)
 	assert.NotNil(t, call)
 	cache.Put(r.LocalName, r.Flocal)

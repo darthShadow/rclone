@@ -114,6 +114,8 @@ type statScheduler struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
+	closing atomic.Bool
+
 	normalQueue chan *statJob
 	retryQueue  chan *statJob
 
@@ -379,6 +381,8 @@ func (s *statScheduler) waitStandaloneCancel(controller *batchController, termin
 
 // Close stops the scheduler and waits briefly for non-stuck workers to exit.
 func (s *statScheduler) Close() {
+	s.closing.Store(true)
+
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
@@ -412,6 +416,9 @@ func (s *statScheduler) Close() {
 		events := s.sweepLeases(time.Now())
 		s.processEvents(events)
 	}
+
+	s.drainQueuedJobs(s.normalQueue)
+	s.drainQueuedJobs(s.retryQueue)
 }
 
 func (s *statScheduler) spawnWorker() bool {
@@ -458,6 +465,10 @@ func (s *statScheduler) workerLoop(workerID int, workerGeneration uint64) {
 		if !ok {
 			return
 		}
+		if s.closing.Load() {
+			s.failQueuedJob(job, s.schedulerClosedErr())
+			continue
+		}
 		if job.kind == statJobStandalone && job.batch.standaloneCanceled() {
 			// A standalone job can be canceled while still queued; close its
 			// terminal path without beginning a lease or entering a syscall.
@@ -468,16 +479,16 @@ func (s *statScheduler) workerLoop(workerID int, workerGeneration uint64) {
 		var published, completed bool
 		var panicValue any
 		resultsScratch, nameBuf, published, completed, panicValue = s.executeLease(workerID, workerGeneration, job, resultsScratch, nameBuf)
-		// Snapshot the label before finishLease returns the job to the pool;
-		// otherwise the next acquirePendingLease can race fillJobLocked's write
-		// against this read.
-		var panicLabel string
+		var panicTarget any
 		if panicValue != nil {
-			panicLabel = job.label()
+			// Snapshot the final panic log target before finishLease returns the
+			// pooled job to putJob; otherwise a subsequent fillJobLocked can race
+			// this read by reusing the same object.
+			panicTarget = s.leaseLogTarget(job.batch, job.label())
 		}
 		reclaimed := s.finishLease(workerID, workerGeneration, job, published, completed)
 		if panicValue != nil {
-			fs.Errorf(s.leaseLogTarget(job.batch, panicLabel), "stat scheduler worker panic: %v", panicValue)
+			fs.Errorf(panicTarget, "stat scheduler worker panic: %v", panicValue)
 		}
 		if reclaimed {
 			return
@@ -596,6 +607,9 @@ func (s *statScheduler) nextJob() (*statJob, bool) {
 }
 
 func (s *statScheduler) enqueueNormal(ctx context.Context, job *statJob) error {
+	if s.closing.Load() {
+		return s.schedulerClosedErr()
+	}
 	select {
 	case <-s.ctx.Done():
 		return s.ctx.Err()
@@ -607,6 +621,9 @@ func (s *statScheduler) enqueueNormal(ctx context.Context, job *statJob) error {
 }
 
 func (s *statScheduler) enqueueRetry(ctx context.Context, job *statJob) error {
+	if s.closing.Load() {
+		return s.schedulerClosedErr()
+	}
 	select {
 	case <-s.ctx.Done():
 		return s.ctx.Err()
@@ -634,4 +651,42 @@ func (s *statScheduler) getJob() *statJob {
 func (s *statScheduler) putJob(job *statJob) {
 	*job = statJob{}
 	s.jobPool.Put(job)
+}
+
+func (s *statScheduler) schedulerClosedErr() error {
+	if err := s.ctx.Err(); err != nil {
+		return err
+	}
+	return context.Canceled
+}
+
+func (s *statScheduler) failQueuedJob(job *statJob, err error) {
+	if job == nil {
+		return
+	}
+	if err == nil {
+		err = context.Canceled
+	}
+	if job.batch != nil {
+		job.batch.mu.Lock()
+		if job.batch.firstErr == nil {
+			job.batch.firstErr = err
+		}
+		job.batch.canceled = true
+		job.batch.mu.Unlock()
+		job.batch.closeDone()
+		job.batch.signalTerminal()
+	}
+	s.putJob(job)
+}
+
+func (s *statScheduler) drainQueuedJobs(queue chan *statJob) {
+	for {
+		select {
+		case job := <-queue:
+			s.failQueuedJob(job, s.schedulerClosedErr())
+		default:
+			return
+		}
+	}
 }
