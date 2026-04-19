@@ -70,7 +70,7 @@ func DirSorted(ctx context.Context, f fs.Fs, includeAll bool, dir string) (entri
 		fs.Debugf(dir, "Excluded")
 		return nil, nil
 	}
-	return filterAndSortDir(ctx, entries, includeAll, dir, fi.IncludeObject, fi.IncludeDirectory(ctx, f))
+	return filterAndSortDir(ctx, entries, includeAll, dir, fi.IncludeObject, fi.IncludeDirectory(ctx, f), fi)
 }
 
 // listP for every backend
@@ -117,7 +117,7 @@ func DirSortedFn(ctx context.Context, f fs.Fs, includeAll bool, dir string, call
 			return nil
 		}
 
-		entries, err := filterDir(ctx, entries, includeAll, dir, fi.IncludeObject, fi.IncludeDirectory(ctx, f))
+		entries, err := filterDir(ctx, entries, includeAll, dir, fi.IncludeObject, fi.IncludeDirectory(ctx, f), fi)
 		if err != nil {
 			return err
 		}
@@ -132,9 +132,18 @@ func DirSortedFn(ctx context.Context, f fs.Fs, includeAll bool, dir string, call
 // Filter the entries passed in
 func filterDir(ctx context.Context, entries fs.DirEntries, includeAll bool, dir string,
 	IncludeObject func(ctx context.Context, o fs.Object) bool,
-	IncludeDirectory func(remote string) (bool, error)) (newEntries fs.DirEntries, err error) {
+	IncludeDirectory func(remote string) (bool, error),
+	fi *filter.Filter) (newEntries fs.DirEntries, err error) {
 	entries = RemoveEscaping(entries)
 	newEntries = entries[:0] // in place filter
+	// Uncomment to bypass batch evaluation when backend pre-filtered.
+	// WARNING: This skips ALL filterDir processing, including:
+	// - Post-hoc modtime/size/metadata guards (--min-age, --max-age, --min-size, --max-size, --metadata-filter)
+	// - Directory filtering via IncludeDirectory
+	// - Entry-shape validation
+	// - Exclude-file checks (ListContainsExcludeFile)
+	// Only safe when none of these features are in use.
+	// if filter.GetPreFiltered(ctx) { return entries, nil }
 	prefix := ""
 	if dir != "" {
 		prefix = dir
@@ -142,60 +151,103 @@ func filterDir(ctx context.Context, entries fs.DirEntries, includeAll bool, dir 
 			prefix += "/"
 		}
 	}
-	for _, entry := range entries {
-		ok := true
-		// check includes and types
-		switch x := entry.(type) {
-		case fs.Object:
-			// Make sure we don't delete excluded files if not required
-			if !includeAll && !IncludeObject(ctx, x) {
-				ok = false
-				fs.Debugf(x, "Excluded")
-			}
-		case fs.Directory:
-			if !includeAll {
-				include, err := IncludeDirectory(x.Remote())
-				if err != nil {
-					return nil, err
-				}
-				if !include {
-					ok = false
-					fs.Debugf(x, "Excluded")
-				}
-			}
+
+	// When batch evaluation is available and filtering is active,
+	// collect validated objects and their indices for batch processing.
+	useBatch := fi != nil && !includeAll && !fi.InActive()
+
+	// Phase 1: validate all entries and filter directories.
+	// Objects are collected for batch evaluation if useBatch is true.
+	// Use a bool slice indexed by entry position to preserve original order.
+	inc := make([]bool, len(entries))
+	type objectEntry struct {
+		obj      fs.Object
+		entryIdx int // position in entries slice
+	}
+	var batchObjects []objectEntry
+
+	for i, entry := range entries {
+		// Check for known types first - unknown types are always an error
+		switch entry.(type) {
+		case fs.Object, fs.Directory:
+			// ok - known type
 		default:
 			return nil, fmt.Errorf("unknown object type %T", entry)
 		}
-		// check remote name belongs in this directory
+
+		// check remote name belongs in this directory - BEFORE any filter evaluation
 		remote := entry.Remote()
 		switch {
-		case !ok:
-			// ignore
 		case !strings.HasPrefix(remote, prefix):
-			ok = false
 			fs.Errorf(entry, "Entry doesn't belong in directory %q (too short) - ignoring", dir)
+			continue
 		case remote == dir:
-			ok = false
 			fs.Errorf(entry, "Entry doesn't belong in directory %q (same as directory) - ignoring", dir)
+			continue
 		case strings.ContainsRune(remote[len(prefix):], '/') && !bucket.IsAllSlashes(remote[len(prefix):]):
-			ok = false
 			fs.Errorf(entry, "Entry doesn't belong in directory %q (contains subdir) - ignoring", dir)
-		default:
-			// ok
+			continue
 		}
-		if ok {
+
+		// check includes and types
+		switch x := entry.(type) {
+		case fs.Object:
+			if useBatch {
+				// Defer object filtering to batch evaluation
+				batchObjects = append(batchObjects, objectEntry{obj: x, entryIdx: i})
+			} else {
+				// Per-object evaluation (includeAll or no batch)
+				if !includeAll && !IncludeObject(ctx, x) {
+					fs.Debugf(x, "Excluded")
+					continue
+				}
+				inc[i] = true
+			}
+		case fs.Directory:
+			if !includeAll {
+				incDir, err := IncludeDirectory(x.Remote())
+				if err != nil {
+					return nil, err
+				}
+				if !incDir {
+					fs.Debugf(x, "Excluded")
+					continue
+				}
+			}
+			inc[i] = true
+		}
+	}
+
+	// Phase 2: batch-evaluate collected objects and mark results by original index.
+	if useBatch && len(batchObjects) > 0 {
+		objects := make([]fs.Object, len(batchObjects))
+		for j, oe := range batchObjects {
+			objects[j] = oe.obj
+		}
+		// IncludeObjectBatch handles its own "Excluded" debug logging
+		results := fi.IncludeObjectBatch(ctx, prefix, objects)
+		for j, oe := range batchObjects {
+			inc[oe.entryIdx] = results[j]
+		}
+	}
+
+	// Phase 3: single-pass rebuild preserving original interleaved order.
+	for i, entry := range entries {
+		if inc[i] {
 			newEntries = append(newEntries, entry)
 		}
 	}
+
 	return newEntries, nil
 }
 
 // filter and sort the entries
 func filterAndSortDir(ctx context.Context, entries fs.DirEntries, includeAll bool, dir string,
 	IncludeObject func(ctx context.Context, o fs.Object) bool,
-	IncludeDirectory func(remote string) (bool, error)) (newEntries fs.DirEntries, err error) {
+	IncludeDirectory func(remote string) (bool, error),
+	fi *filter.Filter) (newEntries fs.DirEntries, err error) {
 	// Filter the directory entries (in place)
-	entries, err = filterDir(ctx, entries, includeAll, dir, IncludeObject, IncludeDirectory)
+	entries, err = filterDir(ctx, entries, includeAll, dir, IncludeObject, IncludeDirectory, fi)
 	if err != nil {
 		return nil, err
 	}

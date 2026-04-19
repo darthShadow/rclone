@@ -60,6 +60,11 @@ const (
 	vDel                   // removed file or directory
 )
 
+// NOTE: sync.Pool was evaluated and rejected for *Dir:
+// VFS retains Dir nodes in long-lived items maps without an explicit release hook.
+// A pooled Dir could be reused while still reachable, with stale items/statRead maps
+// or sys state visible; cleanupTimer would also require quiescing any prior callback.
+// The lifetime/ownership risk dominates any allocation benefit.
 func newDir(vfs *VFS, f fs.Fs, parent *Dir, fsDir fs.Directory) *Dir {
 	d := &Dir{
 		vfs:      vfs,
@@ -566,8 +571,14 @@ func (d *Dir) _readDir() error {
 	path, f, vfsCtx, vfsOpt := d.path, d.f, d.vfs.ctx, d.vfs.Opt
 	d.mu.RUnlock()
 
+	// Enable filter-aware listing so backends can skip excluded entries before stat
+	listCtx := vfsCtx
+	if !filter.GetConfig(listCtx).InActive() {
+		listCtx = filter.SetUseFilter(listCtx, true)
+	}
+
 	// Expensive I/O operations without lock
-	entries, err := list.DirSorted(vfsCtx, f, false, path)
+	entries, err := list.DirSorted(listCtx, f, false, path)
 	if errors.Is(err, fs.ErrorDirNotFound) {
 		// We treat directory not found as empty because we
 		// create directories on the fly
@@ -577,7 +588,7 @@ func (d *Dir) _readDir() error {
 
 	// Unicode normalization processing
 	if vfsOpt.BlockNormDupes { // do this only if requested, as it will have a performance hit
-		ci := fs.GetConfig(vfsCtx)
+		ci := fs.GetConfig(listCtx)
 
 		// sort entries such that NFD comes before NFC of same name
 		slices.SortFunc(entries, func(entryA, entryB fs.DirEntry) int {

@@ -721,6 +721,62 @@ func TestApplyTransforms(t *testing.T) {
 	testScenario(both, nfcx2, "both checkfile vs. NFCx2 remote")
 }
 
+func TestToNormal(t *testing.T) {
+	nfc := "Caf\u00e9"
+	nfd := norm.NFD.String(nfc)
+
+	for _, tc := range []struct {
+		name        string
+		in          string
+		normUnicode bool
+		normCase    bool
+		want        string
+	}{
+		{
+			name:        "ASCIIUnchanged",
+			in:          "hello/world.txt",
+			normUnicode: true,
+			want:        "hello/world.txt",
+		},
+		{
+			name:     "ASCIILowerCase",
+			in:       "HELLO/WORLD.TXT",
+			normCase: true,
+			want:     "hello/world.txt",
+		},
+		{
+			name:        "ASCIIUnicodeAndCase",
+			in:          "HELLO/WORLD.TXT",
+			normUnicode: true,
+			normCase:    true,
+			want:        "hello/world.txt",
+		},
+		{
+			name:        "UnicodeNormalization",
+			in:          nfd,
+			normUnicode: true,
+			want:        nfc,
+		},
+		{
+			name:     "UnicodeCaseFold",
+			in:       "\u00c4BC",
+			normCase: true,
+			want:     "\u00e4bc",
+		},
+		{
+			name:        "UnicodeNormalizationAndCaseFold",
+			in:          strings.ToUpper(nfd),
+			normUnicode: true,
+			normCase:    true,
+			want:        strings.ToLower(nfc),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, operations.ToNormal(tc.in, tc.normUnicode, tc.normCase))
+		})
+	}
+}
+
 func detectEncoding(s string) string {
 	if norm.NFC.IsNormalString(s) && norm.NFD.IsNormalString(s) {
 		return "BOTH"

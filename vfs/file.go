@@ -62,6 +62,12 @@ type File struct {
 	isLink           bool                            // file represents a symlink
 }
 
+// NOTE: sync.Pool was evaluated and rejected for *File:
+// VFS retains File nodes in long-lived Dir.items maps without an explicit release
+// hook. A pooled File could be reused while still reachable, with stale fs.Object,
+// sys, writer, or mutex-protected state visible to readers.
+// The lifetime/ownership risk dominates any allocation benefit.
+
 // newFile creates a new File
 //
 // o may be nil

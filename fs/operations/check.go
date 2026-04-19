@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"unicode/utf8"
 
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/accounting"
@@ -396,6 +397,29 @@ func ApplyTransforms(ctx context.Context, s string) string {
 // If normCase == true, s will be transformed to lowercase.
 // If both are true, both transformations will be performed.
 func ToNormal(s string, normUnicode, normCase bool) string {
+	if !normUnicode && !normCase {
+		return s
+	}
+
+	asciiOnly := true
+	hasUpperASCII := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c >= utf8.RuneSelf {
+			asciiOnly = false
+			break
+		}
+		if 'A' <= c && c <= 'Z' {
+			hasUpperASCII = true
+		}
+	}
+	if asciiOnly {
+		if normCase && hasUpperASCII {
+			return strings.ToLower(s)
+		}
+		return s
+	}
+
 	if normUnicode {
 		s = norm.NFC.String(s)
 	}

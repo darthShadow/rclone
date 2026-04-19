@@ -2,10 +2,12 @@ package list
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
 	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/filter"
 	"github.com/rclone/rclone/fstest/mockdir"
 	"github.com/rclone/rclone/fstest/mockobject"
 	"github.com/stretchr/testify/assert"
@@ -61,7 +63,7 @@ func TestFilterAndSortConfinement(t *testing.T) {
 	includeDirectory := func(remote string) (bool, error) { return true, nil }
 
 	// Even with includeAll, entries that escape the root are dropped.
-	newEntries, err := filterAndSortDir(context.Background(), entries, true, "", includeObject, includeDirectory)
+	newEntries, err := filterAndSortDir(context.Background(), entries, true, "", includeObject, includeDirectory, nil)
 	require.NoError(t, err)
 	assert.Equal(t, fs.DirEntries{ok}, newEntries)
 }
@@ -83,19 +85,108 @@ func TestFilterAndSortIncludeAll(t *testing.T) {
 		return remote != "c", nil
 	}
 	// no filter
-	newEntries, err := filterAndSortDir(context.Background(), entries, true, "", includeObject, includeDirectory)
+	newEntries, err := filterAndSortDir(context.Background(), entries, true, "", includeObject, includeDirectory, nil)
 	require.NoError(t, err)
 	assert.Equal(t,
 		newEntries,
 		fs.DirEntries{oA, oB, oC, oD, da, db, dc, dd},
 	)
 	// filter
-	newEntries, err = filterAndSortDir(context.Background(), entries, false, "", includeObject, includeDirectory)
+	newEntries, err = filterAndSortDir(context.Background(), entries, false, "", includeObject, includeDirectory, nil)
 	require.NoError(t, err)
 	assert.Equal(t,
 		newEntries,
 		fs.DirEntries{oA, oC, oD, da, db, dd},
 	)
+}
+
+func TestFilterAndSortBatchPath(t *testing.T) {
+	ctx := context.Background()
+	f, err := filter.NewFilter(nil)
+	require.NoError(t, err)
+	require.NoError(t, f.Add(true, "*.jpg"))
+	require.NoError(t, f.Add(false, "*"))
+
+	da := mockdir.New("aa")
+	oA := mockobject.Object("ab.jpg")
+	oB := mockobject.Object("ac.txt")
+	db := mockdir.New("ad")
+	oC := mockobject.Object("ae.jpg")
+	oD := mockobject.Object("af.bin")
+	entries := fs.DirEntries{da, oA, oB, db, oC, oD}
+
+	includeDirectory := f.IncludeDirectory(ctx, nil)
+	includeDa, err := includeDirectory(da.Remote())
+	require.NoError(t, err)
+	require.True(t, includeDa)
+	includeDb, err := includeDirectory(db.Remote())
+	require.NoError(t, err)
+	require.True(t, includeDb)
+
+	newEntries, err := filterAndSortDir(ctx, entries, false, "",
+		func(ctx context.Context, o fs.Object) bool {
+			t.Errorf("IncludeObject called for %q on batch path", o.Remote())
+			return false
+		},
+		includeDirectory,
+		f,
+	)
+	require.NoError(t, err)
+	assert.Equal(t,
+		fs.DirEntries{da, oA, db, oC},
+		newEntries,
+	)
+}
+
+func TestFilterAndSortBatchIncludeAll(t *testing.T) {
+	ctx := context.Background()
+	f, err := filter.NewFilter(nil)
+	require.NoError(t, err)
+	require.NoError(t, f.Add(false, "*"))
+
+	da := mockdir.New("aa")
+	oA := mockobject.Object("ab.jpg")
+	db := mockdir.New("ac")
+	oB := mockobject.Object("ad.txt")
+	entries := fs.DirEntries{da, oA, db, oB}
+
+	newEntries, err := filterAndSortDir(ctx, entries, true, "",
+		func(ctx context.Context, o fs.Object) bool {
+			t.Errorf("IncludeObject called for %q with includeAll=true", o.Remote())
+			return false
+		},
+		func(remote string) (bool, error) {
+			t.Errorf("IncludeDirectory called for %q with includeAll=true", remote)
+			return false, nil
+		},
+		f,
+	)
+	require.NoError(t, err)
+	assert.Equal(t, fs.DirEntries{da, oA, db, oB}, newEntries)
+}
+
+func TestFilterAndSortDirectoryError(t *testing.T) {
+	expectedErr := fmt.Errorf("include directory failed")
+	entries := fs.DirEntries{
+		mockdir.New("aa"),
+		mockdir.New("broken"),
+		mockobject.Object("zz.jpg"),
+	}
+
+	newEntries, err := filterDir(context.Background(), entries, false, "",
+		func(ctx context.Context, o fs.Object) bool {
+			return true
+		},
+		func(remote string) (bool, error) {
+			if remote == "broken" {
+				return false, expectedErr
+			}
+			return true, nil
+		},
+		nil,
+	)
+	require.ErrorIs(t, err, expectedErr)
+	assert.Nil(t, newEntries)
 }
 
 func TestFilterAndSortCheckDir(t *testing.T) {
@@ -110,7 +201,7 @@ func TestFilterAndSortCheckDir(t *testing.T) {
 	dd := mockdir.New("dir/d")
 	oD := mockobject.Object("dir/D")
 	entries := fs.DirEntries{da, da2, oA, db, oB, dc, oC, dd, oD}
-	newEntries, err := filterAndSortDir(context.Background(), entries, true, "dir", nil, nil)
+	newEntries, err := filterAndSortDir(context.Background(), entries, true, "dir", nil, nil, nil)
 	require.NoError(t, err)
 	assert.Equal(t,
 		fs.DirEntries{da2, oC, oD, db, dc, dd},
@@ -130,7 +221,7 @@ func TestFilterAndSortCheckDirRoot(t *testing.T) {
 	dd := mockdir.New("d")
 	oD := mockobject.Object("D")
 	entries := fs.DirEntries{da, da2, oA, db, oB, dc, oC, dd, oD}
-	newEntries, err := filterAndSortDir(context.Background(), entries, true, "", nil, nil)
+	newEntries, err := filterAndSortDir(context.Background(), entries, true, "", nil, nil, nil)
 	require.NoError(t, err)
 	assert.Equal(t,
 		fs.DirEntries{da2, oA, oC, oD, db, dc, dd},
@@ -153,7 +244,7 @@ func TestFilterAndSortUnknown(t *testing.T) {
 	ub := unknownDirEntry("b")
 	oB := mockobject.Object("B/sub")
 	entries := fs.DirEntries{da, oA, ub, oB}
-	newEntries, err := filterAndSortDir(context.Background(), entries, true, "", nil, nil)
+	newEntries, err := filterAndSortDir(context.Background(), entries, true, "", nil, nil, nil)
 	assert.Error(t, err, "error")
 	assert.Nil(t, newEntries)
 }

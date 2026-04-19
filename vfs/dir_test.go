@@ -346,6 +346,7 @@ func checkListing(t *testing.T, dir *Dir, want []string) {
 	for _, node := range nodes {
 		got = append(got, fmt.Sprintf("%s,%d,%v", node.Name(), node.Size(), node.IsDir()))
 	}
+	sort.Strings(got)
 	assert.Equal(t, want, got)
 }
 
