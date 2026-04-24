@@ -62,14 +62,13 @@ type batchController struct {
 	remainingParts  int
 	done            chan struct{}
 
-	mu           sync.Mutex
-	canceled     bool
-	doneClosed   bool
-	firstErr     error
-	closeOnce    sync.Once
-	doneOnce     sync.Once
-	terminalOnce sync.Once
-	timeoutOnce  sync.Once
+	mu          sync.Mutex
+	canceled    bool
+	doneClosed  bool
+	firstErr    error
+	closeOnce   sync.Once
+	doneOnce    sync.Once
+	timeoutOnce sync.Once
 
 	// timedOutLeases tracks stale timed-out workers that are still in flight.
 	// Mutate it only under b.mu. scratchReusable consults this set before
@@ -81,10 +80,6 @@ type batchController struct {
 	// timeout path delivers the first standalone timeout error on it; batched
 	// controllers leave it nil so stray notifications no-op.
 	timeoutCh chan error
-	// terminalCh is allocated only by newStandaloneBatchController. signalTerminal
-	// closes it exactly once when a standalone lease reaches terminal state;
-	// batched controllers leave it nil so stray signals no-op.
-	terminalCh chan struct{}
 }
 
 type statFileInfo struct {
@@ -122,9 +117,8 @@ func newStandaloneBatchController(ctx context.Context, path string, lstat bool) 
 	b.standalone = true
 	b.standalonePath = path
 	b.standaloneLstat = lstat
-	// Standalone controllers always allocate both notification channels.
+	// Standalone controllers always allocate the timeout notification channel.
 	b.timeoutCh = make(chan error, 1)
-	b.terminalCh = make(chan struct{})
 	return b
 }
 
@@ -134,6 +128,7 @@ type listController struct {
 	owner     *Fs
 	scheduler *statScheduler
 	opts      listControllerOptions
+	dirPath   string
 
 	entriesScratch []cachedDirEntry
 	resultsScratch []statFileInfo
@@ -147,6 +142,10 @@ func newBatchController(ctx context.Context, entries []cachedDirEntry, statDir i
 }
 
 func newBatchControllerWithScratch(ctx context.Context, entries []cachedDirEntry, statDir int, microBatchSize int, statFunc func(*cachedDirEntry, []byte) (os.FileInfo, []byte, error), resultsScratch []statFileInfo, partsScratch []batchPart) *batchController {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx = context.WithoutCancel(ctx)
 	if microBatchSize <= 0 {
 		microBatchSize = statSchedulerDefaultMicroBatchSize
 	}
@@ -218,7 +217,7 @@ func (b *batchController) Close() {
 // shared scheduler.
 func (b *batchController) Schedule(scheduler *statScheduler) error {
 	if scheduler == nil {
-		return fmt.Errorf("nil stat scheduler")
+		return fmt.Errorf("nil stat scheduler: %w", errStatSchedulerBug)
 	}
 
 	for microBatch := range b.parts {
@@ -246,9 +245,6 @@ func (b *batchController) Wait(ctx context.Context) ([]cachedDirEntry, []statFil
 	case <-ctx.Done():
 		b.cancel()
 		return nil, nil, ctx.Err()
-	case <-b.ctx.Done():
-		b.cancel()
-		return nil, nil, b.ctx.Err()
 	}
 }
 
@@ -265,9 +261,9 @@ func runStatFunc(entry *cachedDirEntry, statFunc func(*cachedDirEntry, []byte) (
 	defer func() {
 		if r := recover(); r != nil {
 			if recoveredErr, ok := r.(error); ok {
-				err = fmt.Errorf("stat panic for %q: %w", entry.Name(), recoveredErr)
+				err = fmt.Errorf("stat panic for %q: %w: %w", entry.Name(), errStatSchedulerBug, recoveredErr)
 			} else {
-				err = fmt.Errorf("stat panic for %q: %v", entry.Name(), r)
+				err = fmt.Errorf("stat panic for %q: %w: %v", entry.Name(), errStatSchedulerBug, r)
 			}
 		}
 	}()
@@ -355,10 +351,10 @@ func (b *batchController) publish(microBatch int, leaseID uint64, results []stat
 	// Close recycles the batch dirfd; those stale workers still hold the raw fd
 	// integer and observe EBADF. This publish gate is also the correctness check
 	// that rejects any late worker after its lease times out or the batch is
-	// canceled. markLeaseTimedOut flips part.state, part.leaseID, and b.canceled
-	// under b.mu before waking retries or close paths, and this publish path
-	// reacquires b.mu before accepting results, so stale completions observe the
-	// flipped state and are discarded instead of overwriting fresh work.
+	// canceled. markLeaseTimedOut flips part.state to retry-pending under b.mu,
+	// and this publish path reacquires b.mu before accepting results, so stale
+	// completions fail the canceled/state/leaseID gate and are discarded instead
+	// of overwriting fresh work.
 	if b.canceled || part.state != statMicroBatchLeased || part.leaseID != leaseID {
 		return false, false
 	}
@@ -423,12 +419,18 @@ func (b *batchController) cancel() {
 	b.mu.Unlock()
 }
 
-func (b *batchController) timeoutNotifications() <-chan error {
-	return b.timeoutCh
+func (b *batchController) cancelWithErr(err error) {
+	b.mu.Lock()
+	if b.firstErr == nil {
+		b.firstErr = err
+	}
+	b.canceled = true
+	b.mu.Unlock()
+	b.closeDone()
 }
 
-func (b *batchController) terminalNotifications() <-chan struct{} {
-	return b.terminalCh
+func (b *batchController) timeoutNotifications() <-chan error {
+	return b.timeoutCh
 }
 
 // notifyTimeout publishes the first standalone timeout error. Batched
@@ -439,18 +441,6 @@ func (b *batchController) notifyTimeout(err error) {
 	}
 	b.timeoutOnce.Do(func() {
 		b.timeoutCh <- err
-	})
-}
-
-// signalTerminal closes the standalone terminal channel once the lease reaches
-// any terminal state. Batched controllers keep terminalCh nil, so accidental
-// calls are harmless.
-func (b *batchController) signalTerminal() {
-	if b.terminalCh == nil {
-		return
-	}
-	b.terminalOnce.Do(func() {
-		close(b.terminalCh)
 	})
 }
 
@@ -506,6 +496,14 @@ func (l *listController) reclaimScratch(controller *batchController) {
 // submits the filtered entries to the shared scheduler, and waits for that batch to finish
 // before the caller advances to the next ReadDir batch.
 func (l *listController) ProcessBatch(ctx context.Context, batch *readResult, preFilter func(os.DirEntry) (cachedDirEntry, bool), statFunc func(*cachedDirEntry, []byte) (os.FileInfo, []byte, error), consume listBatchConsumer) error {
+	// Mirror SubmitOne's nil handling: ProcessBatch is a public scheduler entry,
+	// and context.WithoutCancel(nil) would panic.
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx = context.WithoutCancel(ctx)
+	path := l.dirPath
+
 	var controller *batchController
 	defer func() {
 		if controller != nil {
@@ -564,16 +562,16 @@ func (l *listController) ProcessBatch(ctx context.Context, batch *readResult, pr
 	err := controller.Schedule(l.scheduler)
 	if err != nil {
 		l.reclaimScratch(controller)
-		return err
+		return translateSchedulerErr("list", path, err)
 	}
 	batchEntries, fis, err := controller.Wait(ctx)
 	if err != nil {
 		l.reclaimScratch(controller)
-		return err
+		return translateSchedulerErr("list", path, err)
 	}
 	if consume != nil {
 		err = consume(batchEntries, fis)
 	}
 	l.reclaimScratch(controller)
-	return err
+	return translateSchedulerErr("list", path, err)
 }

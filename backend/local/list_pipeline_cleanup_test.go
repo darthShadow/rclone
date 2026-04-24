@@ -2,7 +2,6 @@ package local
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"testing"
@@ -37,14 +36,14 @@ func TestListFileInfos_CancellationLargeDirectory(t *testing.T) {
 	started := make(chan struct{}, 1)
 	done := make(chan error, 1)
 	go func() {
-		_, err := f.listFileInfos(ctx, fd, nil, nil, func(entry os.DirEntry) os.FileInfo {
+		err := f.listCachedFileInfos(ctx, fd, nil, "", nil, func(entry *cachedDirEntry, nameBuf []byte) (os.FileInfo, []byte, error) {
 			select {
 			case started <- struct{}{}:
 			default:
 			}
 			<-ctx.Done()
-			return nil
-		})
+			return nil, nameBuf, ctx.Err()
+		}, nil)
 		done <- err
 	}()
 
@@ -58,7 +57,7 @@ func TestListFileInfos_CancellationLargeDirectory(t *testing.T) {
 
 	select {
 	case err := <-done:
-		require.True(t, errors.Is(err, context.Canceled), "expected context cancellation, got %v", err)
+		require.ErrorIs(t, err, context.Canceled)
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for large-directory cancellation")
 	}
