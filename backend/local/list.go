@@ -8,6 +8,7 @@ import (
 	"os"
 	"runtime"
 	"slices"
+	"strings"
 	"syscall"
 	"time"
 
@@ -98,34 +99,6 @@ func stopTimer(timer *time.Timer) {
 		default:
 		}
 	}
-}
-
-// listFileInfos runs the sequential ReadDir(listReadDirBatchSize) ->
-// ProcessBatch -> materialize loop and unwraps the cached stat results to plain
-// os.FileInfo values.
-func (f *Fs) listFileInfos(ctx context.Context, fd *os.File, openDir func() (*os.File, error), preFilter func(os.DirEntry) bool, statFunc func(entry os.DirEntry) os.FileInfo) (allFis []os.FileInfo, err error) {
-	cachedPreFilter := func(entry os.DirEntry) (cachedDirEntry, bool) {
-		if preFilter != nil && !preFilter(entry) {
-			return cachedDirEntry{}, false
-		}
-		return cachedDirEntry{DirEntry: entry}, true
-	}
-	cachedStatFunc := func(entry *cachedDirEntry, nameBuf []byte) (os.FileInfo, []byte, error) {
-		return statFunc(entry.DirEntry), nameBuf, nil
-	}
-	err = f.listCachedFileInfos(ctx, fd, openDir, "", cachedPreFilter, cachedStatFunc, func(_ []cachedDirEntry, fis []statFileInfo) error {
-		for i := range fis {
-			if fis[i].fi == nil {
-				continue
-			}
-			allFis = append(allFis, fis[i].fi)
-		}
-		return nil
-	})
-	if err != nil {
-		return nil, err
-	}
-	return allFis, nil
 }
 
 // listCachedFileInfos reads one directory. The first ReadDir(listReadDirBatchSize)
@@ -221,11 +194,14 @@ func (f *Fs) listCachedFileInfos(ctx context.Context, fd *os.File, openDir func(
 
 	// TODO(adversarial-review): local-main had no process-wide listing admission
 	// control at all. The scheduler worker pool here is already strictly better
-	// because a stuck outage is capped at MaxWorkers leaked goroutines/fds per
-	// concurrent listing. We still do not add a process-wide breaker in this
-	// round; revisit if io_uring does not land and sustained stuck-CephFS outages
-	// show up in the field.
+	// because stuck stats must pass through shared admission and replacement
+	// instead of spawning directly from every listing. We still do not add a
+	// process-wide breaker in this round; revisit if io_uring does not land and
+	// sustained stuck-CephFS outages show up in the field.
 	controller := newListController(f, f.statScheduler, listControllerOptions{})
+	if len(dirRemotePrefix) > 0 {
+		controller.dirPath = strings.TrimSuffix(dirRemotePrefix, "/")
+	}
 	fdOwned := true
 	defer func() {
 		if fdOwned && fd != nil {
@@ -273,6 +249,9 @@ func (f *Fs) listCachedFileInfos(ctx context.Context, fd *os.File, openDir func(
 	if err != nil {
 		return err
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if batch.err == io.EOF {
 		return nil
 	}
@@ -297,7 +276,9 @@ func (f *Fs) listCachedFileInfos(ctx context.Context, fd *os.File, openDir func(
 		if err != nil {
 			return err
 		}
-
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if batch.err == io.EOF {
 			break
 		}

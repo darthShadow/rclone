@@ -14,12 +14,23 @@ import (
 
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/accounting"
+	"github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/fs/operations"
 	"github.com/rclone/rclone/fs/sync"
 	"github.com/rclone/rclone/fstest"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+type cancelHashObject struct {
+	fs.Object
+	cancel context.CancelFunc
+}
+
+func (o *cancelHashObject) Hash(context.Context, hash.Type) (string, error) {
+	o.cancel()
+	return "", context.Canceled
+}
 
 func TestTruncateString(t *testing.T) {
 	for _, test := range []struct {
@@ -393,6 +404,46 @@ func TestCopyInplace(t *testing.T) {
 	require.NoError(t, err)
 	r.CheckLocalItems(t, file1)
 	r.CheckRemoteItems(t, file2)
+}
+
+func TestCopyCanceledVerificationCleanup(t *testing.T) {
+	baseCtx, ci := fs.AddConfig(context.Background())
+	const contents = "source contents"
+
+	t.Run("non-inplace removes partial", func(t *testing.T) {
+		r := fstest.NewRun(t)
+		r.WriteFile("source", contents, t1)
+		src, err := r.Flocal.NewObject(baseCtx, "source")
+		require.NoError(t, err)
+
+		ci.Inplace = false
+		require.NotNil(t, r.Fremote.Features().Move)
+		require.True(t, r.Fremote.Features().PartialUploads)
+
+		ctx, cancel := context.WithCancel(baseCtx)
+		_, err = operations.Copy(ctx, r.Fremote, nil, "destination", &cancelHashObject{Object: src, cancel: cancel})
+		require.ErrorIs(t, err, context.Canceled)
+
+		r.CheckRemoteItems(t)
+	})
+
+	t.Run("inplace keeps destination", func(t *testing.T) {
+		r := fstest.NewRun(t)
+		r.WriteFile("source", contents, t1)
+		src, err := r.Flocal.NewObject(baseCtx, "source")
+		require.NoError(t, err)
+
+		ci.Inplace = true
+		r.WriteObject(baseCtx, "destination", "old contents", t1)
+		dst, err := r.Fremote.NewObject(baseCtx, "destination")
+		require.NoError(t, err)
+
+		ctx, cancel := context.WithCancel(baseCtx)
+		_, err = operations.Copy(ctx, r.Fremote, dst, "destination", &cancelHashObject{Object: src, cancel: cancel})
+		require.ErrorIs(t, err, context.Canceled)
+
+		r.CheckRemoteItems(t, fstest.NewItem("destination", contents, t1))
+	})
 }
 
 func TestCopyLongFileName(t *testing.T) {

@@ -640,8 +640,9 @@ func (f *Fs) Features() *fs.Features {
 //
 // lib/cache finalization can invoke Shutdown while long-lived callers still
 // retain *Fs references (for example VFS or rc fscache/clear). After that
-// point SubmitOne returns context.Canceled on the closed scheduler. That cache
-// pinning surprise is documented here; the fix belongs upstream in cache.
+// point SubmitOne returns *os.PathError wrapping context.Canceled on the
+// closed scheduler. That cache pinning surprise is documented here; the fix
+// belongs upstream in cache.
 func (f *Fs) Shutdown(ctx context.Context) error {
 	if f.statScheduler != nil {
 		f.statScheduler.Close()
@@ -1329,7 +1330,7 @@ func (f *Fs) Stat(ctx context.Context, dir string, leaf string) (entry fs.DirEnt
 	}
 
 	leafPath := join.FilePathJoin(fsDirPath, leaf)
-	fi, fierr := os.Lstat(leafPath)
+	fi, fierr := f.statScheduler.SubmitOne(ctx, leafPath, true)
 	if fierr != nil {
 		return nil, fmt.Errorf("%q: fetching info about directory entry %q: %w", dir, leafPath, fierr)
 	}
@@ -1341,7 +1342,7 @@ func (f *Fs) Stat(ctx context.Context, dir string, leaf string) (entry fs.DirEnt
 	// Follow symlinks if required
 	if f.opt.FollowSymlinks && (mode&os.ModeSymlink) != 0 {
 		localPath := join.FilePathJoin(fsDirPath, name)
-		fi, fierr = os.Stat(localPath)
+		fi, fierr = f.statScheduler.SubmitOne(ctx, localPath, false)
 		// Quietly skip errors on excluded files and directories
 		if fierr != nil && useFilter && !filter.IncludeRemote(newRemote) {
 			return nil, fs.ErrorObjectNotFound

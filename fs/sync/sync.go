@@ -320,15 +320,15 @@ func (s *syncCopyMove) processError(err error) {
 	if err == nil {
 		return
 	}
-	if err == context.DeadlineExceeded {
+	if errors.Is(err, context.DeadlineExceeded) {
 		err = fserrors.NoRetryError(err)
-	} else if err == accounting.ErrorMaxTransferLimitReachedGraceful {
+	} else if errors.Is(err, accounting.ErrorMaxTransferLimitReachedGraceful) {
 		if s.inCtx.Err() == nil {
 			fs.Logf(nil, "%v - stopping transfers", err)
 			// Cancel the march and stop the pipes
 			s.inCancel()
 		}
-	} else if err == context.Canceled && s.inCtx.Err() != nil {
+	} else if errors.Is(err, context.Canceled) && s.inCtx.Err() != nil {
 		// Ignore context Canceled if we have called s.inCancel()
 		return
 	}

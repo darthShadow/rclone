@@ -186,7 +186,7 @@ func Bisync(ctx context.Context, fs1, fs2 fs.Fs, optArg *Options) (err error) {
 
 	b.CleanupCompleted = true
 	if b.InGracefulShutdown {
-		if err == context.Canceled || err == accounting.ErrorMaxTransferLimitReachedGraceful {
+		if errors.Is(err, context.Canceled) || errors.Is(err, accounting.ErrorMaxTransferLimitReachedGraceful) {
 			err = nil
 			b.critical = false
 		}
@@ -381,7 +381,7 @@ func (b *bisyncRun) runLocked(octx context.Context) (err error) {
 		fs.Infof(nil, "Applying changes")
 		results2to1, results1to2, queues, err = b.applyDeltas(octx, ds1, ds2)
 		if err != nil {
-			if b.InGracefulShutdown && (err == context.Canceled || err == accounting.ErrorMaxTransferLimitReachedGraceful || strings.Contains(err.Error(), "context canceled")) {
+			if b.InGracefulShutdown && (errors.Is(err, context.Canceled) || errors.Is(err, accounting.ErrorMaxTransferLimitReachedGraceful)) {
 				fs.Infof(nil, "Ignoring sync error due to Graceful Shutdown: %v", err)
 			} else {
 				b.critical = true

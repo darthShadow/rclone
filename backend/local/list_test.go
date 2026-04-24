@@ -370,7 +370,7 @@ func TestListCachedFileInfos_CancellationStopsScheduledBatch(t *testing.T) {
 	}
 }
 
-func TestListFileInfos_Cancellation(t *testing.T) {
+func TestListCachedFileInfos_Cancellation(t *testing.T) {
 	f, root := newTestLocalFs(t)
 	for i := 0; i < statSchedulerDefaultMicroBatchSize+4; i++ {
 		writeTestFile(t, root, fakeEntryName("item", i))
@@ -396,21 +396,21 @@ func TestListFileInfos_Cancellation(t *testing.T) {
 	started := make(chan struct{}, 1)
 	done := make(chan error, 1)
 	go func() {
-		_, err := f.listFileInfos(ctx, fd, nil, nil, func(entry os.DirEntry) os.FileInfo {
+		err := f.listCachedFileInfos(ctx, fd, nil, "", nil, func(entry *cachedDirEntry, nameBuf []byte) (os.FileInfo, []byte, error) {
 			select {
 			case started <- struct{}{}:
 			default:
 			}
 			<-ctx.Done()
-			return nil
-		})
+			return nil, nameBuf, ctx.Err()
+		}, nil)
 		done <- err
 	}()
 
 	select {
 	case <-started:
 	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for listFileInfos stat work to start")
+		t.Fatal("timed out waiting for listCachedFileInfos stat work to start")
 	}
 
 	cancel()
@@ -419,7 +419,7 @@ func TestListFileInfos_Cancellation(t *testing.T) {
 	case err := <-done:
 		require.ErrorIs(t, err, context.Canceled)
 	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for listFileInfos cancellation")
+		t.Fatal("timed out waiting for listCachedFileInfos cancellation")
 	}
 }
 

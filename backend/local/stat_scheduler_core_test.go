@@ -3,11 +3,13 @@ package local
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"slices"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -28,6 +30,122 @@ func TestStatSchedulerOptions_WithDefaults(t *testing.T) {
 func TestListControllerOptions_WithDefaults(t *testing.T) {
 	opts := (listControllerOptions{}).withDefaults()
 	assert.Equal(t, statSchedulerDefaultMicroBatchSize, opts.MicroBatchSize)
+}
+
+func TestTranslateSchedulerErr(t *testing.T) {
+	sysErr := &os.PathError{Op: "lstat", Path: "/tmp/x", Err: syscall.ENOENT}
+	plainErr := errors.New("plain")
+	bugErr := fmt.Errorf("wrapped: %w", errStatSchedulerBug)
+
+	tests := []struct {
+		name            string
+		err             error
+		wantSame        error
+		wantIs          error
+		wantNotExist    bool
+		wantPathErr     bool
+		wantPathErrOp   string
+		wantPathErrPath string
+	}{
+		{
+			name:         "syscall_passthrough",
+			err:          sysErr,
+			wantSame:     sysErr,
+			wantNotExist: true,
+			wantPathErr:  true,
+		},
+		{
+			name:            "context_canceled_path_error_preserves_identity",
+			err:             context.Canceled,
+			wantIs:          context.Canceled,
+			wantPathErr:     true,
+			wantPathErrOp:   "lstat",
+			wantPathErrPath: "/x",
+		},
+		{
+			name:        "bug_sentinel_path_error_preserves_identity",
+			err:         bugErr,
+			wantIs:      errStatSchedulerBug,
+			wantPathErr: true,
+		},
+		{
+			name:        "default_path_error_preserves_original",
+			err:         plainErr,
+			wantIs:      plainErr,
+			wantPathErr: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := translateSchedulerErr("lstat", "/x", tc.err)
+			if tc.wantSame != nil {
+				assert.Same(t, tc.wantSame, got)
+			}
+			if tc.wantIs != nil {
+				require.ErrorIs(t, got, tc.wantIs)
+			}
+			assert.Equal(t, tc.wantNotExist, os.IsNotExist(got))
+			if tc.wantPathErr {
+				var pathErr *os.PathError
+				require.ErrorAs(t, got, &pathErr)
+				if tc.wantPathErrOp != "" {
+					assert.Equal(t, tc.wantPathErrOp, pathErr.Op)
+				}
+				if tc.wantPathErrPath != "" {
+					assert.Equal(t, tc.wantPathErrPath, pathErr.Path)
+				}
+			}
+		})
+	}
+}
+
+func TestFsStatRoutesThroughScheduler(t *testing.T) {
+	t.Run("lstat_path_uses_scheduler_shutdown", func(t *testing.T) {
+		f, root := newTestLocalFs(t)
+		writeTestFile(t, root, "alpha.txt")
+
+		f.statScheduler.Close()
+
+		_, err := f.Stat(context.Background(), "", "alpha.txt")
+		require.Error(t, err)
+		require.ErrorIs(t, err, context.Canceled)
+		var pathErr *os.PathError
+		require.ErrorAs(t, err, &pathErr)
+		assert.Equal(t, "lstat", pathErr.Op)
+		assert.False(t, os.IsNotExist(err))
+	})
+
+	t.Run("follow_symlink_stat_path_uses_scheduler", func(t *testing.T) {
+		f, _ := newTestLocalFs(t)
+		f.opt.FollowSymlinks = true
+		statErr := errors.New("scheduled stat failed")
+		f.lstat = func(path string) (os.FileInfo, error) {
+			return fakeFileInfo{name: "link", mode: os.ModeSymlink}, nil
+		}
+		f.statScheduler.Close()
+		f.statScheduler = newStatScheduler(f, statSchedulerOptions{
+			Workers:          1,
+			MaxWorkers:       1,
+			QueueDepth:       2,
+			LeaseTimeout:     time.Second,
+			RetryBackoff:     time.Millisecond,
+			WatchdogInterval: time.Second,
+			WarnAfter:        time.Second,
+			ReplaceAfter:     time.Second,
+		})
+		f.statScheduler.statFn = func(path string) (os.FileInfo, error) {
+			return nil, statErr
+		}
+
+		_, err := f.Stat(context.Background(), "", "link")
+		require.Error(t, err)
+		require.ErrorIs(t, err, statErr)
+		var pathErr *os.PathError
+		require.ErrorAs(t, err, &pathErr)
+		assert.Equal(t, "stat", pathErr.Op)
+		assert.False(t, os.IsNotExist(err))
+	})
 }
 
 func TestListController_ProcessBatch_PreservesScheduledResultSlots(t *testing.T) {
@@ -80,6 +198,108 @@ func TestListController_ProcessBatch_PreservesScheduledResultSlots(t *testing.T)
 	assert.Equal(t, "remote/gamma", filtered[2].Remote())
 }
 
+func TestListController_ProcessBatchIgnoresCallerCancellation(t *testing.T) {
+	tests := []struct {
+		name             string
+		cancelBeforeCall bool
+		cancelDuringStat bool
+	}{
+		{name: "pre_call_cancel_returns_result", cancelBeforeCall: true},
+		{name: "mid_call_cancel_returns_result", cancelDuringStat: true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			scheduler := newStatScheduler(nil, statSchedulerOptions{
+				Workers:          1,
+				MaxWorkers:       1,
+				QueueDepth:       4,
+				LeaseTimeout:     time.Second,
+				RetryBackoff:     time.Millisecond,
+				WatchdogInterval: time.Second,
+				WarnAfter:        time.Second,
+				ReplaceAfter:     time.Second,
+			})
+			defer scheduler.Close()
+
+			controller := newListController(nil, scheduler, listControllerOptions{
+				MicroBatchSize: 1,
+			})
+			batch := newReadResult()
+			batch.entries = fakeEntries("alpha")
+
+			started := make(chan struct{}, 1)
+			release := make(chan struct{})
+			type batchResult struct {
+				entries []cachedDirEntry
+				fis     []statFileInfo
+				err     error
+			}
+			resultCh := make(chan batchResult, 1)
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			if tc.cancelBeforeCall {
+				cancel()
+			}
+
+			go func() {
+				result := batchResult{}
+				err := controller.ProcessBatch(ctx, &batch, func(entry os.DirEntry) (cachedDirEntry, bool) {
+					return cachedDirEntry{
+						DirEntry: entry,
+						remote:   "remote/" + entry.Name(),
+					}, true
+				}, func(entry *cachedDirEntry, nameBuf []byte) (os.FileInfo, []byte, error) {
+					select {
+					case started <- struct{}{}:
+					default:
+					}
+					<-release
+					return fakeFileInfo{name: entry.Name(), mode: entry.Type()}, nameBuf, nil
+				}, func(entries []cachedDirEntry, fis []statFileInfo) error {
+					result.entries = append([]cachedDirEntry(nil), entries...)
+					result.fis = append([]statFileInfo(nil), fis...)
+					return nil
+				})
+				result.err = err
+				resultCh <- result
+			}()
+
+			select {
+			case <-started:
+			case <-time.After(time.Second):
+				close(release)
+				t.Fatal("timed out waiting for ProcessBatch stat work to start")
+			}
+
+			if tc.cancelDuringStat {
+				cancel()
+			}
+
+			select {
+			case result := <-resultCh:
+				close(release)
+				t.Fatalf("ProcessBatch returned before the blocked stat was released: err=%v entries=%d fis=%d", result.err, len(result.entries), len(result.fis))
+			case <-time.After(25 * time.Millisecond):
+			}
+
+			close(release)
+
+			select {
+			case result := <-resultCh:
+				require.NoError(t, result.err)
+				require.Len(t, result.entries, 1)
+				require.Len(t, result.fis, 1)
+				assert.Equal(t, "remote/alpha", result.entries[0].Remote())
+				assert.Equal(t, "alpha", result.fis[0].Name())
+			case <-time.After(time.Second):
+				t.Fatal("timed out waiting for ProcessBatch to return a result after caller cancellation")
+			}
+		})
+	}
+}
+
 func TestRunStatFunc(t *testing.T) {
 	testErr := errors.New("boom")
 	entry := &cachedDirEntry{
@@ -98,7 +318,7 @@ func TestRunStatFunc(t *testing.T) {
 			statFunc: func(*cachedDirEntry, []byte) (os.FileInfo, []byte, error) {
 				panic(testErr)
 			},
-			wantErr:     `stat panic for "alpha": boom`,
+			wantErr:     `stat panic for "alpha": stat scheduler bug: boom`,
 			wantWrapped: testErr,
 		},
 		{
@@ -106,7 +326,7 @@ func TestRunStatFunc(t *testing.T) {
 			statFunc: func(*cachedDirEntry, []byte) (os.FileInfo, []byte, error) {
 				panic("boom")
 			},
-			wantErr: `stat panic for "alpha": boom`,
+			wantErr: `stat panic for "alpha": stat scheduler bug: boom`,
 		},
 		{
 			name: "normal return",
@@ -126,6 +346,7 @@ func TestRunStatFunc(t *testing.T) {
 				return
 			}
 			require.EqualError(t, err, tc.wantErr)
+			require.ErrorIs(t, err, errStatSchedulerBug)
 			if tc.wantWrapped != nil {
 				require.ErrorIs(t, err, tc.wantWrapped)
 			}
@@ -349,6 +570,71 @@ func TestBatchController_WaitReturnsBeforeTimedOutLeaseRetiresWhenResultsStayUnc
 		defer batch.mu.Unlock()
 		return len(batch.timedOutLeases) == 0 && batch.parts[0].retiredLeaseID == 1
 	}, time.Second, 10*time.Millisecond)
+}
+
+func TestBatchController_PublishRejectsLateCompletionAfterCancel(t *testing.T) {
+	tests := []struct {
+		name   string
+		cancel func(*testing.T, *batchController)
+	}{
+		{
+			name: "explicit_cancel_rejects_publish",
+			cancel: func(t *testing.T, batch *batchController) {
+				t.Helper()
+				batch.cancel()
+			},
+		},
+		{
+			name: "wait_ctx_cancel_rejects_publish",
+			cancel: func(t *testing.T, batch *batchController) {
+				t.Helper()
+
+				waitCtx, cancel := context.WithCancel(context.Background())
+				errCh := make(chan error, 1)
+				go func() {
+					_, _, err := batch.Wait(waitCtx)
+					errCh <- err
+				}()
+
+				cancel()
+
+				select {
+				case err := <-errCh:
+					require.ErrorIs(t, err, context.Canceled)
+				case <-time.After(time.Second):
+					t.Fatal("timed out waiting for Wait to cancel the batch")
+				}
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			batch := newBatchController(context.Background(), []cachedDirEntry{
+				{DirEntry: fakeDirEntry{name: "alpha"}},
+			}, invalidStatDirFD, 1, func(entry *cachedDirEntry, nameBuf []byte) (os.FileInfo, []byte, error) {
+				return fakeFileInfo{name: entry.Name(), mode: entry.Type()}, nameBuf, nil
+			})
+			defer batch.Close()
+
+			job := &statJob{}
+			require.True(t, batch.acquirePendingLease(0, job))
+
+			tc.cancel(t, batch)
+
+			published, completed := batch.publish(0, job.leaseID, []statFileInfo{
+				{fi: fakeFileInfo{name: "late"}},
+			}, nil)
+			assert.False(t, published)
+			assert.False(t, completed)
+
+			batch.mu.Lock()
+			assert.True(t, batch.canceled)
+			assert.Nil(t, batch.results[0].fi)
+			assert.Equal(t, statMicroBatchLeased, batch.parts[0].state)
+			batch.mu.Unlock()
+		})
+	}
 }
 
 func TestListController_ProcessBatch_ForfeitsScratchWhileTimedOutWorkerStillRuns(t *testing.T) {
@@ -836,180 +1122,284 @@ func TestStatScheduler_SubmitOneHappyPath(t *testing.T) {
 	}
 }
 
-func TestStatScheduler_SubmitOneCallerContext(t *testing.T) {
+func TestStatScheduler_SubmitOneIgnoresCallerCancellation(t *testing.T) {
+	tests := []struct {
+		name             string
+		cancelBeforeCall bool
+		cancelDuringStat bool
+	}{
+		{name: "pre_call_cancel_returns_result", cancelBeforeCall: true},
+		{name: "mid_call_cancel_returns_result", cancelDuringStat: true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			scheduler := newStatScheduler(nil, statSchedulerOptions{
+				Workers:          1,
+				MaxWorkers:       1,
+				QueueDepth:       4,
+				LeaseTimeout:     time.Second,
+				RetryBackoff:     time.Millisecond,
+				WatchdogInterval: time.Second,
+				WarnAfter:        time.Second,
+				ReplaceAfter:     time.Second,
+			})
+			defer scheduler.Close()
+
+			started := make(chan struct{}, 1)
+			release := make(chan struct{})
+			var releaseOnce sync.Once
+			releaseWorker := func() {
+				releaseOnce.Do(func() {
+					close(release)
+				})
+			}
+			scheduler.statFn = func(path string) (os.FileInfo, error) {
+				select {
+				case started <- struct{}{}:
+				default:
+				}
+				<-release
+				return fakeFileInfo{name: path}, nil
+			}
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			if tc.cancelBeforeCall {
+				cancel()
+			}
+
+			type submitOneResult struct {
+				info os.FileInfo
+				err  error
+			}
+			resultCh := make(chan submitOneResult, 1)
+			go func() {
+				info, err := scheduler.SubmitOne(ctx, "alpha", false)
+				resultCh <- submitOneResult{info: info, err: err}
+			}()
+
+			select {
+			case <-started:
+			case <-time.After(time.Second):
+				releaseWorker()
+				t.Fatal("timed out waiting for standalone stat to start")
+			}
+
+			if tc.cancelDuringStat {
+				cancel()
+			}
+
+			select {
+			case result := <-resultCh:
+				releaseWorker()
+				t.Fatalf("SubmitOne returned before the blocked stat was released: err=%v info=%v", result.err, result.info)
+			case <-time.After(25 * time.Millisecond):
+			}
+
+			releaseWorker()
+
+			select {
+			case result := <-resultCh:
+				require.NoError(t, result.err)
+				require.NotNil(t, result.info)
+				assert.Equal(t, "alpha", result.info.Name())
+			case <-time.After(time.Second):
+				t.Fatal("timed out waiting for SubmitOne to return a result after caller cancellation")
+			}
+		})
+	}
+}
+
+func TestStatScheduler_SubmitOneLeaseTimeoutIgnoresCallerDeadline(t *testing.T) {
+	tests := []struct {
+		name   string
+		newCtx func() (context.Context, context.CancelFunc)
+	}{
+		{
+			name: "expired_before_submit_retries_to_success",
+			newCtx: func() (context.Context, context.CancelFunc) {
+				return context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+			},
+		},
+		{
+			name: "mid_call_deadline_retries_to_success",
+			newCtx: func() (context.Context, context.CancelFunc) {
+				return context.WithTimeout(context.Background(), 10*time.Millisecond)
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			scheduler := newStatScheduler(nil, statSchedulerOptions{
+				Workers:          1,
+				MaxWorkers:       1,
+				QueueDepth:       4,
+				LeaseTimeout:     40 * time.Millisecond,
+				RetryBackoff:     5 * time.Millisecond,
+				WatchdogInterval: 5 * time.Millisecond,
+				WarnAfter:        time.Second,
+				ReplaceAfter:     50 * time.Millisecond,
+			})
+			defer scheduler.Close()
+
+			started := make(chan struct{}, 1)
+			retryStarted := make(chan struct{}, 1)
+			release := make(chan struct{})
+			var releaseOnce sync.Once
+			releaseWorker := func() {
+				releaseOnce.Do(func() {
+					close(release)
+				})
+			}
+			defer releaseWorker()
+			var calls atomic.Int64
+			scheduler.statFn = func(path string) (os.FileInfo, error) {
+				call := calls.Add(1)
+				if call == 1 {
+					select {
+					case started <- struct{}{}:
+					default:
+					}
+					<-release
+					return fakeFileInfo{name: "stale:" + path}, nil
+				}
+				select {
+				case retryStarted <- struct{}{}:
+				default:
+				}
+				return fakeFileInfo{name: "retry:" + path}, nil
+			}
+
+			ctx, cancel := tc.newCtx()
+			defer cancel()
+
+			type submitResult struct {
+				info os.FileInfo
+				err  error
+			}
+			resultCh := make(chan submitResult, 1)
+			go func() {
+				info, err := scheduler.SubmitOne(ctx, "alpha", false)
+				resultCh <- submitResult{info: info, err: err}
+			}()
+
+			select {
+			case <-started:
+			case <-time.After(time.Second):
+				releaseWorker()
+				t.Fatal("timed out waiting for standalone stat to start")
+			}
+
+			select {
+			case <-retryStarted:
+			case <-time.After(time.Second):
+				releaseWorker()
+				t.Fatal("timed out waiting for standalone retry to start")
+			}
+
+			select {
+			case result := <-resultCh:
+				require.NoError(t, result.err)
+				require.NotNil(t, result.info)
+				assert.Equal(t, "retry:alpha", result.info.Name())
+			case <-time.After(time.Second):
+				releaseWorker()
+				t.Fatal("timed out waiting for SubmitOne retry result")
+			}
+
+			snapshot := scheduler.Snapshot()
+			assert.Equal(t, uint64(1), snapshot.Timeouts)
+			assert.Equal(t, uint64(1), snapshot.Retries)
+			assert.Equal(t, 1, snapshot.Workers)
+
+			releaseWorker()
+			require.Eventually(t, func() bool {
+				snapshot := scheduler.Snapshot()
+				return snapshot.StaleCompletions == 1 && snapshot.ActiveLeases == 0
+			}, time.Second, 5*time.Millisecond)
+		})
+	}
+}
+
+func TestStatScheduler_SubmitOneStandaloneRetrySucceedsAfterLeaseTimeout(t *testing.T) {
 	scheduler := newStatScheduler(nil, statSchedulerOptions{
 		Workers:          1,
 		MaxWorkers:       1,
 		QueueDepth:       4,
-		LeaseTimeout:     time.Second,
-		RetryBackoff:     time.Millisecond,
-		WatchdogInterval: time.Second,
+		LeaseTimeout:     40 * time.Millisecond,
+		RetryBackoff:     5 * time.Millisecond,
+		WatchdogInterval: 5 * time.Millisecond,
 		WarnAfter:        time.Second,
-		ReplaceAfter:     time.Second,
+		ReplaceAfter:     60 * time.Millisecond,
 	})
+	defer scheduler.Close()
 
-	started := make(chan struct{}, 1)
-	release := make(chan struct{})
+	firstStarted := make(chan struct{}, 1)
+	retryStarted := make(chan struct{}, 1)
+	releaseFirst := make(chan struct{})
 	var releaseOnce sync.Once
 	releaseWorker := func() {
 		releaseOnce.Do(func() {
-			close(release)
+			close(releaseFirst)
 		})
 	}
-	scheduler.statFn = func(path string) (os.FileInfo, error) {
-		select {
-		case started <- struct{}{}:
-		default:
+	defer releaseWorker()
+	var calls atomic.Int64
+	scheduler.lstatFn = func(path string) (os.FileInfo, error) {
+		call := calls.Add(1)
+		if call == 1 {
+			firstStarted <- struct{}{}
+			<-releaseFirst
+			return fakeFileInfo{name: "stale:" + path, mode: os.ModeSymlink}, nil
 		}
-		<-release
-		return fakeFileInfo{name: path}, nil
+		retryStarted <- struct{}{}
+		return fakeFileInfo{name: "retry:" + path, mode: os.ModeSymlink}, nil
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	resultCh := make(chan error, 1)
+	resultCh := make(chan struct {
+		info os.FileInfo
+		err  error
+	}, 1)
 	go func() {
-		_, err := scheduler.SubmitOne(ctx, "alpha", false)
-		resultCh <- err
+		info, err := scheduler.SubmitOne(context.Background(), "alpha", true)
+		resultCh <- struct {
+			info os.FileInfo
+			err  error
+		}{info: info, err: err}
 	}()
 
 	select {
-	case <-started:
+	case <-firstStarted:
 	case <-time.After(time.Second):
 		releaseWorker()
-		cancel()
-		scheduler.Close()
-		t.Fatal("timed out waiting for standalone stat to start")
+		t.Fatal("timed out waiting for first standalone lstat to start")
 	}
 
-	cancel()
+	select {
+	case <-retryStarted:
+	case <-time.After(time.Second):
+		releaseWorker()
+		t.Fatal("timed out waiting for standalone retry lstat to start")
+	}
+
+	select {
+	case result := <-resultCh:
+		require.NoError(t, result.err)
+		require.NotNil(t, result.info)
+		assert.Equal(t, "retry:alpha", result.info.Name())
+		assert.Equal(t, os.ModeSymlink, result.info.Mode()&os.ModeSymlink)
+	case <-time.After(time.Second):
+		releaseWorker()
+		t.Fatal("timed out waiting for SubmitOne retry success")
+	}
+
+	snapshot := scheduler.Snapshot()
+	assert.Equal(t, uint64(1), snapshot.Timeouts)
+	assert.Equal(t, uint64(1), snapshot.Retries)
+
 	releaseWorker()
-
-	select {
-	case err := <-resultCh:
-		require.ErrorIs(t, err, context.Canceled)
-	case <-time.After(time.Second):
-		releaseWorker()
-		scheduler.Close()
-		t.Fatal("timed out waiting for SubmitOne to return")
-	}
-
-	scheduler.Close()
-}
-
-func TestStatScheduler_SubmitOneDeadlineExceededWaitsForTerminalState(t *testing.T) {
-	scheduler := newStatScheduler(nil, statSchedulerOptions{
-		Workers:          1,
-		MaxWorkers:       1,
-		QueueDepth:       4,
-		LeaseTimeout:     40 * time.Millisecond,
-		RetryBackoff:     5 * time.Millisecond,
-		WatchdogInterval: 5 * time.Millisecond,
-		WarnAfter:        time.Second,
-		ReplaceAfter:     50 * time.Millisecond,
-	})
-	defer scheduler.Close()
-
-	started := make(chan struct{}, 1)
-	release := make(chan struct{})
-	scheduler.statFn = func(path string) (os.FileInfo, error) {
-		select {
-		case started <- struct{}{}:
-		default:
-		}
-		<-release
-		return fakeFileInfo{name: path}, nil
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
-	defer cancel()
-
-	resultCh := make(chan error, 1)
-	go func() {
-		_, err := scheduler.SubmitOne(ctx, "alpha", false)
-		resultCh <- err
-	}()
-
-	select {
-	case <-started:
-	case <-time.After(time.Second):
-		close(release)
-		t.Fatal("timed out waiting for standalone stat to start")
-	}
-
-	select {
-	case err := <-resultCh:
-		require.ErrorIs(t, err, context.DeadlineExceeded)
-	case <-time.After(250 * time.Millisecond):
-		close(release)
-		t.Fatal("SubmitOne returned before the deadline-exceeded standalone lease reached terminal state")
-	}
-
-	snapshot := scheduler.Snapshot()
-	assert.Equal(t, uint64(1), snapshot.Timeouts)
-	assert.Equal(t, 1, snapshot.Workers)
-
-	close(release)
-	require.Eventually(t, func() bool {
-		snapshot := scheduler.Snapshot()
-		return snapshot.StaleCompletions == 1 && snapshot.ActiveLeases == 0
-	}, time.Second, 5*time.Millisecond)
-}
-
-func TestStatScheduler_SubmitOneCanceledContextWaitsForTerminalState(t *testing.T) {
-	scheduler := newStatScheduler(nil, statSchedulerOptions{
-		Workers:          1,
-		MaxWorkers:       1,
-		QueueDepth:       4,
-		LeaseTimeout:     40 * time.Millisecond,
-		RetryBackoff:     5 * time.Millisecond,
-		WatchdogInterval: 5 * time.Millisecond,
-		WarnAfter:        time.Second,
-		ReplaceAfter:     time.Second,
-	})
-	defer scheduler.Close()
-
-	started := make(chan struct{}, 1)
-	release := make(chan struct{})
-	scheduler.statFn = func(path string) (os.FileInfo, error) {
-		select {
-		case started <- struct{}{}:
-		default:
-		}
-		<-release
-		return fakeFileInfo{name: path}, nil
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	resultCh := make(chan error, 1)
-	go func() {
-		_, err := scheduler.SubmitOne(ctx, "alpha", false)
-		resultCh <- err
-	}()
-
-	select {
-	case <-started:
-	case <-time.After(time.Second):
-		close(release)
-		t.Fatal("timed out waiting for standalone stat to start")
-	}
-
-	cancel()
-
-	select {
-	case err := <-resultCh:
-		require.ErrorIs(t, err, context.Canceled)
-	case <-time.After(250 * time.Millisecond):
-		close(release)
-		t.Fatal("SubmitOne did not return after the canceled standalone lease reached terminal state")
-	}
-
-	snapshot := scheduler.Snapshot()
-	assert.Equal(t, uint64(1), snapshot.Timeouts)
-	assert.Equal(t, 1, snapshot.Workers)
-
-	close(release)
 	require.Eventually(t, func() bool {
 		snapshot := scheduler.Snapshot()
 		return snapshot.StaleCompletions == 1 && snapshot.ActiveLeases == 0
@@ -1030,39 +1420,57 @@ func TestStatScheduler_SubmitOneLeaseTimeoutReclaimsWorker(t *testing.T) {
 	defer scheduler.Close()
 
 	started := make(chan struct{}, 1)
+	retryStarted := make(chan struct{}, 1)
 	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseWorker := func() {
+		releaseOnce.Do(func() {
+			close(release)
+		})
+	}
+	defer releaseWorker()
+	var calls atomic.Int64
 	scheduler.statFn = func(path string) (os.FileInfo, error) {
+		call := calls.Add(1)
+		if call == 1 {
+			select {
+			case started <- struct{}{}:
+			default:
+			}
+			<-release
+			return fakeFileInfo{name: "stale:" + path}, nil
+		}
 		select {
-		case started <- struct{}{}:
+		case retryStarted <- struct{}{}:
 		default:
 		}
-		<-release
-		return fakeFileInfo{name: path}, nil
+		return fakeFileInfo{name: "retry:" + path}, nil
 	}
 
-	resultCh := make(chan error, 1)
+	resultCh := make(chan struct {
+		info os.FileInfo
+		err  error
+	}, 1)
 	go func() {
-		_, err := scheduler.SubmitOne(context.Background(), "stuck", false)
-		resultCh <- err
+		info, err := scheduler.SubmitOne(context.Background(), "stuck", false)
+		resultCh <- struct {
+			info os.FileInfo
+			err  error
+		}{info: info, err: err}
 	}()
 
 	select {
 	case <-started:
 	case <-time.After(time.Second):
-		close(release)
+		releaseWorker()
 		t.Fatal("timed out waiting for standalone stat to start")
 	}
 
 	select {
-	case err := <-resultCh:
-		var timeoutErr *statLeaseTimeoutError
-		require.ErrorAs(t, err, &timeoutErr)
-		assert.Equal(t, "stuck", timeoutErr.Path)
-		assert.False(t, timeoutErr.Lstat)
-		assert.Equal(t, 40*time.Millisecond, timeoutErr.Timeout)
+	case <-retryStarted:
 	case <-time.After(time.Second):
-		close(release)
-		t.Fatal("timed out waiting for SubmitOne lease timeout")
+		releaseWorker()
+		t.Fatal("timed out waiting for standalone retry to start")
 	}
 
 	require.Eventually(t, func() bool {
@@ -1071,11 +1479,112 @@ func TestStatScheduler_SubmitOneLeaseTimeoutReclaimsWorker(t *testing.T) {
 		return len(scheduler.workers) > 0 && scheduler.workers[0].generation >= 2 && scheduler.workers[0].accounted
 	}, time.Second, 5*time.Millisecond)
 
-	close(release)
+	select {
+	case result := <-resultCh:
+		require.NoError(t, result.err)
+		require.NotNil(t, result.info)
+		assert.Equal(t, "retry:stuck", result.info.Name())
+	case <-time.After(time.Second):
+		releaseWorker()
+		t.Fatal("timed out waiting for SubmitOne retry result")
+	}
+
+	releaseWorker()
 	require.Eventually(t, func() bool {
 		snapshot := scheduler.Snapshot()
 		return snapshot.StaleCompletions == 1 && snapshot.ActiveLeases == 0
 	}, time.Second, 5*time.Millisecond)
+}
+
+func TestStatScheduler_SubmitOneSchedulerShutdownDuringRetry(t *testing.T) {
+	scheduler := newStatScheduler(nil, statSchedulerOptions{
+		Workers:          1,
+		MaxWorkers:       1,
+		QueueDepth:       4,
+		LeaseTimeout:     40 * time.Millisecond,
+		RetryBackoff:     5 * time.Millisecond,
+		WatchdogInterval: 5 * time.Millisecond,
+		WarnAfter:        time.Second,
+		ReplaceAfter:     60 * time.Millisecond,
+	})
+
+	firstStarted := make(chan struct{}, 1)
+	retryStarted := make(chan struct{}, 1)
+	releaseFirst := make(chan struct{})
+	releaseRetry := make(chan struct{})
+	var releaseFirstOnce sync.Once
+	var releaseRetryOnce sync.Once
+	releaseWorkers := func() {
+		releaseFirstOnce.Do(func() {
+			close(releaseFirst)
+		})
+		releaseRetryOnce.Do(func() {
+			close(releaseRetry)
+		})
+	}
+	defer releaseWorkers()
+	var calls atomic.Int64
+	scheduler.statFn = func(path string) (os.FileInfo, error) {
+		call := calls.Add(1)
+		if call == 1 {
+			firstStarted <- struct{}{}
+			<-releaseFirst
+			return fakeFileInfo{name: "stale:" + path}, nil
+		}
+		retryStarted <- struct{}{}
+		<-releaseRetry
+		return fakeFileInfo{name: "retry:" + path}, nil
+	}
+
+	resultCh := make(chan error, 1)
+	go func() {
+		_, err := scheduler.SubmitOne(context.Background(), "shutdown", false)
+		resultCh <- err
+	}()
+
+	select {
+	case <-firstStarted:
+	case <-time.After(time.Second):
+		releaseWorkers()
+		scheduler.Close()
+		t.Fatal("timed out waiting for first standalone stat to start")
+	}
+
+	select {
+	case <-retryStarted:
+	case <-time.After(time.Second):
+		releaseWorkers()
+		scheduler.Close()
+		t.Fatal("timed out waiting for standalone retry to start")
+	}
+
+	closeDone := make(chan struct{})
+	go func() {
+		scheduler.Close()
+		close(closeDone)
+	}()
+
+	select {
+	case err := <-resultCh:
+		require.Error(t, err)
+		require.ErrorIs(t, err, context.Canceled)
+		var pathErr *os.PathError
+		require.ErrorAs(t, err, &pathErr)
+		assert.Equal(t, "stat", pathErr.Op)
+		assert.Equal(t, "shutdown", pathErr.Path)
+		assert.False(t, os.IsNotExist(err))
+	case <-time.After(time.Second):
+		releaseWorkers()
+		<-closeDone
+		t.Fatal("timed out waiting for SubmitOne shutdown error")
+	}
+
+	releaseWorkers()
+	select {
+	case <-closeDone:
+	case <-time.After(time.Second):
+		t.Fatal("scheduler close did not finish after releasing retry workers")
+	}
 }
 
 func TestStatScheduler_SubmitOneConcurrentCallers(t *testing.T) {

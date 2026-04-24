@@ -296,8 +296,11 @@ func (c *copy) verify(ctx context.Context, newDst fs.Object) (err error) {
 	// Verify hashes are the same after transfer - ignoring blank hashes
 	if c.hashType != hash.None {
 		// checkHashes has logs and counts errors
-		equal, _, srcSum, dstSum, _ := checkHashes(ctx, c.src, newDst, c.hashType)
+		equal, _, srcSum, dstSum, hashErr := checkHashes(ctx, c.src, newDst, c.hashType)
 		if !equal {
+			if hashErr != nil {
+				return fmt.Errorf("corrupted on transfer: %v hashes differ src(%s) %q vs dst(%s) %q (hash check error: %w)", c.hashType, c.src.Fs(), srcSum, newDst.Fs(), dstSum, hashErr)
+			}
 			return fmt.Errorf("corrupted on transfer: %v hashes differ src(%s) %q vs dst(%s) %q", c.hashType, c.src.Fs(), srcSum, newDst.Fs(), dstSum)
 		}
 	}
@@ -361,7 +364,12 @@ func (c *copy) copy(ctx context.Context) (newDst fs.Object, err error) {
 	if err != nil {
 		fs.Errorf(newDst, "%v", err)
 		err = fs.CountError(ctx, err)
-		c.removeFailedCopy(ctx, newDst)
+		// FIXME ctx is already cancelled, so backends whose Remove honours it
+		// leave the .partial behind.
+		// A cancelled verification does not prove an in-place upload failed, so retain its destination.
+		if !c.inplace || !errors.Is(err, context.Canceled) {
+			c.removeFailedCopy(ctx, newDst)
+		}
 		return nil, err
 	}
 

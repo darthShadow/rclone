@@ -2,11 +2,13 @@ package local
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/rclone/rclone/fs"
@@ -19,6 +21,8 @@ const (
 	statSchedulerDefaultRetryBackoff   = 250 * time.Millisecond
 	statSchedulerMaxRetryBackoff       = 5 * time.Minute
 )
+
+var errStatSchedulerBug = errors.New("stat scheduler bug")
 
 // statSchedulerOptions controls the per-Fs shared worker set, lease timeout,
 // and retry/watchdog policy for scheduled stat microbatches.
@@ -78,7 +82,6 @@ type statLeaseKey struct {
 
 type statWorkerState struct {
 	currentJob *statJob
-	startedAt  time.Time
 	generation uint64
 	accounted  bool
 }
@@ -204,10 +207,6 @@ func (j *statJob) executeBatch(resultsScratch []statFileInfo, nameBuf []byte) ([
 	var firstErr error
 
 	for i := j.start; i < j.end; i++ {
-		if err := j.batch.ctx.Err(); err != nil {
-			return resultsScratch[:0], nameBuf, false, false
-		}
-
 		entry := &j.batch.entries[i]
 		fi, nextNameBuf, err := runStatFunc(entry, j.batch.statFunc, nameBuf)
 		nameBuf = nextNameBuf
@@ -222,9 +221,6 @@ func (j *statJob) executeBatch(resultsScratch []statFileInfo, nameBuf []byte) ([
 }
 
 func (j *statJob) executeStandalone(s *statScheduler, resultsScratch []statFileInfo, nameBuf []byte) ([]statFileInfo, []byte, bool, bool) {
-	if err := j.batch.ctx.Err(); err != nil {
-		return resultsScratch[:0], nameBuf, false, false
-	}
 	if cap(resultsScratch) < 1 {
 		resultsScratch = make([]statFileInfo, 1)
 	}
@@ -290,91 +286,65 @@ func (s *statScheduler) Snapshot() statSchedulerSnapshot {
 }
 
 // SubmitOne runs one stat or lstat call through the shared worker pool and
-// waits for the result, caller cancellation, watchdog timeout, or scheduler
-// shutdown. The effective timeout is min(caller deadline, LeaseTimeout). If the
-// caller cancels, SubmitOne waits for the standalone lease to reach terminal
-// state so no late result is returned after cancel, then returns ctx.Err().
+// waits for the result or scheduler shutdown. Caller cancellation is detached
+// on entry so upstream aborts cannot short-circuit the enqueue path or wait
+// loop; LeaseTimeout remains the bound for each standalone
+// lease attempt before the scheduler retries the stat internally.
 //
-// Single-path stat/lstat still routes through the scheduler so production code
-// does not reintroduce uncapped stuck syscalls outside the shared lease/watchdog
+// Fs.Stat, Object stat, and listing stat/lstat work all route through the
+// scheduler so potentially stuck CephFS syscalls share the same lease/watchdog
 // control path.
 func (s *statScheduler) SubmitOne(ctx context.Context, path string, lstat bool) (os.FileInfo, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	ctx = context.WithoutCancel(ctx)
+	op := "stat"
+	if lstat {
+		op = "lstat"
+	}
 	if err := s.ctx.Err(); err != nil {
-		return nil, err
+		return nil, translateSchedulerErr(op, path, err)
 	}
 
-	submitCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	controller := newStandaloneBatchController(submitCtx, path, lstat)
+	controller := newStandaloneBatchController(ctx, path, lstat)
 	defer controller.Close()
 
 	job := s.getJob()
-	ok := controller.acquirePendingLease(0, job)
-	if !ok {
-		s.putJob(job)
-		return nil, context.Canceled
-	}
-	if err := s.enqueueNormal(submitCtx, job); err != nil {
+	controller.acquirePendingLease(0, job)
+	if err := s.enqueueNormal(ctx, job); err != nil {
 		controller.revertIssuedLease(job.microBatch, job.leaseID, false)
 		s.putJob(job)
-		return nil, err
+		return nil, translateSchedulerErr(op, path, err)
 	}
 
 	timeoutCh := controller.timeoutNotifications()
-	terminalCh := controller.terminalNotifications()
 	for {
 		select {
 		case <-controller.done:
-			if err := ctx.Err(); err != nil {
-				return nil, s.waitStandaloneCancel(controller, terminalCh, err)
-			}
 			if err := s.ctx.Err(); err != nil {
 				controller.cancel()
-				return nil, err
+				return nil, translateSchedulerErr(op, path, err)
 			}
 			_, fis, err := controller.Results()
 			if err != nil {
-				return nil, err
+				return nil, translateSchedulerErr(op, path, err)
 			}
 			if len(fis) == 0 {
-				return nil, fmt.Errorf("standalone stat completed without a result slot")
+				return nil, translateSchedulerErr(op, path, fmt.Errorf("standalone stat completed without a result slot: %w", errStatSchedulerBug))
 			}
 			if fis[0].fi == nil {
-				return nil, fmt.Errorf("standalone stat completed without file info")
+				return nil, translateSchedulerErr(op, path, fmt.Errorf("standalone stat completed without file info: %w", errStatSchedulerBug))
 			}
 			return fis[0].fi, nil
-		case err := <-timeoutCh:
-			if cancelErr := ctx.Err(); cancelErr != nil {
-				return nil, s.waitStandaloneCancel(controller, terminalCh, cancelErr)
-			}
+		case <-timeoutCh:
 			if schedulerErr := s.ctx.Err(); schedulerErr != nil {
 				controller.cancel()
-				return nil, schedulerErr
+				return nil, translateSchedulerErr(op, path, schedulerErr)
 			}
-			controller.cancel()
-			return nil, err
-		case <-ctx.Done():
-			return nil, s.waitStandaloneCancel(controller, terminalCh, ctx.Err())
 		case <-s.ctx.Done():
 			controller.cancel()
-			return nil, s.ctx.Err()
-		}
-	}
-}
-
-func (s *statScheduler) waitStandaloneCancel(controller *batchController, terminalCh <-chan struct{}, err error) error {
-	controller.cancel()
-
-	for {
-		select {
-		case <-terminalCh:
-			return err
-		case <-s.ctx.Done():
-			return s.ctx.Err()
+			return nil, translateSchedulerErr(op, path, s.ctx.Err())
 		}
 	}
 }
@@ -564,14 +534,47 @@ func statSchedulerPanicError(job *statJob, panicValue any) error {
 	label := job.label()
 	if recoveredErr, ok := panicValue.(error); ok {
 		if label != "" {
-			return fmt.Errorf("stat scheduler panic for %q [%d:%d): %w", label, job.start, job.end, recoveredErr)
+			return fmt.Errorf("stat scheduler panic for %q [%d:%d): %w: %w", label, job.start, job.end, errStatSchedulerBug, recoveredErr)
 		}
-		return fmt.Errorf("stat scheduler panic [%d:%d): %w", job.start, job.end, recoveredErr)
+		return fmt.Errorf("stat scheduler panic [%d:%d): %w: %w", job.start, job.end, errStatSchedulerBug, recoveredErr)
 	}
 	if label != "" {
-		return fmt.Errorf("stat scheduler panic for %q [%d:%d): %v", label, job.start, job.end, panicValue)
+		return fmt.Errorf("stat scheduler panic for %q [%d:%d): %w: %v", label, job.start, job.end, errStatSchedulerBug, panicValue)
 	}
-	return fmt.Errorf("stat scheduler panic [%d:%d): %v", job.start, job.end, panicValue)
+	return fmt.Errorf("stat scheduler panic [%d:%d): %w: %v", job.start, job.end, errStatSchedulerBug, panicValue)
+}
+
+// translateSchedulerErr maps scheduler boundary errors to filesystem-shaped
+// errors. Non-syscall scheduler classes are wrapped in *os.PathError so callers
+// can use standard os.IsNotExist/os.IsPermission-style discrimination, while
+// sentinel identity remains reachable through Unwrap.
+func translateSchedulerErr(op string, path string, err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, errStatSchedulerBug) {
+		return &os.PathError{Op: op, Path: path, Err: err}
+	}
+	var pathErr *os.PathError
+	if errors.As(err, &pathErr) {
+		return err
+	}
+	var syscallErr *os.SyscallError
+	if errors.As(err, &syscallErr) {
+		return err
+	}
+	var linkErr *os.LinkError
+	if errors.As(err, &linkErr) {
+		return err
+	}
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
+		return err
+	}
+	if errors.Is(err, context.Canceled) {
+		return &os.PathError{Op: op, Path: path, Err: context.Canceled}
+	}
+	return &os.PathError{Op: op, Path: path, Err: err}
 }
 
 func standalonePathLabel(path string) string {
@@ -675,7 +678,6 @@ func (s *statScheduler) failQueuedJob(job *statJob, err error) {
 		job.batch.canceled = true
 		job.batch.mu.Unlock()
 		job.batch.closeDone()
-		job.batch.signalTerminal()
 	}
 	s.putJob(job)
 }
