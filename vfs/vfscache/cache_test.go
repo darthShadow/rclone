@@ -11,7 +11,9 @@ import (
 
 	_ "github.com/rclone/rclone/backend/local" // import the local backend
 	"github.com/rclone/rclone/fs"
+	fscache "github.com/rclone/rclone/fs/cache"
 	"github.com/rclone/rclone/fs/config"
+	"github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/fstest"
 	"github.com/rclone/rclone/lib/diskusage"
 	"github.com/rclone/rclone/vfs/vfscache/writeback"
@@ -22,6 +24,12 @@ import (
 
 // TestMain drives the tests
 func TestMain(m *testing.M) {
+	// fs/cache reads these once via sync.Once at first use, so they MUST be
+	// set before any test resolves an Fs (e.g. via newTestCache). Do not
+	// move into a test body; see fs/cache/cache.go createOnFirstUse.
+	ci := fs.GetConfig(context.Background())
+	ci.FsCacheExpireDuration = fs.Duration(100 * time.Millisecond)
+	ci.FsCacheExpireInterval = fs.Duration(20 * time.Millisecond)
 	fstest.TestMain(m)
 }
 
@@ -193,6 +201,32 @@ func TestCacheNew(t *testing.T) {
 
 	// clean - have tested the internals already
 	c.clean(false)
+}
+
+func TestCacheBackendSurvivesFsCacheExpiry(t *testing.T) {
+	pinnedBefore, _ := fscache.EntriesWithPinCount()
+	_, c := newTestCache(t)
+	pinnedAfter, _ := fscache.EntriesWithPinCount()
+
+	ctx := context.Background()
+	remote := "potato"
+
+	p, err := c.createItemDir(remote)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(p, []byte("hello"), 0o600))
+
+	_, err = c.fcache.NewObject(ctx, remote)
+	require.NoError(t, err)
+
+	time.Sleep(250 * time.Millisecond)
+
+	o, err := c.fcache.NewObject(ctx, remote)
+	require.NoError(t, err)
+
+	sum, err := o.Hash(ctx, hash.MD5)
+	require.NoError(t, err)
+	assert.Equal(t, "5d41402abc4b2a76b9719d911017c592", sum)
+	assert.GreaterOrEqual(t, pinnedAfter-pinnedBefore, 2)
 }
 
 func TestCacheOpens(t *testing.T) {
