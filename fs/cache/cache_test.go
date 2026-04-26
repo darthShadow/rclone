@@ -192,6 +192,29 @@ func TestPin(t *testing.T) {
 	Unpin(f2)
 }
 
+func TestUnpinIgnoresReplacement(t *testing.T) {
+	create := mockNewFs(t)
+
+	f1, err := GetFn(context.Background(), "mock:/", create)
+	require.NoError(t, err)
+	Pin(f1)
+
+	f2, err := mockfs.NewFs(context.Background(), "mock", "/", nil)
+	require.NoError(t, err)
+	Put("mock:/", f2)
+	Pin(f2)
+
+	Unpin(f1)
+	pinned, unpinned := EntriesWithPinCount()
+	assert.Equal(t, 1, pinned)
+	assert.Equal(t, 0, unpinned)
+
+	Unpin(f2)
+	pinned, unpinned = EntriesWithPinCount()
+	assert.Equal(t, 0, pinned)
+	assert.Equal(t, 1, unpinned)
+}
+
 func TestPinFile(t *testing.T) {
 	defer ClearMappings()
 	create := mockNewFs(t)

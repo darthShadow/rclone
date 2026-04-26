@@ -217,6 +217,43 @@ func TestCachePin(t *testing.T) {
 	c.mu.Unlock()
 }
 
+func TestCacheUnpinIfSame(t *testing.T) {
+	t.Run("replacement", func(t *testing.T) {
+		c, _ := setup(t)
+		oldValue := &struct{ name string }{"old"}
+		newValue := &struct{ name string }{"new"}
+		c.Put("/", oldValue)
+		c.Pin("/")
+		c.Put("/", newValue)
+		c.Pin("/")
+
+		assert.False(t, c.UnpinIfSame("/", oldValue))
+
+		c.mu.Lock()
+		assert.Equal(t, 1, c.cache["/"].pinCount)
+		c.mu.Unlock()
+
+		assert.True(t, c.UnpinIfSame("/", newValue))
+
+		c.mu.Lock()
+		assert.Equal(t, 0, c.cache["/"].pinCount)
+		c.mu.Unlock()
+	})
+
+	t.Run("non comparable", func(t *testing.T) {
+		c, _ := setup(t)
+		value := []string{"one"}
+		c.Put("/", value)
+		c.Pin("/")
+
+		assert.False(t, c.UnpinIfSame("/", value))
+
+		c.mu.Lock()
+		assert.Equal(t, 1, c.cache["/"].pinCount)
+		c.mu.Unlock()
+	})
+}
+
 func TestClear(t *testing.T) {
 	c, create := setup(t)
 

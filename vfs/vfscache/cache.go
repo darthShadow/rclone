@@ -132,6 +132,21 @@ func New(ctx context.Context, fremote fs.Fs, opt *vfscommon.Options, avFn AddVir
 		writeback:  writeback.New(ctx, opt),
 		avFn:       avFn,
 	}
+	// Pin the cache backends for the *Cache lifetime. fs/cache's idle expiry
+	// calls Fs.Shutdown on evicted entries, but vfscache holds c.fcache /
+	// c.fcacheMeta directly throughout the mount; without a pin, eviction
+	// can shut down a backend we still depend on.
+	//
+	// Two cache.PinUntilFinalized(_, c) calls would NOT work: each calls
+	// runtime.SetFinalizer(c, ...) and the second silently replaces the
+	// first, leaking one pin permanently. Pin both and release both from a
+	// single finalizer.
+	fscache.Pin(fdata)
+	fscache.Pin(fmeta)
+	runtime.SetFinalizer(c, func(c *Cache) {
+		fscache.Unpin(c.fcache)
+		fscache.Unpin(c.fcacheMeta)
+	})
 
 	// load in the cache and metadata off disk
 	err = c.reload(ctx)
