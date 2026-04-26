@@ -157,10 +157,10 @@ func PinUntilFinalized(f fs.Fs, x any) {
 	})
 }
 
-// Unpin f from the cache
+// Unpin f from the cache if the cache entry still maps to f.
 func Unpin(f fs.Fs) {
 	createOnFirstUse()
-	c.Unpin(fs.ConfigString(f))
+	c.UnpinIfSame(fs.ConfigString(f), f)
 }
 
 // To avoid circular dependencies these are filled in by fs/rc/jobs/job.go

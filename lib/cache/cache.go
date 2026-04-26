@@ -3,6 +3,7 @@
 package cache
 
 import (
+	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -122,6 +123,30 @@ func (c *Cache) Pin(key string) {
 // Unpin a value in the cache if it exists
 func (c *Cache) Unpin(key string) {
 	c.addPin(key, -1)
+}
+
+// UnpinIfSame unpins a value if the key still maps to that exact value.
+func (c *Cache) UnpinIfSame(key string, value any) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	entry, ok := c.cache[key]
+	if !ok || !sameValue(entry.value, value) {
+		return false
+	}
+	entry.pinCount--
+	c.used(entry)
+	return true
+}
+
+func sameValue(a, b any) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	aType := reflect.TypeOf(a)
+	if aType != reflect.TypeOf(b) || !aType.Comparable() {
+		return false
+	}
+	return a == b
 }
 
 // PutErr puts a value named key with err into the cache
