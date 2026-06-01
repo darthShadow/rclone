@@ -103,7 +103,7 @@ func mount(VFS *vfs.VFS, mountpoint string, opt *mountlib.Options) (asyncerrors 
 	}
 	asyncerrors = errChan
 	unmount = func() error {
-		if s.UnmountedExternally {
+		if s.UnmountedExternally.Load() {
 			return nil
 		}
 		var umountErr error
@@ -129,7 +129,7 @@ func mount(VFS *vfs.VFS, mountpoint string, opt *mountlib.Options) (asyncerrors 
 	}
 
 	nfs.OnUnmountFunc = func() {
-		s.UnmountedExternally = true
+		s.UnmountedExternally.Store(true)
 		errChan <- nil
 	}
 
