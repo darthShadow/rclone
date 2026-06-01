@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"sync/atomic"
 
 	nfs "github.com/willscott/go-nfs"
 
@@ -20,7 +21,7 @@ type Server struct {
 	handler             nfs.Handler
 	ctx                 context.Context // for global config
 	listener            net.Listener
-	UnmountedExternally bool
+	UnmountedExternally atomic.Bool
 }
 
 // NewServer creates a new server
