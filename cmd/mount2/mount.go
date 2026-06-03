@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"sync"
 	"time"
 
 	fusefs "github.com/hanwen/go-fuse/v2/fs"
@@ -62,6 +63,10 @@ func mountOptions(fsys *FS, f fs.Fs, opt *mountlib.Options) (mountOpts *fuse.Mou
 		IDMappedMount:      opt.AllowIDMap,
 		MaxStackDepth:      fsys.opt.MaxStackDepth,
 		ExtraCapabilities:  fuse.CAP_ASYNC_DIO,
+		// Lift kernel async-request cap above the default 12 (CongestionThreshold 9)
+		// so high-fanout reads aren't throttled by FUSE backing-dev congestion.
+		// CongestionThreshold becomes 96 (= 128 * 3/4) via go-fuse's hardcoded ratio.
+		MaxBackground: 128,
 
 		// RememberInodes: true,
 		// SingleThreaded: true,
@@ -206,6 +211,15 @@ func mountOptions(fsys *FS, f fs.Fs, opt *mountlib.Options) (mountOpts *fuse.Mou
 	return mountOpts
 }
 
+// notifySupport reports which kernel notifications this mount may use.
+func notifySupport(ks *fuse.InitIn, links bool) (prune, content bool) {
+	prune = ks.SupportsNotify(fuse.NOTIFY_PRUNE)
+	content = links &&
+		ks.Flags64()&fuse.CAP_CACHE_SYMLINKS != 0 &&
+		ks.SupportsNotify(fuse.NOTIFY_INVAL_INODE)
+	return prune, content
+}
+
 // mount the file system
 //
 // The mount point will be ready when this returns.
@@ -259,6 +273,23 @@ func mount(VFS *vfs.VFS, mountpoint string, opt *mountlib.Options) (<-chan error
 	if err != nil {
 		return nil, nil, "", err
 	}
+	prune, _ := notifySupport(server.KernelSettings(), VFS.Opt.Links)
+	registeredPruner := false
+	if prune {
+		VFS.SetPruner(fsys, fsys)
+		registeredPruner = true
+		fs.Infof(f, "NotifyPrune supported: registered VFS pruner")
+	} else {
+		fs.Infof(f, "NotifyPrune unsupported: VFS pruner not registered")
+	}
+	var unregisterOnce sync.Once
+	unregister := func() {
+		unregisterOnce.Do(func() {
+			if registeredPruner {
+				VFS.SetPruner(fsys, nil)
+			}
+		})
+	}
 
 	//mountOpts := &fuse.MountOptions{}
 	//server, err := fusefs.Mount(mountpoint, fsys, &opts)
@@ -278,12 +309,14 @@ func mount(VFS *vfs.VFS, mountpoint string, opt *mountlib.Options) (<-chan error
 	errs := make(chan error, 1)
 	go func() {
 		server.Serve()
+		unregister()
 		errs <- nil
 	}()
 
 	fs.Debugf(f, "Waiting for the mount to start...")
 	err = server.WaitMount()
 	if err != nil {
+		unregister()
 		return nil, nil, "", err
 	}
 

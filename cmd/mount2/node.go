@@ -32,7 +32,9 @@ type Node struct {
 // Node types must be InodeEmbedders
 var _ fusefs.InodeEmbedder = (*Node)(nil)
 
-// newNode creates a new fusefs.Node from a vfs Node
+// newNode returns the FUSE node attached to a VFS node, creating and attaching
+// one if needed. A VFS node maps to one attached FUSE node. If the owner slot
+// contains an unexpected type, newNode returns a new unattached FUSE node.
 func newNode(fsys *FS, vfsNode vfs.Node) (node *Node) {
 	// Check the vfsNode to see if it has a fuse Node cached
 	// We must return the same fuse nodes for vfs Nodes
@@ -43,8 +45,11 @@ func newNode(fsys *FS, vfsNode vfs.Node) (node *Node) {
 	node = &Node{
 		fsys: fsys,
 	}
-	// Cache the node for later
-	vfsNode.SetAux(fsys, node)
+	actual, _ := vfsNode.LoadOrStoreAux(fsys, node)
+	if actualNode, ok := actual.(*Node); ok {
+		return actualNode
+	}
+	fs.Errorf(vfsNode, "Unexpected auxiliary value type %T for FUSE node", actual)
 	return node
 }
 
@@ -246,6 +251,20 @@ func (n *Node) Opendir(ctx context.Context) syscall.Errno {
 
 var _ = (fusefs.NodeOpendirer)((*Node)(nil))
 
+// parentDirEntryInode returns the parent inode, treating the root as its own parent.
+// It returns zero when the node is detached from the bridge tree.
+func (n *Node) parentDirEntryInode() uint64 {
+	inode := n.EmbeddedInode()
+	_, parent := inode.Parent()
+	if parent != nil {
+		return parent.StableAttr().Ino
+	}
+	if n.fsys != nil && n.fsys.root == n {
+		return inode.StableAttr().Ino
+	}
+	return 0
+}
+
 // Readdir opens a stream of directory entries.
 //
 // Readdir essentially returns a list of strings, and it is allowed
@@ -280,15 +299,16 @@ func (n *Node) Readdir(ctx context.Context) (ds fusefs.DirStream, errno syscall.
 		return nil, translateError(err)
 	}
 
+	// go-fuse emits "." and ".." as dirents, including inode values, skips only their readdirplus child lookup, and panics if they enter the real node tree.
 	items[0] = fuse.DirEntry{
 		Mode: fuse.S_IFDIR,
 		Name: ".",
-		Ino:  0, // FIXME
+		Ino:  vfsDir.Inode(),
 	}
 	items[1] = fuse.DirEntry{
 		Mode: fuse.S_IFDIR,
 		Name: "..",
-		Ino:  0, // FIXME
+		Ino:  n.parentDirEntryInode(),
 	}
 	// The result is unsorted because POSIX readdir does not require sorted output.
 	return fusefs.NewListDirStream(items), 0

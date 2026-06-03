@@ -122,6 +122,116 @@ func TestDirForgetAll(t *testing.T) {
 	assert.True(t, root.read.IsZero())
 }
 
+func requireDirFile(t *testing.T, dir *Dir, leaf string) *File {
+	t.Helper()
+
+	node, err := dir.Stat(leaf)
+	require.NoError(t, err)
+	file, ok := node.(*File)
+	require.True(t, ok, "node %q is %T", leaf, node)
+	return file
+}
+
+func TestDirForgetAllInvokesPruner(t *testing.T) {
+	r, vfs, dir, file1 := dirCreate(t)
+
+	activeItem := r.WriteObject(context.Background(), "dir/active", "active contents", t2)
+	idleItem := r.WriteObject(context.Background(), "dir/idle", "idle contents", t3)
+	r.CheckRemoteItems(t, file1, activeItem, idleItem)
+
+	_, err := dir.ReadDirAll()
+	require.NoError(t, err)
+
+	regular := requireDirFile(t, dir, "file1")
+	idle := requireDirFile(t, dir, "idle")
+
+	active := requireDirFile(t, dir, "active")
+	fd, err := active.Open(os.O_WRONLY)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, fd.Close())
+	})
+	require.Positive(t, active.activeWriters())
+
+	root, err := vfs.Root()
+	require.NoError(t, err)
+
+	owner1, owner2 := new(int), new(int)
+	require.Nil(t, regular.Sys())
+	require.Nil(t, regular.Aux(owner1))
+	require.Nil(t, idle.Sys())
+	require.Nil(t, idle.Aux(owner2))
+	require.Nil(t, dir.Sys())
+	require.Nil(t, dir.Aux(owner1))
+
+	pruner1, pruner2 := &recordingPruner{}, &recordingPruner{}
+	vfs.SetPruner(owner1, pruner1)
+	vfs.SetPruner(owner2, pruner2)
+
+	root.ForgetAll()
+
+	calls := pruner1.callsSnapshot()
+	require.Equal(t, calls, pruner2.callsSnapshot())
+	require.Len(t, calls, 2)
+	require.ElementsMatch(t, []Node{regular, idle}, calls[0])
+	assert.NotContains(t, calls[0], active)
+	require.Equal(t, []Node{dir}, calls[1])
+}
+
+func TestDirReadDirPrunesRemovedCachedEntries(t *testing.T) {
+	r, vfs, dir, file1 := dirCreate(t)
+
+	_, err := dir.ReadDirAll()
+	require.NoError(t, err)
+
+	dropped := requireDirFile(t, dir, "file1")
+
+	owner1, owner2 := new(int), new(int)
+	require.Nil(t, dropped.Sys())
+	require.Nil(t, dropped.Aux(owner1))
+
+	pruner1, pruner2 := &recordingPruner{}, &recordingPruner{}
+	vfs.SetPruner(owner1, pruner1)
+	vfs.SetPruner(owner2, pruner2)
+
+	obj, err := r.Fremote.NewObject(context.Background(), file1.Path)
+	require.NoError(t, err)
+	require.NoError(t, obj.Remove(context.Background()))
+
+	require.NoError(t, dir.readDir())
+
+	calls := pruner1.callsSnapshot()
+	require.Equal(t, calls, pruner2.callsSnapshot())
+	require.Len(t, calls, 1, "expected one prune call for dropped prunable node, got %d", len(calls))
+	require.Len(t, calls[0], 1, "expected one prune victim for dropped prunable node, got %d", len(calls[0]))
+	assert.Same(t, dropped, calls[0][0], "expected refresh removal to prune the dropped cached node")
+	assert.Equal(t, "dir/file1", calls[0][0].Path())
+}
+
+func TestDirForgetAllSkipsPrunerWhenVirtual(t *testing.T) {
+	_, vfs, dir, _ := dirCreate(t)
+
+	dir.AddVirtual("virtualFile", 17, false)
+	require.True(t, dir.cleanupTimer.Stop())
+
+	pruner := &recordingPruner{}
+	vfs.SetPruner(new(int), pruner)
+
+	hasVirtual := dir.ForgetAll()
+	assert.True(t, hasVirtual)
+
+	assert.Empty(t, pruner.callsSnapshot())
+
+	dir.mu.RLock()
+	_, found := dir.items["virtualFile"]
+	itemCount := len(dir.items)
+	dir.mu.RUnlock()
+	assert.True(t, found)
+	assert.Positive(t, itemCount)
+
+	assert.True(t, dir.cleanupTimer.Stop())
+}
+
 func TestDirForgetPath(t *testing.T) {
 	_, vfs, dir, file1 := dirCreate(t)
 
