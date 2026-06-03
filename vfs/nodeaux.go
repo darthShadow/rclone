@@ -9,8 +9,8 @@ type auxEntry struct {
 
 // aux holds auxiliary values attached to a node, keyed by owner.
 //
-// It is embedded in Dir and File to provide the Aux, SetAux, Sys and
-// SetSys methods of the Node interface.
+// It is embedded in Dir and File to provide the Aux, LoadOrStoreAux,
+// SetAux, Sys and SetSys methods of the Node interface.
 //
 // Reads are lock free. Writes copy the entry list, which is assumed
 // to be very short.
@@ -32,6 +32,33 @@ func (a *aux) Aux(owner any) any {
 		}
 	}
 	return nil
+}
+
+// LoadOrStoreAux returns the existing value for owner if present.
+// Otherwise it attaches and returns value. The loaded result reports
+// whether the existing value was returned. A nil value is not attached.
+func (a *aux) LoadOrStoreAux(owner, value any) (actual any, loaded bool) {
+	for {
+		old := a.entries.Load()
+		var entries []auxEntry
+		if old != nil {
+			for _, entry := range *old {
+				if entry.owner == owner {
+					return entry.value, true
+				}
+			}
+			entries = make([]auxEntry, len(*old), len(*old)+1)
+			copy(entries, *old)
+		}
+		if value == nil {
+			return nil, false
+		}
+		entries = append(entries, auxEntry{owner: owner, value: value})
+		next := &entries
+		if a.entries.CompareAndSwap(old, next) {
+			return value, false
+		}
+	}
 }
 
 // SetAux attaches value to the node for owner, replacing any value

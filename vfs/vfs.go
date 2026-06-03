@@ -71,6 +71,7 @@ type Node interface {
 	Path() string
 	SetSys(any)
 	Aux(owner any) any
+	LoadOrStoreAux(owner, value any) (actual any, loaded bool)
 	SetAux(owner, value any)
 }
 
@@ -196,6 +197,7 @@ type VFS struct {
 	pollMu      sync.Mutex
 	pollChan    chan time.Duration
 	inUse       atomic.Int32 // count of number of opens
+	prunerStore atomic.Pointer[[]prunerEntry]
 }
 
 // Keep track of active VFS keyed on fs.ConfigString(f)
