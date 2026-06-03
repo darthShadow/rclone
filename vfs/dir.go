@@ -248,11 +248,26 @@ func (d *Dir) ForgetAll() (hasVirtual bool) {
 		}
 	}
 
+	pruners := d.vfs.pruners()
 	d.mu.RUnlock()
 
-	// We run this part with Lock so we can modify the Dir
+	victims, hasVirtual := d.clearAndCollect(len(pruners) != 0)
 
+	if len(victims) > 0 {
+		for _, pruner := range pruners {
+			pruner.PruneInodes(victims)
+		}
+	}
+
+	return hasVirtual
+}
+
+// clearAndCollect acquires d.mu, purges virtuals, computes hasVirtual, and either clears items and stops cleanup or rearms cleanup when virtuals remain.
+// It returns the prune victims plus hasVirtual, and defers Unlock for panic safety under cacheCleanup's outer recover.
+func (d *Dir) clearAndCollect(collectPrune bool) (victims []Node, hasVirtual bool) {
+	// We run this part with Lock so we can modify the Dir
 	d.mu.Lock()
+	// Defer unlock so cacheCleanup's outer recover can't strand d.mu locked.
 	defer d.mu.Unlock()
 
 	// Purge any unnecessary virtual entries
@@ -262,6 +277,9 @@ func (d *Dir) ForgetAll() (hasVirtual bool) {
 	// directory or any children
 	hasVirtual = d.hasVirtual()
 	if !hasVirtual {
+		if collectPrune {
+			victims = collectPruneVictims(d.items)
+		}
 		d.read = time.Time{}
 		d.items = make(map[string]Node)
 		d.resetStatRead(false)
@@ -269,8 +287,33 @@ func (d *Dir) ForgetAll() (hasVirtual bool) {
 	} else {
 		d.cleanupTimer.Reset(time.Duration(d.vfs.Opt.DirCacheTime * 2))
 	}
+	return victims, hasVirtual
+}
 
-	return hasVirtual
+func collectPruneVictims(items map[string]Node) []Node {
+	if len(items) == 0 {
+		return nil
+	}
+	victims := make([]Node, 0, len(items))
+	for _, node := range items {
+		if victim := collectPruneVictim(node); victim != nil {
+			victims = append(victims, victim)
+		}
+	}
+	return victims
+}
+
+func collectPruneVictim(node Node) Node {
+	switch n := node.(type) {
+	case *Dir:
+		return n
+	case *File:
+		// Active writers may still use the inode, so exclude them conservatively.
+		if n.activeWriters() == 0 {
+			return n
+		}
+	}
+	return nil
 }
 
 // forgetDirPath clears the cache for itself and all subdirectories if
@@ -629,31 +672,47 @@ func (d *Dir) _readDir() error {
 	when = time.Now()
 
 	// Atomic state update
-	d.mu.Lock()
-	defer d.mu.Unlock()
+	pruners := d.vfs.pruners()
+	collectPrune := len(pruners) != 0
+	var victims []Node
+	err = func() error {
+		d.mu.Lock()
+		defer d.mu.Unlock()
 
-	// Double-check staleness to prevent duplicate work
-	if _, stale := d._age(when); !stale {
+		// Double-check staleness to prevent duplicate work
+		if _, stale := d._age(when); !stale {
+			return nil
+		}
+
+		// Apply changes
+		victims, err = d._readDirFromEntries(entries, nil, time.Time{}, collectPrune)
+		if err != nil {
+			return err
+		}
+
+		d.read = when
+		d.resetStatRead(true)
+		d.cleanupTimer.Reset(time.Duration(d.vfs.Opt.DirCacheTime * 2))
+
 		return nil
-	}
-
-	// Apply changes
-	err = d._readDirFromEntries(entries, nil, time.Time{})
+	}()
 	if err != nil {
 		return err
 	}
 
-	d.read = when
-	d.resetStatRead(true)
-	d.cleanupTimer.Reset(time.Duration(d.vfs.Opt.DirCacheTime * 2))
+	if len(victims) > 0 {
+		for _, pruner := range pruners {
+			pruner.PruneInodes(victims)
+		}
+	}
 
 	return nil
 }
 
 // update d.items for each dir in the DirTree below this one and
 // set the last read time - must be called with the lock held
-func (d *Dir) _readDirFromDirTree(dirTree dirtree.DirTree, when time.Time) error {
-	return d._readDirFromEntries(dirTree[d.path], dirTree, when)
+func (d *Dir) _readDirFromDirTree(dirTree dirtree.DirTree, when time.Time, collectPrune bool) (victims []Node, err error) {
+	return d._readDirFromEntries(dirTree[d.path], dirTree, when, collectPrune)
 }
 
 // Remove the virtual directory entry leaf
@@ -763,7 +822,7 @@ func (mv manageVirtuals) add(d *Dir, name string) bool {
 // with virtual entries
 //
 // must be called with the Dir lock held
-func (mv manageVirtuals) end(d *Dir) {
+func (mv manageVirtuals) end(d *Dir, collectPrune bool) (victims []Node) {
 	// delete unused d.items
 	for name := range d.items {
 		if _, ok := mv[name]; !ok {
@@ -774,6 +833,11 @@ func (mv manageVirtuals) end(d *Dir) {
 				// virtually added so leave virtual item
 			default:
 				// otherwise delete it
+				if collectPrune {
+					if victim := collectPruneVictim(d.items[name]); victim != nil {
+						victims = append(victims, victim)
+					}
+				}
 				delete(d.items, name)
 			}
 		}
@@ -789,9 +853,10 @@ func (mv manageVirtuals) end(d *Dir) {
 			}
 		}
 	}
+	return victims
 }
 
-func (d *Dir) _processEntry(entry fs.DirEntry, mv manageVirtuals, dirTree dirtree.DirTree, when time.Time) (err error) {
+func (d *Dir) _processEntry(entry fs.DirEntry, mv manageVirtuals, dirTree dirtree.DirTree, when time.Time, collectPrune bool) (victims []Node, err error) {
 	entryName := path.Base(entry.Remote())
 	if d.vfs.Opt.Links {
 		entryName, _ = strings.CutSuffix(entryName, fs.LinkSuffix)
@@ -799,11 +864,11 @@ func (d *Dir) _processEntry(entry fs.DirEntry, mv manageVirtuals, dirTree dirtre
 	// Check after removing the suffix so "...rclonelink" can't
 	// become an entry called ".."
 	if entryName == "" || entryName == "." || entryName == ".." {
-		return nil
+		return nil, nil
 	}
 
 	if mv != nil && mv.add(d, entryName) {
-		return nil
+		return nil, nil
 	}
 
 	node := d.items[entryName]
@@ -832,7 +897,7 @@ func (d *Dir) _processEntry(entry fs.DirEntry, mv manageVirtuals, dirTree dirtre
 		dir.resetStatRead(true)
 
 		if dirTree != nil {
-			err = dir._readDirFromDirTree(dirTree, when)
+			victims, err = dir._readDirFromDirTree(dirTree, when, collectPrune)
 			if err != nil {
 				dir.read = time.Time{}
 			} else {
@@ -843,28 +908,30 @@ func (d *Dir) _processEntry(entry fs.DirEntry, mv manageVirtuals, dirTree dirtre
 
 		dir.mu.Unlock()
 		if err != nil {
-			return err
+			return nil, err
 		}
 
 	default:
-		return fmt.Errorf("unknown type: %T", item)
+		return nil, fmt.Errorf("unknown type: %T", item)
 	}
 
 	d.items[entryName] = node
-	return nil
+	return victims, nil
 }
 
 // update d.items and if dirTree is not nil update each dir in the DirTree below this one and
 // set the last read time - must be called with the lock held
-func (d *Dir) _readDirFromEntries(entries fs.DirEntries, dirTree dirtree.DirTree, when time.Time) error {
+func (d *Dir) _readDirFromEntries(entries fs.DirEntries, dirTree dirtree.DirTree, when time.Time, collectPrune bool) (victims []Node, err error) {
 	mv := d._newManageVirtuals()
 	for _, entry := range entries {
-		if err := d._processEntry(entry, mv, dirTree, when); err != nil {
-			return fmt.Errorf("%s: processing entry: %s: %v", d.path, path.Base(entry.Remote()), err)
+		entryVictims, err := d._processEntry(entry, mv, dirTree, when, collectPrune)
+		if err != nil {
+			return nil, fmt.Errorf("%s: processing entry: %s: %v", d.path, path.Base(entry.Remote()), err)
 		}
+		victims = append(victims, entryVictims...)
 	}
-	mv.end(d)
-	return nil
+	victims = append(victims, mv.end(d, collectPrune)...)
+	return victims, nil
 }
 
 // readDirTree forces a refresh of the complete directory tree
@@ -878,17 +945,34 @@ func (d *Dir) readDirTree() error {
 	if err != nil {
 		return err
 	}
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	d.read = time.Time{}
-	d.resetStatRead(false)
-	err = d._readDirFromDirTree(dt, when)
+	pruners := d.vfs.pruners()
+	collectPrune := len(pruners) != 0
+	var victims []Node
+	err = func() error {
+		d.mu.Lock()
+		defer d.mu.Unlock()
+
+		d.read = time.Time{}
+		d.resetStatRead(false)
+		victims, err = d._readDirFromDirTree(dt, when, collectPrune)
+		if err != nil {
+			return err
+		}
+		fs.Debugf(d.path, "Reading directory tree done in %s", time.Since(when))
+		d.read = when
+		d.cleanupTimer.Reset(time.Duration(d.vfs.Opt.DirCacheTime * 2))
+		return nil
+	}()
 	if err != nil {
 		return err
 	}
-	fs.Debugf(d.path, "Reading directory tree done in %s", time.Since(when))
-	d.read = when
-	d.cleanupTimer.Reset(time.Duration(d.vfs.Opt.DirCacheTime * 2))
+
+	if len(victims) > 0 {
+		for _, pruner := range pruners {
+			pruner.PruneInodes(victims)
+		}
+	}
+
 	return nil
 }
 
@@ -1053,7 +1137,7 @@ func (d *Dir) _stat(leaf string) bool {
 		}
 	}
 
-	if err = d._processEntry(entry, nil, nil, when); err != nil {
+	if _, err = d._processEntry(entry, nil, nil, when, false); err != nil {
 		fs.Errorf(dirPath, "processing entry: %q: %v", entryName, err)
 		return false
 	}

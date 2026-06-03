@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -30,6 +31,54 @@ const (
 	writeBackDelay      = fs.Duration(100 * time.Millisecond) // A short writeback delay for testing
 	waitForWritersDelay = 30 * time.Second                    // time to wait for existing writers
 )
+
+type recordingPruner struct {
+	mu    sync.Mutex
+	calls [][]Node
+}
+
+func (p *recordingPruner) PruneInodes(victims []Node) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.calls = append(p.calls, append([]Node(nil), victims...))
+}
+
+func (p *recordingPruner) callsSnapshot() [][]Node {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	calls := make([][]Node, len(p.calls))
+	for i := range p.calls {
+		calls[i] = append([]Node(nil), p.calls[i]...)
+	}
+	return calls
+}
+
+func requireSamePruners(t *testing.T, want, got []Pruner) {
+	t.Helper()
+	require.Len(t, got, len(want), "got pruners %v", got)
+	matched := make([]bool, len(got))
+	for _, wantPruner := range want {
+		found := false
+		for i, gotPruner := range got {
+			if !matched[i] && gotPruner == wantPruner {
+				matched[i] = true
+				found = true
+				break
+			}
+		}
+		require.Truef(t, found, "missing pruner %T %p from snapshot %v", wantPruner, wantPruner, got)
+	}
+}
+
+func containsSamePruner(pruners []Pruner, want Pruner) bool {
+	for _, pruner := range pruners {
+		if pruner == want {
+			return true
+		}
+	}
+	return false
+}
 
 // TestMain drives the tests
 func TestMain(m *testing.M) {
@@ -57,6 +106,91 @@ func newTestVFSOpt(t *testing.T, opt *vfscommon.Options) (r *fstest.Run, vfs *VF
 // Create a new VFS with default options
 func newTestVFS(t *testing.T) (r *fstest.Run, vfs *VFS) {
 	return newTestVFSOpt(t, nil)
+}
+
+func TestVFSPruner(t *testing.T) {
+	var vfs VFS
+	owner1, owner2, absentOwner := new(int), new(int), new(int)
+	p1, p2, replacement := &recordingPruner{}, &recordingPruner{}, &recordingPruner{}
+
+	require.Empty(t, vfs.pruners())
+
+	for _, test := range []struct {
+		name  string
+		owner any
+		set   Pruner
+		want  []Pruner
+	}{
+		{
+			name:  "SetFirstOwner",
+			owner: owner1,
+			set:   p1,
+			want:  []Pruner{p1},
+		},
+		{
+			name:  "SetSecondOwner",
+			owner: owner2,
+			set:   p2,
+			want:  []Pruner{p1, p2},
+		},
+		{
+			name:  "ReplaceFirstOwner",
+			owner: owner1,
+			set:   replacement,
+			want:  []Pruner{replacement, p2},
+		},
+		{
+			name:  "RemoveAbsentOwner",
+			owner: absentOwner,
+			want:  []Pruner{replacement, p2},
+		},
+		{
+			name:  "RemoveFirstOwner",
+			owner: owner1,
+			want:  []Pruner{p2},
+		},
+		{
+			name:  "RemoveLastOwner",
+			owner: owner2,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			vfs.SetPruner(test.owner, test.set)
+			requireSamePruners(t, test.want, vfs.pruners())
+		})
+	}
+
+	vfs.SetPruner(owner1, p1)
+	vfs.SetPruner(owner2, p2)
+	snapshot := vfs.pruners()
+	require.Len(t, snapshot, 2)
+	snapshot[0] = nil
+	requireSamePruners(t, []Pruner{p1, p2}, vfs.pruners())
+}
+
+func TestVFSPrunerConcurrent(t *testing.T) {
+	const (
+		owners     = 4
+		iterations = 100
+	)
+	var (
+		vfs VFS
+		wg  sync.WaitGroup
+	)
+	for i := range owners {
+		wg.Go(func() {
+			owner := &i
+			pruner := &recordingPruner{}
+			for range iterations {
+				vfs.SetPruner(owner, pruner)
+				snapshot := vfs.pruners()
+				assert.Truef(t, containsSamePruner(snapshot, pruner), "missing registered pruner %p from snapshot %v", pruner, snapshot)
+				vfs.SetPruner(owner, nil)
+			}
+		})
+	}
+	wg.Wait()
+	require.Empty(t, vfs.pruners())
 }
 
 // Check baseHandle performs as advertised

@@ -9,6 +9,7 @@ import (
 	"syscall"
 	"time"
 
+	fusefs "github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/rclone/rclone/cmd/mountlib"
 	"github.com/rclone/rclone/fs"
@@ -63,6 +64,62 @@ func (f *FS) Root() (node *Node, err error) {
 	}
 	f.root = newNode(f, root)
 	return f.root, nil
+}
+
+func (f *FS) nodeFor(vfsNode vfs.Node) *Node {
+	node, _ := vfsNode.Aux(f).(*Node)
+	return node
+}
+
+// pruneCandidates converts VFS victims into this mount's inodes.
+func (f *FS) pruneCandidates(victims []vfs.Node) []*fusefs.Inode {
+	if len(victims) == 0 || f.root == nil {
+		return nil
+	}
+	rootInode := f.root.EmbeddedInode()
+	if rootInode == nil {
+		return nil
+	}
+
+	seen := make(map[*fusefs.Inode]struct{}, len(victims))
+	inodes := make([]*fusefs.Inode, 0, len(victims))
+	for _, victim := range victims {
+		node := f.nodeFor(victim)
+		if node == nil {
+			continue
+		}
+		inode := node.EmbeddedInode()
+		if inode == nil {
+			continue
+		}
+		// ForgetAll provides children only; keep pointer identity as the root
+		// guard because StableAttr.Ino is not the FUSE root nodeId.
+		if inode == rootInode {
+			continue
+		}
+		if _, parent := inode.Parent(); parent == nil {
+			continue // never entered this bridge's tree, so it has no nodeId
+		}
+		if _, ok := seen[inode]; ok {
+			continue
+		}
+		seen[inode] = struct{}{}
+		inodes = append(inodes, inode)
+	}
+	return inodes
+}
+
+// PruneInodes converts VFS victims into go-fuse inodes and issues a
+// best-effort prune notification for defensively valid non-root nodes.
+func (f *FS) PruneInodes(victims []vfs.Node) {
+	inodes := f.pruneCandidates(victims)
+	if len(inodes) == 0 {
+		return
+	}
+
+	if errno := f.root.EmbeddedInode().NotifyPrune(inodes); errno != 0 && errno != syscall.ENOSYS {
+		fs.Debugf(f.f, "NotifyPrune: %d victims, errno=%v", len(inodes), errno)
+	}
 }
 
 // SetDebug if called, provide debug output through the log package.
