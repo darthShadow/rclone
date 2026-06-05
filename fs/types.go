@@ -213,9 +213,15 @@ type SetMetadataer interface {
 
 // Fder is an optional interface for DirEntry
 type Fder interface {
-	// Fd returns the underlying fd for an DirEntry
+	// Fd returns a caller-owned file descriptor for the DirEntry.
 	//
-	// It should return fs.ErrorNotImplemented if it can't return an fd
+	// The returned fd is a dup of an internally managed descriptor.
+	// The caller MUST close the fd exactly once when the return value
+	// is non-zero and err is nil. On error, or when the fd is zero,
+	// the caller MUST NOT close anything.
+	//
+	// Implementations MUST return fs.ErrorNotImplemented when passthrough
+	// is unavailable on the current platform or for the specific object.
 	Fd(ctx context.Context, flags int) (uintptr, error)
 }
 

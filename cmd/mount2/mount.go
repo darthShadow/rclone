@@ -17,6 +17,8 @@ import (
 	"github.com/rclone/rclone/vfs"
 )
 
+const maxBackground = 128
+
 func init() {
 	mountlib.NewMountCommand("mount2", true, mount)
 	mountlib.AddRc("mount2", mount)
@@ -63,10 +65,13 @@ func mountOptions(fsys *FS, f fs.Fs, opt *mountlib.Options) (mountOpts *fuse.Mou
 		IDMappedMount:      opt.AllowIDMap,
 		MaxStackDepth:      fsys.opt.MaxStackDepth,
 		ExtraCapabilities:  fuse.CAP_ASYNC_DIO,
-		// Lift kernel async-request cap above the default 12 (CongestionThreshold 9)
-		// so high-fanout reads aren't throttled by FUSE backing-dev congestion.
-		// CongestionThreshold becomes 96 (= 128 * 3/4) via go-fuse's hardcoded ratio.
-		MaxBackground: 128,
+		SyncRead:           !opt.AsyncRead,
+		// Lift the kernel async-request cap above go-fuse's default of 12 so
+		// high-fanout reads aren't throttled by FUSE backing-dev congestion.
+		// The congestion threshold follows the kernel-FUSE convention of
+		// three quarters of that cap.
+		MaxBackground:       maxBackground,
+		CongestionThreshold: maxBackground * 3 / 4,
 
 		// RememberInodes: true,
 		// SingleThreaded: true,
@@ -74,16 +79,62 @@ func mountOptions(fsys *FS, f fs.Fs, opt *mountlib.Options) (mountOpts *fuse.Mou
 		/*
 			AllowOther bool
 
-			// Options are passed as -o string to fusermount.
+			// Options are the options passed as -o string to fusermount.
 			Options []string
 
-			// Default is _DEFAULT_BACKGROUND_TASKS, 12.  This numbers
-			// controls the allowed number of requests that relate to
-			// async I/O.  Concurrency for synchronous I/O is not limited.
+			// MaxBackground controls the maximum number of allowed background
+			// asynchronous I/O requests.
+			//
+			// If unset, the default is _DEFAULT_BACKGROUND_TASKS, 12.
+			// Concurrency for synchronous I/O is not limited.
 			MaxBackground int
 
+			// MaxInflightRequestBytes controls the number of bytes used for
+			// request structs and input buffers checked out by go-fuse. This
+			// includes buffers used by readers waiting on the kernel and requests
+			// being processed concurrently.
+			//
+			// It also applies to requests that do not expect a reply, such as
+			// FORGET and BATCH_FORGET. If unset, it defaults to math.MaxInt. If
+			// set smaller than the bytes needed for a single request, one request
+			// is still allowed through.
+			MaxInflightRequestBytes int
+
+			// NumCloneFDs opens this many additional /dev/fuse file
+			// descriptors and binds them to the mount session via
+			// FUSE_DEV_IOC_CLONE (Linux >= 4.2). Each active cloned fd has its
+			// own kernel queue and reader goroutine tree, which reduces
+			// single-fd read contention on many-core machines.
+			//
+			// Replies are written back through the fd from which the request was
+			// read. Session-global operations, such as notifications and
+			// RegisterBackingFd/UnregisterBackingFd, use the primary fd.
+			//
+			// Clone failures are logged and the server continues with the primary
+			// fd and any clones that were already opened. On non-Linux, clone
+			// attempts return ENOSYS through the stub implementation and the
+			// server continues without clones. Defaults to 0 (no cloning).
+			//
+			// MaxInflightRequestBytes is enforced per active fd. When the limit
+			// is at least one request's accounting size, the effective configured
+			// ceiling scales with active fds:
+			// (1 + active clones) * MaxInflightRequestBytes. If the limit is
+			// smaller than one request, each active fd can still admit one
+			// request.
+			NumCloneFDs int
+
+			// CongestionThreshold is the in-flight async-request count at which
+			// the kernel marks the FUSE backing-dev as congested, throttling new
+			// submissions. It corresponds to
+			// /sys/fs/fuse/connections/<id>/congestion_threshold.
+			//
+			// If 0, go-fuse falls back to the kernel-FUSE convention of
+			// 3/4 * MaxBackground. The value is silently clamped by the kernel
+			// to MaxBackground if it is set higher.
+			CongestionThreshold int
+
 			// MaxWrite is the max size for read and write requests. If 0, use
-			// go-fuse default (currently 64 kiB).
+			// go-fuse default (currently 128 kiB).
 			// This number is internally capped at MAX_KERNEL_WRITE (higher values don't make
 			// sense).
 			//
@@ -120,51 +171,167 @@ func mountOptions(fsys *FS, f fs.Fs, opt *mountlib.Options) (mountOpts *fuse.Mou
 			// (up to MaxWrite or VM_READAHEAD_PAGES=128 kiB, whichever is less).
 			MaxReadAhead int
 
-			// If IgnoreSecurityLabels is set, all security related xattr
-			// requests will return NO_DATA without passing through the
-			// user defined filesystem.  You should only set this if you
+			// IgnoreSecurityLabels, if set, makes security related xattr
+			// requests return NO_DATA without passing through the
+			// user defined filesystem. You should only set this if you
 			// file system implements extended attributes, and you are not
 			// interested in security labels.
 			IgnoreSecurityLabels bool // ignoring labels should be provided as a fusermount mount option.
 
-			// If RememberInodes is set, we will never forget inodes.
+			// RememberInodes, if set, makes go-fuse never forget inodes.
 			// This may be useful for NFS.
 			RememberInodes bool
 
-			// Values shown in "df -T" and friends
-			// First column, "Filesystem"
+			// FsName is the name of the filesystem, shown in "df -T"
+			// and friends (as the first column, "Filesystem").
 			FsName string
 
-			// Second column, "Type", will be shown as "fuse." + Name
+			// Name is the "fuse.<name>" suffix, shown in "df -T" and friends
+			// (as the second column, "Type")
 			Name string
 
-			// If set, wrap the file system in a single-threaded locking wrapper.
+			// SingleThreaded, if set, wraps the file system in a single-threaded
+			// locking wrapper.
 			SingleThreaded bool
 
-			// If set, return ENOSYS for Getxattr calls, so the kernel does not issue any
+			// DisableXAttrs, if set, returns ENOSYS for Getxattr, Listxattr,
+			// Setxattr and Removexattr calls, so the kernel does not issue any
 			// Xattr operations at all.
 			DisableXAttrs bool
 
-			// If set, print debugging information.
+			// Debug, if set, enables verbose debugging information.
 			Debug bool
 
-			// If set, ask kernel to forward file locks to FUSE. If using,
-			// you must implement the GetLk/SetLk/SetLkw methods.
+			// Logger, if set, is an alternate log sink for debug statements.
+			//
+			// To increase signal/noise ratio Go-FUSE uses abbreviations in its debug log
+			// output. Here is how to read it:
+			//
+			// - `iX` means `inode X`;
+			// - `gX` means `generation X`;
+			// - `tA` and `tE` means timeout for attributes and directory entry correspondingly;
+			// - `[<off> +<size>)` means data range from `<off>` inclusive till `<off>+<size>` exclusive;
+			// - `Xb` means `X bytes`.
+			// - `pX` means the request originated from PID `x`. 0 means the request originated from the kernel.
+			//
+			// Every line is prefixed with either `rx <unique>` (receive from kernel) or `tx <unique>` (send to kernel)
+			//
+			// Example debug log output:
+			//
+			//     rx 2: LOOKUP i1 [".wcfs"] 6b p5874
+			//     tx 2:     OK, {i3 g2 tE=1s tA=1s {M040755 SZ=0 L=0 1000:1000 B0*0 i0:3 A 0.000000 M 0.000000 C 0.000000}}
+			//     rx 3: LOOKUP i3 ["zurl"] 5b p5874
+			//     tx 3:     OK, {i4 g3 tE=1s tA=1s {M0100644 SZ=33 L=1 1000:1000 B0*0 i0:4 A 0.000000 M 0.000000 C 0.000000}}
+			//     rx 4: OPEN i4 {O_RDONLY,0x8000} p5874
+			//     tx 4:     38=function not implemented, {Fh 0 }
+			//     rx 5: READ i4 {Fh 0 [0 +4096)  L 0 RDONLY,0x8000} p5874
+			//     tx 5:     OK,  33b data "file:///"...
+			//     rx 6: GETATTR i4 {Fh 0} p5874
+			//     tx 6:     OK, {tA=1s {M0100644 SZ=33 L=1 1000:1000 B0*0 i0:4 A 0.000000 M 0.000000 C 0.000000}}
+			//     rx 7: FLUSH i4 {Fh 0} p5874
+			//     tx 7:     OK
+			//     rx 8: LOOKUP i1 ["head"] 5b p5874
+			//     tx 8:     OK, {i5 g4 tE=1s tA=1s {M040755 SZ=0 L=0 1000:1000 B0*0 i0:5 A 0.000000 M 0.000000 C 0.000000}}
+			//     rx 9: LOOKUP i5 ["bigfile"] 8b p5874
+			//     tx 9:     OK, {i6 g5 tE=1s tA=1s {M040755 SZ=0 L=0 1000:1000 B0*0 i0:6 A 0.000000 M 0.000000 C 0.000000}}
+			//     rx 10: FLUSH i4 {Fh 0} p5874
+			//     tx 10:     OK
+			//     rx 11: GETATTR i1 {Fh 0} p5874
+			//     tx 11:     OK, {tA=1s {M040755 SZ=0 L=1 1000:1000 B0*0 i0:1 A 0.000000 M 0.000000 C 0.000000}}
+			Logger *log.Logger
+
+			// EnableLocks, if set, asks the kernel to forward file locks to FUSE
+			// When used, you must implement the GetLk/SetLk/SetLkw methods.
 			EnableLocks bool
 
-			// If set, the kernel caches all Readlink return values. The
-			// filesystem must use content notification to force the
+			// EnableSymlinkCaching, if set, makes the kernel cache all Readlink return values.
+			// The filesystem must use content notification to force the
 			// kernel to issue a new Readlink call.
 			EnableSymlinkCaching bool
 
-			// If set, ask kernel not to do automatic data cache invalidation.
-			// The filesystem is fully responsible for invalidating data cache.
+			// ExplicitDataCacheControl, if set, asks the kernel not to do automatic
+			// data cache invalidation. The filesystem is fully responsible for
+			// invalidating data cache.
 			ExplicitDataCacheControl bool
 
-			// Disable ReadDirPlus capability so ReadDir is used instead. Simple
-			// directory queries (i.e. 'ls' without '-l') can be faster with
-			// ReadDir, as no per-file stat calls are needed
+			// SyncRead disables the CAP_ASYNC_READ capability.  The
+			// kernel then only sends one read request per file handle at
+			// a time, and orders the requests by offset.  This is useful
+			// if reading out of order or concurrently is expensive for
+			// (example: Amazon Cloud Drive).
+			//
+			// If unset, multiple concurrent reads may be issued to
+			// service userspace requests and kernel readahead.
+			//
+			// See the comment to FUSE_CAP_ASYNC_READ in
+			// https://github.com/libfuse/libfuse/blob/master/include/fuse_common.h
+			// for more details.
+			SyncRead bool
+
+			// DirectMount, if set, makes go-fuse first attempt to use syscall.Mount instead of
+			// fusermount to mount the filesystem. This will not update /etc/mtab
+			// but might be needed if fusermount is not available.
+			// Also, Server.Unmount will attempt syscall.Unmount before calling
+			// fusermount.
+			DirectMount bool
+
+			// DirectMountStrict, if set, is like DirectMount but no fallback to fusermount is
+			// performed. If both DirectMount and DirectMountStrict are set,
+			// DirectMountStrict wins.
+			DirectMountStrict bool
+
+			// DirectMountFlags are the mountflags passed to syscall.Mount. If zero, the
+			// default value used by fusermount are used: syscall.MS_NOSUID|syscall.MS_NODEV.
+			//
+			// If you actually *want* zero flags, pass syscall.MS_MGC_VAL, which is ignored
+			// by the kernel. See `man 2 mount` for details about MS_MGC_VAL.
+			DirectMountFlags uintptr
+
+			// EnableAcl, if set, enables kernel ACL support.
+			//
+			// See the comments to FUSE_CAP_POSIX_ACL
+			// in https://github.com/libfuse/libfuse/blob/master/include/fuse_common.h
+			// for details.
+			EnableAcl bool
+
+			// DisableReadDirPlus, if set, disables the ReadDirPlus capability so
+			// ReadDir is used instead. Simple directory queries (i.e. 'ls' without
+			// '-l') can be faster with ReadDir, as no per-file stat calls are needed.
 			DisableReadDirPlus bool
+
+			// DisableSplice, if set, disables splicing from files to the FUSE device.
+			DisableSplice bool
+
+			// PanicHandler is called if an FS routine panics. The handler
+			// should return a nonzero status. If not set, the default is
+			// to print a stack trace and return EIO.
+			PanicHandler func(any) Status
+
+			// MaxStackDepth is the maximum stacking depth for passthrough files.
+			// If unset, the default is 1.
+			MaxStackDepth int
+
+			// IDMappedMount, if set, enables an ID-mapped mount if the Kernel supports
+			// it.
+			//
+			// An ID-mapped mount allows the device to be mounted on the system with the
+			// IDs remapped (via mount_setattr, move_mount syscalls) to those of the
+			// user on the local system.
+			//
+			// Enabling this flag automatically sets the "default_permissions" mount
+			// option. This is required by FUSE to delegate the UID/GID-based permission
+			// checks to the kernel. For requests that create new inodes, FUSE will send
+			// the mapped UID/GIDs. For all other requests, FUSE will send "-1".
+			IDMappedMount bool
+
+			// DisabledCapabilities is a bitmask, containing capablities
+			// (the CAP_* bitmasks) that must be disabled for the entire
+			// mount.
+			DisabledCapabilities uint64
+
+			// ExtraCapabilities is a bitmask of capabilities which
+			// must be enabled in addition to the defaults.
+			ExtraCapabilities uint64
 		*/
 
 	}
@@ -220,6 +387,19 @@ func notifySupport(ks *fuse.InitIn, links bool) (prune, content bool) {
 	return prune, content
 }
 
+// setNegativeTimeout wires NegativeTimeout into opts when AttrTimeout > 0.
+//
+// EntryTimeout, AttrTimeout, and NegativeTimeout intentionally alias the
+// same opt.AttrTimeout backing storage so they always present a single,
+// consistent value to go-fuse. NegativeTimeout is only set when
+// AttrTimeout > 0 so --attr-timeout=0 preserves the direct ENOENT wire
+// format instead of a zero-TTL OK+NodeId=0 negative-dentry response.
+func setNegativeTimeout(opts *fusefs.Options, attrTimeout *fs.Duration) {
+	if *attrTimeout > 0 {
+		opts.NegativeTimeout = (*time.Duration)(attrTimeout)
+	}
+}
+
 // mount the file system
 //
 // The mount point will be ready when this returns.
@@ -237,21 +417,6 @@ func mount(VFS *vfs.VFS, mountpoint string, opt *mountlib.Options) (<-chan error
 	fs.Debugf(f, "Mounting on %q", mountpoint)
 
 	fsys := NewFS(VFS, opt)
-
-	// nodeFsOpts := &fusefs.PathNodeFsOptions{
-	// 	ClientInodes: false,
-	// 	Debug:        mountlib.DebugFUSE,
-	// }
-	// nodeFs := fusefs.NewPathNodeFs(fsys, nodeFsOpts)
-
-	//mOpts := fusefs.NewOptions() // default options
-	// FIXME
-	// mOpts.EntryTimeout = 10 * time.Second
-	// mOpts.AttrTimeout = 10 * time.Second
-	// mOpts.NegativeTimeout = 10 * time.Second
-	//mOpts.Debug = mountlib.DebugFUSE
-
-	//conn := fusefs.NewFileSystemConnector(nodeFs.Root(), mOpts)
 	mountOpts := mountOptions(fsys, f, opt)
 
 	// FIXME fill out
@@ -262,6 +427,8 @@ func mount(VFS *vfs.VFS, mountpoint string, opt *mountlib.Options) (<-chan error
 		GID:          VFS.Opt.GID,
 		UID:          VFS.Opt.UID,
 	}
+	// Wire NegativeTimeout per the AttrTimeout aliasing convention.
+	setNegativeTimeout(&opts, &opt.AttrTimeout)
 
 	root, err := fsys.Root()
 	if err != nil {
@@ -290,13 +457,6 @@ func mount(VFS *vfs.VFS, mountpoint string, opt *mountlib.Options) (<-chan error
 			}
 		})
 	}
-
-	//mountOpts := &fuse.MountOptions{}
-	//server, err := fusefs.Mount(mountpoint, fsys, &opts)
-	// server, err := fusefs.Mount(mountpoint, root, &opts)
-	// if err != nil {
-	// 	return nil, nil, "", err
-	// }
 
 	umount := func() error {
 		return server.Unmount()

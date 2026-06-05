@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1407,18 +1408,16 @@ func (f *Fs) Stat(ctx context.Context, dir string, leaf string) (entry fs.DirEnt
 	var newRemote string
 
 	if useFilter {
-		newRemote = f.cleanRemote(dir, leaf)
+		newRemote = f.cleanRemote(dir, f.opt.Enc.FromStandardName(leaf))
 		if !filter.IncludeRemote(newRemote) {
 			return nil, fs.ErrorObjectNotFound
 		}
 	}
 
-	fsDirPath, err := f.localPath(dir)
+	leafPath, err := f.localPath(join.PathJoin(dir, leaf))
 	if err != nil {
 		return nil, err
 	}
-
-	leafPath := join.FilePathJoin(fsDirPath, leaf)
 	fi, fierr := f.getStatScheduler().SubmitOne(ctx, leafPath, true)
 	if fierr != nil {
 		return nil, fmt.Errorf("%q: fetching info about directory entry %q: %w", dir, leafPath, fierr)
@@ -1430,8 +1429,7 @@ func (f *Fs) Stat(ctx context.Context, dir string, leaf string) (entry fs.DirEnt
 
 	// Follow symlinks if required
 	if f.opt.FollowSymlinks && (mode&os.ModeSymlink) != 0 {
-		localPath := join.FilePathJoin(fsDirPath, name)
-		fi, fierr = f.statScheduler.SubmitOne(ctx, localPath, false)
+		fi, fierr = f.getStatScheduler().SubmitOne(ctx, leafPath, false)
 		// Quietly skip errors on excluded files and directories
 		if fierr != nil && useFilter && !filter.IncludeRemote(newRemote) {
 			return nil, fs.ErrorObjectNotFound
@@ -1439,6 +1437,15 @@ func (f *Fs) Stat(ctx context.Context, dir string, leaf string) (entry fs.DirEnt
 
 		if fierr != nil {
 			return nil, fmt.Errorf("%q: following symlink for %q: %w", dir, leafPath, fierr)
+		}
+
+		if fi.IsDir() && slices.ContainsFunc(f.statParents(ctx, filepath.Dir(leafPath)), func(parent os.FileInfo) bool { return os.SameFile(fi, parent) }) {
+			if useFilter {
+				if include, dirErr := filter.IncludeDirectory(ctx, f)(newRemote); dirErr == nil && !include {
+					return nil, fs.ErrorObjectNotFound
+				}
+			}
+			return nil, fmt.Errorf("%q: following symlink for %q: %w", dir, leafPath, errSymlinkLoop)
 		}
 
 		mode = fi.Mode()
@@ -2337,19 +2344,6 @@ func cleanRootPath(s string, noUNC bool, enc encoder.MultiEncoder) string {
 		s = file.UNCPath(s)
 	}
 	return s
-}
-
-// Fd returns the Fd of the Object
-//
-// It should return fs.ErrorNotImplemented if it's not available
-func (o *Object) Fd(ctx context.Context, flags int) (uintptr, error) {
-	osFile, err := file.OpenFile(o.path, flags, 0)
-	if err != nil {
-		return 0, fmt.Errorf("failed to open file: %s: %w", o.path, err)
-	}
-	fileFd := osFile.Fd()
-	fs.Infof(o, "Returning fd: %s: %d", o.path, fileFd)
-	return fileFd, nil
 }
 
 // Items returns the count of items in this directory or this

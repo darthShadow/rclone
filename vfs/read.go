@@ -502,7 +502,10 @@ func (fh *ReadFileHandle) Stat() (os.FileInfo, error) {
 	return fh.file, nil
 }
 
-// Fd returns the integer Unix file descriptor referencing the underlying file.
+// Fd returns a caller-owned passthrough file descriptor for the underlying
+// file, or 0 if passthrough is unavailable. When non-zero, the caller
+// (typically FileHandle.PassthroughFd in mount2) is responsible for closing
+// the fd exactly once, after the FUSE layer no longer needs it.
 func (fh *ReadFileHandle) Fd() uintptr {
 	if fh.file == nil {
 		return 0
