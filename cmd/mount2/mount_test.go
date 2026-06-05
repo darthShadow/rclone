@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -19,7 +20,9 @@ import (
 	"github.com/rclone/rclone/vfs"
 	"github.com/rclone/rclone/vfs/vfscommon"
 	"github.com/rclone/rclone/vfs/vfstest"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sys/unix"
 )
 
 func TestMount(t *testing.T) {
@@ -408,4 +411,137 @@ func TestNotifySupport(t *testing.T) {
 			require.Equal(t, test.wantContent, content, "content")
 		})
 	}
+}
+
+func TestMountOptionsSyncRead(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		asyncRead    bool
+		wantSyncRead bool
+	}{
+		{name: "async read enabled", asyncRead: true, wantSyncRead: false},
+		{name: "async read disabled", asyncRead: false, wantSyncRead: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mountOpt := mountlib.Opt
+			mountOpt.AsyncRead = tc.asyncRead
+			fsys := &FS{
+				VFS: &vfs.VFS{},
+				opt: &mountOpt,
+			}
+
+			got := mountOptions(fsys, nil, &mountOpt)
+
+			assert.Equal(t, tc.wantSyncRead, got.SyncRead)
+		})
+	}
+}
+
+func TestSetNegativeTimeout(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		timeout fs.Duration
+		wantSet bool
+	}{
+		{name: "zero attr timeout", timeout: 0, wantSet: false},
+		{name: "positive attr timeout", timeout: fs.Duration(time.Second), wantSet: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mountOpt := mountlib.Options{AttrTimeout: tc.timeout}
+			opts := fusefs.Options{
+				AttrTimeout: (*time.Duration)(&mountOpt.AttrTimeout),
+			}
+
+			setNegativeTimeout(&opts, &mountOpt.AttrTimeout)
+
+			if !tc.wantSet {
+				assert.Nil(t, opts.NegativeTimeout)
+				return
+			}
+			require.NotNil(t, opts.NegativeTimeout)
+			assert.True(t, opts.NegativeTimeout == opts.AttrTimeout, "NegativeTimeout should alias AttrTimeout")
+			assert.Equal(t, *opts.AttrTimeout, *opts.NegativeTimeout)
+		})
+	}
+}
+
+// fakeVFSHandle is a minimal vfs.Handle stub used by passthrough fd tests. It
+// returns a *vfs.File node for the FileHandle.PassthroughFd type guard and a
+// caller-owned fd from each Fd call.
+type fakeVFSHandle struct {
+	vfs.Handle
+
+	node vfs.Node
+	fds  []int
+}
+
+func (h *fakeVFSHandle) Fd() uintptr {
+	if len(h.fds) == 0 {
+		return 0
+	}
+	fd := h.fds[0]
+	h.fds = h.fds[1:]
+	return uintptr(fd)
+}
+
+func (h *fakeVFSHandle) Node() vfs.Node { return h.node }
+
+func (*fakeVFSHandle) Release() error { return nil }
+
+func requireFdOpen(t *testing.T, fd int, msg string) {
+	t.Helper()
+	_, err := unix.FcntlInt(uintptr(fd), unix.F_GETFD, 0)
+	require.NoError(t, err, msg)
+}
+
+func assertFdClosed(t *testing.T, fd int, msg string) {
+	t.Helper()
+	_, err := unix.FcntlInt(uintptr(fd), unix.F_GETFD, 0)
+	assert.Error(t, err, msg)
+}
+
+// TestFileHandlePassthroughFdRecordsAndCloses verifies the fd lifecycle of
+// FileHandle.PassthroughFd and FileHandle.Release:
+//   - PassthroughFd records the fd returned by the vfs handle.
+//   - A second PassthroughFd closes the prior recorded fd before replacement.
+//   - Release closes the final fd exactly once via the -1 sentinel.
+func TestFileHandlePassthroughFdRecordsAndCloses(t *testing.T) {
+	tmp, err := os.CreateTemp(t.TempDir(), "fh_passthrough_test")
+	require.NoError(t, err)
+	dupFd1, err := syscall.Dup(int(tmp.Fd()))
+	require.NoError(t, err)
+	dupFd2, err := syscall.Dup(int(tmp.Fd()))
+	require.NoError(t, err)
+	require.NoError(t, tmp.Close())
+	t.Cleanup(func() {
+		_ = syscall.Close(dupFd1)
+		_ = syscall.Close(dupFd2)
+	})
+
+	handle := &fakeVFSHandle{
+		node: &vfs.File{},
+		fds:  []int{dupFd1, dupFd2},
+	}
+	fh := newFileHandle(handle, nil)
+
+	fd1, ok := fh.PassthroughFd()
+	require.True(t, ok, "first PassthroughFd should succeed")
+	assert.Equal(t, dupFd1, fd1)
+	assert.Equal(t, fd1, fh.passthroughFd)
+	requireFdOpen(t, fd1, "first passthrough fd should be open")
+
+	fd2, ok := fh.PassthroughFd()
+	require.True(t, ok, "second PassthroughFd should succeed")
+	assert.Equal(t, dupFd2, fd2)
+	assert.Equal(t, fd2, fh.passthroughFd)
+	assertFdClosed(t, fd1, "prior passthrough fd should be closed after replacement")
+	requireFdOpen(t, fd2, "second passthrough fd should be open")
+
+	errno := fh.Release(context.Background())
+	require.Equal(t, syscall.Errno(0), errno, "Release should succeed")
+	assert.Equal(t, -1, fh.passthroughFd, "sentinel must be -1 after Release")
+	assertFdClosed(t, fd2, "final passthrough fd should be closed after Release")
+
+	errno2 := fh.Release(context.Background())
+	require.Equal(t, syscall.Errno(0), errno2, "second Release should be a no-op")
 }

@@ -167,6 +167,60 @@ func TestListedConstructorsUseProvidedLocalPath(t *testing.T) {
 	assert.Equal(t, dirPath, dir.path)
 }
 
+func TestStat_EncodedLeafUsesContainedLocalPath(t *testing.T) {
+	ctx := context.Background()
+	testDir := t.TempDir()
+	root := filepath.Join(testDir, "root")
+	require.NoError(t, os.Mkdir(root, 0777))
+	fRaw, err := NewFs(ctx, "local", root, configmap.Simple{"encoding": "Colon"})
+	require.NoError(t, err)
+	f, ok := fRaw.(*Fs)
+	require.True(t, ok)
+	t.Cleanup(func() {
+		f.statScheduler.Close()
+	})
+
+	const remoteLeaf = "encoded:name"
+	nativeLeaf := f.opt.Enc.FromStandardName(remoteLeaf)
+	require.NotEqual(t, nativeLeaf, remoteLeaf)
+	writeTestFile(t, root, nativeLeaf)
+
+	entry, err := f.Stat(ctx, "", remoteLeaf)
+	require.NoError(t, err)
+	assert.Equal(t, remoteLeaf, entry.Remote())
+
+	outsideName := "outside.txt"
+	require.NoError(t, os.WriteFile(filepath.Join(testDir, outsideName), []byte("outside"), 0666))
+	escapingLeaf := f.opt.Enc.ToStandardName("../" + outsideName)
+	require.NotEqual(t, "../"+outsideName, escapingLeaf)
+	_, err = f.Stat(ctx, "", escapingLeaf)
+	assert.ErrorIs(t, err, errPathEscapes)
+
+	_, err = f.Stat(ctx, "", "missing.txt")
+	assert.ErrorIs(t, err, os.ErrNotExist)
+	assert.NotErrorIs(t, err, errPathEscapes)
+}
+
+func TestStat_EncodedLeafUsesStandardRemoteForFilter(t *testing.T) {
+	ctx := context.Background()
+	f, root := newTestLocalFs(t)
+	f.opt.Enc = encoder.EncodeColon
+
+	const remoteLeaf = "literal：name"
+	nativeLeaf := f.opt.Enc.FromStandardName(remoteLeaf)
+	require.NotEqual(t, nativeLeaf, remoteLeaf)
+	writeTestFile(t, root, nativeLeaf)
+
+	ctx, fi := filter.AddConfig(ctx)
+	require.NoError(t, fi.AddRule("+ "+remoteLeaf))
+	require.NoError(t, fi.AddRule("- *"))
+	ctx = filter.SetUseFilter(ctx, true)
+
+	entry, err := f.Stat(ctx, "", remoteLeaf)
+	require.NoError(t, err)
+	assert.Equal(t, remoteLeaf, entry.Remote())
+}
+
 func TestListCachedFileInfos_FilteredBatchUsesSharedScheduler(t *testing.T) {
 	f, root := newTestLocalFs(t)
 	for i := 0; i < statSchedulerDefaultMicroBatchSize+4; i++ {

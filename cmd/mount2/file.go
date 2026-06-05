@@ -35,13 +35,23 @@ import (
 type FileHandle struct {
 	h    vfs.Handle
 	fsys *FS
+	// go-fuse calls PassthroughFd at most once before completing Open/Create.
+	// Mutex-free access relies on the unverified kernel rule that Release cannot
+	// arrive before that reply.
+	// If a future request path such as Read under DIRECT_IO accesses this field
+	// concurrently, add synchronization before reusing it.
+	//
+	// -1 means no fd is held. Release closes and resets this fd when
+	// non-negative.
+	passthroughFd int
 }
 
 // Create a new FileHandle
 func newFileHandle(h vfs.Handle, fsys *FS) *FileHandle {
 	return &FileHandle{
-		h:    h,
-		fsys: fsys,
+		h:             h,
+		fsys:          fsys,
+		passthroughFd: -1,
 	}
 }
 
@@ -90,11 +100,19 @@ func (f *FileHandle) Flush(ctx context.Context) syscall.Errno {
 
 var _ fusefs.FileFlusher = (*FileHandle)(nil)
 
-// Release is called to before a FileHandle is forgotten. The
-// kernel ignores the return value of this method,
-// so any cleanup that requires specific synchronization or
-// could fail with I/O errors should happen in Flush instead.
+// Release is called before a FileHandle is forgotten. The kernel ignores
+// the return value of this method, so any cleanup that requires specific
+// synchronization or could fail with I/O errors should happen in Flush
+// instead.
+//
+// Release closes the recorded passthrough fd (if any) before delegating to
+// the vfs layer. The -1 sentinel prevents accidental double-close.
 func (f *FileHandle) Release(ctx context.Context) syscall.Errno {
+	if f.passthroughFd >= 0 {
+		fd := f.passthroughFd
+		f.passthroughFd = -1
+		_ = syscall.Close(fd)
+	}
 	return translateError(f.h.Release())
 }
 
@@ -150,7 +168,10 @@ func (f *FileHandle) Setattr(ctx context.Context, in *fuse.SetAttrIn, out *fuse.
 
 var _ fusefs.FileSetattrer = (*FileHandle)(nil)
 
-// PassthroughFd returns the file descriptor of the file if the remote supports passthrough
+// PassthroughFd returns the passthrough file descriptor for the file if the
+// remote supports it. Each successful call records a fresh caller-owned fd
+// (a dup of the backend's internal descriptor) and closes any previously
+// recorded fd before replacement. The final recorded fd is closed by Release.
 func (f *FileHandle) PassthroughFd() (int, bool) {
 	_, ok := f.h.Node().(*vfs.File)
 	if !ok {
@@ -161,7 +182,13 @@ func (f *FileHandle) PassthroughFd() (int, bool) {
 	if fileFd == 0 {
 		return 0, false
 	}
-	return int(fileFd), true
+	fd := int(fileFd)
+	if f.passthroughFd >= 0 {
+		_ = syscall.Close(f.passthroughFd)
+	}
+	// Record the fd so Release can close it when the kernel drops the handle.
+	f.passthroughFd = fd
+	return fd, true
 }
 
 var _ fusefs.FilePassthroughFder = (*FileHandle)(nil)
