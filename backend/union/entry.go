@@ -219,9 +219,11 @@ func (d *Directory) ModTime(ctx context.Context) (t time.Time) {
 	return t
 }
 
-// Fd returns the Fd of the Object
-//
-// It should return fs.ErrorNotImplemented if it's not available
+// Fd returns a caller-owned file descriptor by delegating to the wrapped
+// Object. The fd lifecycle contract (caller MUST close exactly once when
+// non-zero and nil error is returned) propagates unchanged to this wrapper's
+// caller. Returns (0, fs.ErrorNotImplemented) if the wrapped Object does not
+// implement fs.Fder.
 func (o *Object) Fd(ctx context.Context, flags int) (uintptr, error) {
 	do, ok := o.Object.Object.(fs.Fder)
 	if !ok {

@@ -289,7 +289,7 @@ func (n *Node) Readdir(ctx context.Context) (ds fusefs.DirStream, errno syscall.
 			Mode: getMode(n),
 
 			// Name is the basename of the file in the directory.
-			Name: path.Base(n.Name()),
+			Name: n.Name(),
 
 			// Ino is the inode number.
 			Ino: 0, // FIXME
