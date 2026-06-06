@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sync"
 	"testing"
+	"time"
 	"unsafe"
 
 	"github.com/rclone/rclone/fs"
@@ -17,6 +19,23 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+type recordingContentInvalidator struct {
+	mu    sync.Mutex
+	calls []*File
+}
+
+func (ci *recordingContentInvalidator) InvalidateContent(file *File) {
+	ci.mu.Lock()
+	defer ci.mu.Unlock()
+	ci.calls = append(ci.calls, file)
+}
+
+func (ci *recordingContentInvalidator) callsSnapshot() []*File {
+	ci.mu.Lock()
+	defer ci.mu.Unlock()
+	return append([]*File(nil), ci.calls...)
+}
 
 func fileCreate(t *testing.T, mode vfscommon.CacheMode) (r *fstest.Run, vfs *VFS, fh *File, item fstest.Item) {
 	opt := vfscommon.Opt
@@ -226,6 +245,123 @@ func TestFileOpenReadUnknownSize(t *testing.T) {
 	assert.Equal(t, int64(len(contents)), fd.Size())
 
 	require.NoError(t, fd.Close())
+}
+
+func newTestSymlinkObject(t *testing.T, remote, target string, modTime time.Time) *mockobject.ContentMockObject {
+	t.Helper()
+	o := mockobject.New(remote+fs.LinkSuffix).WithContent([]byte(target), mockobject.SeekModeNone)
+	require.NoError(t, o.SetModTime(context.Background(), modTime))
+	return o
+}
+
+func newTestRegularObject(t *testing.T, remote, contents string, modTime time.Time) *mockobject.ContentMockObject {
+	t.Helper()
+	o := mockobject.New(remote).WithContent([]byte(contents), mockobject.SeekModeNone)
+	require.NoError(t, o.SetModTime(context.Background(), modTime))
+	return o
+}
+
+func newTestSymlinkFile(t *testing.T, initialTarget string) (*VFS, *File) {
+	t.Helper()
+	ctx := context.Background()
+	fMock, err := mockfs.NewFs(ctx, "test", "root", nil)
+	require.NoError(t, err)
+	f := fMock.(*mockfs.Fs)
+	f.AddObject(newTestSymlinkObject(t, "link", initialTarget, t1))
+
+	opt := vfscommon.Opt
+	opt.Links = true
+	opt.FastFingerprint = true
+	vfs := New(ctx, f, &opt)
+	t.Cleanup(func() {
+		cleanupVFS(t, vfs)
+	})
+
+	node, err := vfs.Stat("link")
+	require.NoError(t, err)
+	file, ok := node.(*File)
+	require.True(t, ok, "node is %T", node)
+	require.True(t, file.IsSymlink())
+	return vfs, file
+}
+
+func newTestRegularFile(t *testing.T, initialContents string) (*VFS, *File) {
+	t.Helper()
+	ctx := context.Background()
+	fMock, err := mockfs.NewFs(ctx, "test", "root", nil)
+	require.NoError(t, err)
+	f := fMock.(*mockfs.Fs)
+	f.AddObject(newTestRegularObject(t, "file", initialContents, t1))
+
+	opt := vfscommon.Opt
+	opt.Links = true
+	opt.FastFingerprint = true
+	vfs := New(ctx, f, &opt)
+	t.Cleanup(func() {
+		cleanupVFS(t, vfs)
+	})
+
+	node, err := vfs.Stat("file")
+	require.NoError(t, err)
+	file, ok := node.(*File)
+	require.True(t, ok, "node is %T", node)
+	require.False(t, file.IsSymlink())
+	return vfs, file
+}
+
+func TestFileSetObjectNoUpdateContentInvalidationGate(t *testing.T) {
+	for _, tc := range []struct {
+		name             string
+		setup            func(*testing.T) (*VFS, *File, fs.Object)
+		wantInvalidation bool
+	}{
+		{
+			name: "changed target invalidates",
+			setup: func(t *testing.T) (*VFS, *File, fs.Object) {
+				vfs, file := newTestSymlinkFile(t, "target-1")
+				return vfs, file, newTestSymlinkObject(t, "link", "target-2", t2)
+			},
+			wantInvalidation: true,
+		},
+		{
+			name: "unchanged target does not invalidate",
+			setup: func(t *testing.T) (*VFS, *File, fs.Object) {
+				vfs, file := newTestSymlinkFile(t, "target-1")
+				return vfs, file, newTestSymlinkObject(t, "link", "target-1", t1)
+			},
+		},
+		{
+			name: "same-size same-modtime retarget does not invalidate",
+			setup: func(t *testing.T) (*VFS, *File, fs.Object) {
+				vfs, file := newTestSymlinkFile(t, "target-1")
+				// Symlink invalidation always uses size+modtime.
+				return vfs, file, newTestSymlinkObject(t, "link", "target-2", t1)
+			},
+		},
+		{
+			name: "non-symlink does not invalidate",
+			setup: func(t *testing.T) (*VFS, *File, fs.Object) {
+				vfs, file := newTestRegularFile(t, "contents-1")
+				return vfs, file, newTestRegularObject(t, "file", "contents-2", t2)
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			vfs, file, next := tc.setup(t)
+			invalidator := &recordingContentInvalidator{}
+			vfs.SetContentInvalidator(new(int), invalidator)
+
+			check := file.setObjectNoUpdate(next)
+			invalidateChangedContent(invalidator, []contentInvalidationCheck{check})
+
+			calls := invalidator.callsSnapshot()
+			if tc.wantInvalidation {
+				require.Equal(t, []*File{file}, calls)
+				return
+			}
+			require.Empty(t, calls)
+		})
+	}
 }
 
 func TestFileOpenWrite(t *testing.T) {

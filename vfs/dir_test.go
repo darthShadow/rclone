@@ -16,6 +16,7 @@ import (
 	"github.com/rclone/rclone/fs/filter"
 	"github.com/rclone/rclone/fs/operations"
 	"github.com/rclone/rclone/fstest"
+	"github.com/rclone/rclone/vfs/vfscommon"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -206,6 +207,58 @@ func TestDirReadDirPrunesRemovedCachedEntries(t *testing.T) {
 	require.Len(t, calls[0], 1, "expected one prune victim for dropped prunable node, got %d", len(calls[0]))
 	assert.Same(t, dropped, calls[0][0], "expected refresh removal to prune the dropped cached node")
 	assert.Equal(t, "dir/file1", calls[0][0].Path())
+}
+
+func TestDirReadDirInvalidatesChangedSymlinkContent(t *testing.T) {
+	for _, tc := range []struct {
+		name             string
+		nextTarget       string
+		nextModTime      time.Time
+		wantInvalidation bool
+	}{
+		{name: "changed", nextTarget: "target-2", nextModTime: t2, wantInvalidation: true},
+		{name: "unchanged", nextTarget: "target-1", nextModTime: t1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			opt := vfscommon.Opt
+			opt.Links = true
+			opt.FastFingerprint = true
+			r, vfs := newTestVFSOpt(t, &opt)
+
+			r.WriteObject(context.Background(), "dir/link"+fs.LinkSuffix, "target-1", t1)
+			node, err := vfs.Stat("dir")
+			require.NoError(t, err)
+			dir := node.(*Dir)
+			_, err = dir.ReadDirAll()
+			require.NoError(t, err)
+
+			link := requireDirFile(t, dir, "link")
+			require.True(t, link.IsSymlink())
+
+			owner1, owner2 := new(int), new(int)
+			invalidator1, invalidator2 := &recordingContentInvalidator{}, &recordingContentInvalidator{}
+			vfs.SetContentInvalidator(owner1, invalidator1)
+			vfs.SetContentInvalidator(owner2, invalidator2)
+			r.WriteObject(context.Background(), "dir/link"+fs.LinkSuffix, tc.nextTarget, tc.nextModTime)
+
+			require.NoError(t, dir.readDir())
+
+			calls := invalidator1.callsSnapshot()
+			require.Equal(t, calls, invalidator2.callsSnapshot())
+			if tc.wantInvalidation {
+				require.Equal(t, []*File{link}, calls)
+			} else {
+				require.Empty(t, calls)
+			}
+
+			vfs.SetContentInvalidator(owner1, nil)
+			r.WriteObject(context.Background(), "dir/link"+fs.LinkSuffix, "target-3", t3)
+			require.NoError(t, dir.readDir())
+
+			require.Equal(t, calls, invalidator1.callsSnapshot())
+			require.Equal(t, append(calls, link), invalidator2.callsSnapshot())
+		})
+	}
 }
 
 func TestDirForgetAllSkipsPrunerWhenVirtual(t *testing.T) {

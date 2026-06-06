@@ -568,13 +568,56 @@ func (f *File) setObject(o fs.Object) {
 
 // Update the object but don't update the directory cache - for use by
 // the directory cache
-func (f *File) setObjectNoUpdate(o fs.Object) {
+func (f *File) setObjectNoUpdate(o fs.Object) contentInvalidationCheck {
 	f.mu.Lock()
+	prev := f.o
+	wasLink := f.isLink
 	f.o = o
 	f._setIsLink()
+	isLink := f.isLink
 	f.virtualModTime = nil
 	fs.Debugf(f._path(), "Reset virtual modtime")
+	vfs := f.d.vfs
+	ctx := vfs.ctx
 	f.mu.Unlock()
+
+	return contentInvalidationCheck{
+		file:    f,
+		prev:    prev,
+		next:    o,
+		wasLink: wasLink,
+		isLink:  isLink,
+		ctx:     ctx,
+	}
+}
+
+type contentInvalidationCheck struct {
+	file    *File
+	prev    fs.Object
+	next    fs.Object
+	wasLink bool
+	isLink  bool
+	ctx     context.Context
+}
+
+func (c contentInvalidationCheck) changed() bool {
+	if c.file == nil || (!c.wasLink && !c.isLink) || c.prev == nil || c.next == nil {
+		return false
+	}
+	// Symlink content invalidation is size+modtime only on all backends:
+	// never content hash and never backend I/O.
+	return c.prev.Size() != c.next.Size() || !c.prev.ModTime(c.ctx).Equal(c.next.ModTime(c.ctx))
+}
+
+func invalidateChangedContent(ci ContentInvalidator, checks []contentInvalidationCheck) {
+	if ci == nil || len(checks) == 0 {
+		return
+	}
+	for _, check := range checks {
+		if check.changed() {
+			ci.InvalidateContent(check.file)
+		}
+	}
 }
 
 // Get the current fs.Object - may be nil

@@ -53,7 +53,7 @@ func (f *countingStatFs) Stat(ctx context.Context, dir string, leaf string) (fs.
 	if stater, ok := f.Fs.(fs.Stater); ok {
 		return stater.Stat(ctx, dir, leaf)
 	}
-	return f.Fs.NewObject(ctx, remote)
+	return f.NewObject(ctx, remote)
 }
 
 func (f *countingStatFs) statCount(remote string) int {
@@ -204,15 +204,52 @@ func TestMount2NotifyPruneSharedVFS(t *testing.T) {
 }
 
 var _ fs.Stater = (*countingStatFs)(nil)
-var _ vfs.Pruner = (*FS)(nil)
 
 type mount2NodeFixture struct {
-	ctx  context.Context
-	fsys *FS
-	root *Node
-	vfs  *vfs.VFS
-	dir  *vfs.Dir
-	node map[string]*Node
+	ctx       context.Context
+	fsys      *FS
+	root      *Node
+	vfs       *vfs.VFS
+	dir       *vfs.Dir
+	node      map[string]*Node
+	rawFS     fuse.RawFileSystem
+	callbacks *recordingServerCallbacks
+}
+
+type recordingServerCallbacks struct {
+	mu         sync.Mutex
+	inodeCalls int
+}
+
+var _ fusefs.ServerCallbacks = (*recordingServerCallbacks)(nil)
+
+func (*recordingServerCallbacks) DeleteNotify(uint64, uint64, string) fuse.Status {
+	return fuse.OK
+}
+
+func (*recordingServerCallbacks) EntryNotify(uint64, string) fuse.Status {
+	return fuse.OK
+}
+
+func (c *recordingServerCallbacks) InodeNotify(uint64, int64, int64) fuse.Status {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.inodeCalls++
+	return fuse.OK
+}
+
+func (*recordingServerCallbacks) InodeRetrieveCache(uint64, int64, []byte) (int, fuse.Status) {
+	return 0, fuse.OK
+}
+
+func (*recordingServerCallbacks) InodeNotifyStoreCache(uint64, int64, []byte) fuse.Status {
+	return fuse.OK
+}
+
+func (c *recordingServerCallbacks) inodeCallCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.inodeCalls
 }
 
 func newMount2NodeFixture(t *testing.T, names ...string) *mount2NodeFixture {
@@ -236,15 +273,21 @@ func newMount2NodeFixture(t *testing.T, names ...string) *mount2NodeFixture {
 	require.NoError(t, err)
 	root := newNode(fsys, rootDir)
 	fsys.root = root
-	fusefs.NewNodeFS(root, &fusefs.Options{})
+	callbacks := &recordingServerCallbacks{}
+	rawFS := fusefs.NewNodeFS(root, &fusefs.Options{
+		ServerCallbacks: callbacks,
+		RootStableAttr:  &fusefs.StableAttr{Ino: rootDir.Inode()},
+	})
 
 	fixture := &mount2NodeFixture{
-		ctx:  ctx,
-		fsys: fsys,
-		root: root,
-		vfs:  VFS,
-		dir:  rootDir,
-		node: make(map[string]*Node, len(names)),
+		ctx:       ctx,
+		fsys:      fsys,
+		root:      root,
+		vfs:       VFS,
+		dir:       rootDir,
+		node:      make(map[string]*Node, len(names)),
+		rawFS:     rawFS,
+		callbacks: callbacks,
 	}
 	for _, name := range names {
 		vfsNode, err := rootDir.Stat(name)
@@ -327,6 +370,62 @@ func TestFSPruneCandidates(t *testing.T) {
 		unattached,
 	})
 	require.Equal(t, []*fusefs.Inode{sharedB.EmbeddedInode(), bOnlyB.EmbeddedInode()}, got)
+}
+
+func TestFSInvalidateContentOwnership(t *testing.T) {
+	fixture := newMount2NodeFixture(t, "shared", "a-only")
+
+	mountOpt := mountlib.Opt
+	fsysB := NewFS(fixture.vfs, &mountOpt)
+	rootB := newNode(fsysB, fixture.dir)
+	fsysB.root = rootB
+	callbacksB := &recordingServerCallbacks{}
+	fusefs.NewNodeFS(rootB, &fusefs.Options{ServerCallbacks: callbacksB})
+
+	sharedNode, err := fixture.dir.Stat("shared")
+	require.NoError(t, err)
+	shared := sharedNode.(*vfs.File)
+	sharedB := attachMount2Node(fixture.ctx, t, fsysB, rootB, shared)
+	shared.SetSys(sharedB)
+
+	fixture.fsys.InvalidateContent(shared)
+	require.Equal(t, 1, fixture.callbacks.inodeCallCount())
+	require.Zero(t, callbacksB.inodeCallCount())
+
+	aOnlyNode, err := fixture.dir.Stat("a-only")
+	require.NoError(t, err)
+	aOnly := aOnlyNode.(*vfs.File)
+	aOnly.SetSys(fixture.node["a-only"])
+
+	fsysB.InvalidateContent(aOnly)
+	require.Equal(t, 1, fixture.callbacks.inodeCallCount())
+	require.Zero(t, callbacksB.inodeCallCount())
+}
+
+func TestFSInvalidateContentSkipsUnannouncedInode(t *testing.T) {
+	fixture := newMount2NodeFixture(t, "attached", "unannounced")
+
+	attachedNode, err := fixture.dir.Stat("attached")
+	require.NoError(t, err)
+	fixture.fsys.InvalidateContent(attachedNode.(*vfs.File))
+	require.Equal(t, 1, fixture.callbacks.inodeCallCount())
+
+	unannouncedNode, err := fixture.dir.Stat("unannounced")
+	require.NoError(t, err)
+	unannounced := unannouncedNode.(*vfs.File)
+	unannounced.SetAux(fixture.fsys, nil)
+	node := newNode(fixture.fsys, unannounced)
+	var out fuse.EntryOut
+	fixture.fsys.setEntryOut(unannounced, &out)
+	inode := fixture.root.NewInode(fixture.ctx, node, fusefs.StableAttr{
+		Mode: out.Attr.Mode,
+		Ino:  unannounced.Inode(),
+	})
+	_, parent := inode.Parent()
+	require.Nil(t, parent)
+
+	fixture.fsys.InvalidateContent(unannounced)
+	require.Equal(t, 1, fixture.callbacks.inodeCallCount())
 }
 
 func TestNotifySupport(t *testing.T) {
@@ -419,6 +518,87 @@ type foreignInodeNode struct {
 }
 
 var _ fusefs.InodeEmbedder = (*foreignInodeNode)(nil)
+
+type synchronizedAuxNode struct {
+	*vfs.File
+
+	attachAttempt chan struct{}
+	releaseAttach chan struct{}
+}
+
+func (n *synchronizedAuxNode) waitForAttach() {
+	n.attachAttempt <- struct{}{}
+	<-n.releaseAttach
+}
+
+func (n *synchronizedAuxNode) SetAux(owner, value any) {
+	n.waitForAttach()
+	n.File.SetAux(owner, value)
+}
+
+func (n *synchronizedAuxNode) LoadOrStoreAux(owner, value any) (actual any, loaded bool) {
+	n.waitForAttach()
+	return n.File.LoadOrStoreAux(owner, value)
+}
+
+func TestNewNodeConcurrentFirstLookupKeepsLiveMapping(t *testing.T) {
+	fixture := newMount2NodeFixture(t)
+	require.NoError(t, fixture.vfs.AddVirtual("file1", 1, false))
+	vfsNode, err := fixture.dir.Stat("file1")
+	require.NoError(t, err)
+	vfsFile, ok := vfsNode.(*vfs.File)
+	require.True(t, ok, "node is %T", vfsNode)
+	wrapped := &synchronizedAuxNode{
+		File:          vfsFile,
+		attachAttempt: make(chan struct{}),
+		releaseAttach: make(chan struct{}),
+	}
+
+	nodes := make([]*Node, 2)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := range nodes {
+		wg.Go(func() {
+			<-start
+			nodes[i] = newNode(fixture.fsys, wrapped)
+		})
+	}
+	close(start)
+	var releaseOnce sync.Once
+	release := func() {
+		releaseOnce.Do(func() { close(wrapped.releaseAttach) })
+	}
+	defer release()
+	for attempt := range 2 {
+		select {
+		case <-wrapped.attachAttempt:
+		case <-time.After(time.Second):
+			t.Fatalf("attachment attempts = %d, want 2", attempt)
+		}
+	}
+	release()
+	wg.Wait()
+
+	require.Same(t, nodes[0], nodes[1], "concurrent first lookups returned different bridge nodes")
+	stable := fusefs.StableAttr{Mode: fuse.S_IFREG, Ino: vfsNode.Inode()}
+	inode := fixture.root.NewInode(fixture.ctx, nodes[0], stable)
+	require.True(t, fixture.root.EmbeddedInode().AddChild("racing-file", inode, false))
+	require.Same(t, nodes[0], fixture.fsys.nodeFor(wrapped), "auxiliary slot does not resolve the live bridge node")
+	require.Equal(t, stable, inode.StableAttr())
+}
+
+func TestNewNodeUnexpectedAuxValueReturnsCandidate(t *testing.T) {
+	fixture := newMount2NodeFixture(t)
+	require.NoError(t, fixture.vfs.AddVirtual("file1", 1, false))
+	vfsNode, err := fixture.dir.Stat("file1")
+	require.NoError(t, err)
+	unexpected := new(int)
+	vfsNode.SetAux(fixture.fsys, unexpected)
+
+	node := newNode(fixture.fsys, vfsNode)
+	require.NotNil(t, node)
+	require.Same(t, unexpected, vfsNode.Aux(fixture.fsys), "unexpected auxiliary value should be preserved")
+}
 
 func TestNodeLookupChildFallback(t *testing.T) {
 	for _, tc := range []struct {
@@ -695,6 +875,82 @@ func TestMount2OpendirHandleStaleness(t *testing.T) {
 	require.Equal(t, syscall.ENOENT, errno, "handle Lookup should reflect external removal")
 }
 
+func TestMount2OpendirHandleLookupUsesVFSInode(t *testing.T) {
+	fixture := newMount2NodeFixture(t)
+	require.NoError(t, fixture.vfs.AddVirtual("file1", 1, false))
+	vfsNode, err := fixture.dir.Stat("file1")
+	require.NoError(t, err)
+
+	handle := &mount2DirHandle{parent: fixture.root, dir: fixture.dir}
+	var out fuse.EntryOut
+	inode, errno := handle.Lookup(fixture.ctx, "file1", &out)
+	require.Equal(t, syscall.Errno(0), errno, "handle Lookup errno")
+	require.NotNil(t, inode)
+	assert.Equal(t, vfsNode.Inode(), out.Attr.Ino)
+	assert.Equal(t, vfsNode.Inode(), inode.StableAttr().Ino)
+}
+
+func assertMount2DirectoryReadInodes(ctx context.Context, t *testing.T, node *Node, wantSelf, wantParent uint64) {
+	t.Helper()
+	stream, errno := node.Readdir(ctx)
+	require.Equal(t, syscall.Errno(0), errno, "Readdir errno")
+	defer stream.Close()
+	dot, errno := stream.Next()
+	require.Equal(t, syscall.Errno(0), errno, "Readdir dot errno")
+	assert.Equal(t, ".", dot.Name)
+	assert.Equal(t, wantSelf, dot.Ino)
+	dotDot, errno := stream.Next()
+	require.Equal(t, syscall.Errno(0), errno, "Readdir dot-dot errno")
+	assert.Equal(t, "..", dotDot.Name)
+	assert.Equal(t, wantParent, dotDot.Ino)
+
+	fh, _, errno := node.OpendirHandle(ctx, 0)
+	require.Equal(t, syscall.Errno(0), errno, "OpendirHandle errno")
+	handle, ok := fh.(*mount2DirHandle)
+	require.True(t, ok, "handle is %T", fh)
+	defer handle.Releasedir(ctx, 0)
+	handleDot, errno := handle.Readdirent(ctx)
+	require.Equal(t, syscall.Errno(0), errno, "handle dot errno")
+	require.NotNil(t, handleDot)
+	assert.Equal(t, ".", handleDot.Name)
+	assert.Equal(t, wantSelf, handleDot.Ino)
+	handleDotDot, errno := handle.Readdirent(ctx)
+	require.Equal(t, syscall.Errno(0), errno, "handle dot-dot errno")
+	require.NotNil(t, handleDotDot)
+	assert.Equal(t, "..", handleDotDot.Name)
+	assert.Equal(t, wantParent, handleDotDot.Ino)
+}
+
+func TestMount2DirectoryReadInodes(t *testing.T) {
+	fixture := newMount2NodeFixture(t)
+	rootInode := fixture.dir.Inode()
+	require.NotZero(t, rootInode)
+
+	assertMount2DirectoryReadInodes(fixture.ctx, t, fixture.root, rootInode, rootInode)
+
+	var out fuse.AttrOut
+	status := fixture.rawFS.GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{NodeId: 1}}, &out)
+	require.Equal(t, fuse.OK, status, "root GetAttr status")
+	assert.Equal(t, rootInode, out.Ino)
+
+	require.NoError(t, fixture.vfs.AddVirtual("dir", 0, true))
+	vfsNode, err := fixture.dir.Stat("dir")
+	require.NoError(t, err)
+	vfsDir, ok := vfsNode.(*vfs.Dir)
+	require.True(t, ok, "node is %T", vfsNode)
+	dirNode := attachMount2Node(fixture.ctx, t, fixture.fsys, fixture.root, vfsDir)
+	assertMount2DirectoryReadInodes(fixture.ctx, t, dirNode, vfsDir.Inode(), rootInode)
+
+	require.NoError(t, fixture.vfs.AddVirtual("detached", 0, true))
+	vfsNode, err = fixture.dir.Stat("detached")
+	require.NoError(t, err)
+	vfsDir, ok = vfsNode.(*vfs.Dir)
+	require.True(t, ok, "node is %T", vfsNode)
+	detached := newNode(fixture.fsys, vfsDir)
+	fixture.root.NewInode(fixture.ctx, detached, fusefs.StableAttr{Mode: fuse.S_IFDIR, Ino: vfsDir.Inode()})
+	assert.Zero(t, detached.parentDirEntryInode(), "detached node should not report itself as its parent")
+}
+
 func TestMount2OpendirHandleVirtualEntries(t *testing.T) {
 	fixture := newMountedLocalFixture(t, map[string]string{
 		"file1": "file1",
@@ -738,24 +994,29 @@ func TestMount2OpendirHandleConcurrent(t *testing.T) {
 
 func TestMountOptionsSyncRead(t *testing.T) {
 	for _, tc := range []struct {
-		name         string
-		asyncRead    bool
-		wantSyncRead bool
+		name                     string
+		asyncRead                bool
+		links                    bool
+		wantSyncRead             bool
+		wantEnableSymlinkCaching bool
 	}{
-		{name: "async read enabled", asyncRead: true, wantSyncRead: false},
-		{name: "async read disabled", asyncRead: false, wantSyncRead: true},
+		{name: "async read enabled without links", asyncRead: true, wantSyncRead: false},
+		{name: "async read disabled without links", asyncRead: false, wantSyncRead: true},
+		{name: "async read enabled with links", asyncRead: true, links: true, wantSyncRead: false, wantEnableSymlinkCaching: true},
+		{name: "async read disabled with links", asyncRead: false, links: true, wantSyncRead: true, wantEnableSymlinkCaching: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			mountOpt := mountlib.Opt
 			mountOpt.AsyncRead = tc.asyncRead
 			fsys := &FS{
-				VFS: &vfs.VFS{},
+				VFS: &vfs.VFS{Opt: vfscommon.Options{Links: tc.links}},
 				opt: &mountOpt,
 			}
 
 			got := mountOptions(fsys, nil, &mountOpt)
 
 			assert.Equal(t, tc.wantSyncRead, got.SyncRead)
+			assert.Equal(t, tc.wantEnableSymlinkCaching, got.EnableSymlinkCaching)
 		})
 	}
 }

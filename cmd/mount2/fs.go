@@ -122,6 +122,30 @@ func (f *FS) PruneInodes(victims []vfs.Node) {
 	}
 }
 
+// InvalidateContent converts a VFS file to its mount2 inode and issues a
+// best-effort whole-content invalidation for cached symlink targets.
+func (f *FS) InvalidateContent(file *vfs.File) {
+	if file == nil || f.root == nil {
+		return
+	}
+	node := f.nodeFor(file)
+	if node == nil {
+		return
+	}
+	inode := node.EmbeddedInode()
+	if inode == nil {
+		return
+	}
+	if _, parent := inode.Parent(); parent == nil {
+		return // never entered this bridge's tree, so it has no nodeId
+	}
+
+	// Kernel len <= 0 means invalidate to EOF, so (0, 0) is whole-content invalidation.
+	if errno := inode.NotifyContent(0, 0); errno != 0 && errno != syscall.ENOSYS {
+		fs.Debugf(f.f, "NotifyContent: %q, errno=%v", file.Path(), errno)
+	}
+}
+
 // SetDebug if called, provide debug output through the log package.
 func (f *FS) SetDebug(debug bool) {
 	fs.Debugf(f.f, "SetDebug %v", debug)
@@ -218,3 +242,6 @@ func translateError(err error) syscall.Errno {
 	fs.Errorf(nil, "IO error: %v", err)
 	return syscall.EIO
 }
+
+var _ vfs.ContentInvalidator = (*FS)(nil)
+var _ vfs.Pruner = (*FS)(nil)

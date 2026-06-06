@@ -294,6 +294,13 @@ Note that `--local-links` just enables this feature for the local
 backend. `--links` and `-l` enable the feature for all supported
 backends and the VFS.
 
+On `mount2`, `--links` enables kernel symlink caching when the kernel
+supports it. rclone invalidates cached symlink content after a VFS
+directory refresh observes a changed symlink backing object by its
+size and modtime, never a content hash. Same-size retargets with the
+same modtime may not be detected. Removed entries continue to clear
+through the normal prune path.
+
 Note that this flag is incompatible with `-copy-links` / `-L`.
 
 #### Symlink targets and the destination

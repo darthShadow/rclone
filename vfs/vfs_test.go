@@ -80,6 +80,32 @@ func containsSamePruner(pruners []Pruner, want Pruner) bool {
 	return false
 }
 
+func requireSameContentInvalidators(t *testing.T, want, got []ContentInvalidator) {
+	t.Helper()
+	require.Len(t, got, len(want), "got content invalidators %v", got)
+	matched := make([]bool, len(got))
+	for _, wantInvalidator := range want {
+		found := false
+		for i, gotInvalidator := range got {
+			if !matched[i] && gotInvalidator == wantInvalidator {
+				matched[i] = true
+				found = true
+				break
+			}
+		}
+		require.Truef(t, found, "missing content invalidator %T %p from snapshot %v", wantInvalidator, wantInvalidator, got)
+	}
+}
+
+func containsSameContentInvalidator(invalidators []ContentInvalidator, want ContentInvalidator) bool {
+	for _, invalidator := range invalidators {
+		if invalidator == want {
+			return true
+		}
+	}
+	return false
+}
+
 // TestMain drives the tests
 func TestMain(m *testing.M) {
 	fstest.TestMain(m)
@@ -191,6 +217,91 @@ func TestVFSPrunerConcurrent(t *testing.T) {
 	}
 	wg.Wait()
 	require.Empty(t, vfs.pruners())
+}
+
+func TestVFSContentInvalidator(t *testing.T) {
+	var vfs VFS
+	owner1, owner2, absentOwner := new(int), new(int), new(int)
+	ci1, ci2, replacement := &recordingContentInvalidator{}, &recordingContentInvalidator{}, &recordingContentInvalidator{}
+
+	require.Empty(t, vfs.contentInvalidators())
+
+	for _, test := range []struct {
+		name  string
+		owner any
+		set   ContentInvalidator
+		want  []ContentInvalidator
+	}{
+		{
+			name:  "SetFirstOwner",
+			owner: owner1,
+			set:   ci1,
+			want:  []ContentInvalidator{ci1},
+		},
+		{
+			name:  "SetSecondOwner",
+			owner: owner2,
+			set:   ci2,
+			want:  []ContentInvalidator{ci1, ci2},
+		},
+		{
+			name:  "ReplaceFirstOwner",
+			owner: owner1,
+			set:   replacement,
+			want:  []ContentInvalidator{replacement, ci2},
+		},
+		{
+			name:  "RemoveAbsentOwner",
+			owner: absentOwner,
+			want:  []ContentInvalidator{replacement, ci2},
+		},
+		{
+			name:  "RemoveFirstOwner",
+			owner: owner1,
+			want:  []ContentInvalidator{ci2},
+		},
+		{
+			name:  "RemoveLastOwner",
+			owner: owner2,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			vfs.SetContentInvalidator(test.owner, test.set)
+			requireSameContentInvalidators(t, test.want, vfs.contentInvalidators())
+		})
+	}
+
+	vfs.SetContentInvalidator(owner1, ci1)
+	vfs.SetContentInvalidator(owner2, ci2)
+	snapshot := vfs.contentInvalidators()
+	require.Len(t, snapshot, 2)
+	snapshot[0] = nil
+	requireSameContentInvalidators(t, []ContentInvalidator{ci1, ci2}, vfs.contentInvalidators())
+}
+
+func TestVFSContentInvalidatorConcurrent(t *testing.T) {
+	const (
+		owners     = 4
+		iterations = 100
+	)
+	var (
+		vfs VFS
+		wg  sync.WaitGroup
+	)
+	for i := range owners {
+		wg.Go(func() {
+			owner := &i
+			invalidator := &recordingContentInvalidator{}
+			for range iterations {
+				vfs.SetContentInvalidator(owner, invalidator)
+				snapshot := vfs.contentInvalidators()
+				assert.Truef(t, containsSameContentInvalidator(snapshot, invalidator), "missing registered content invalidator %p from snapshot %v", invalidator, snapshot)
+				vfs.SetContentInvalidator(owner, nil)
+			}
+		})
+	}
+	wg.Wait()
+	require.Empty(t, vfs.contentInvalidators())
 }
 
 // Check baseHandle performs as advertised

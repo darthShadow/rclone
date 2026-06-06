@@ -336,6 +336,15 @@ func (d *Dir) invalidateDir(absPath string) {
 		if !dir.read.IsZero() {
 			fs.Debugf(dir.path, "invalidating directory cache")
 			dir.read = time.Time{}
+		}
+		// Per-leaf stat freshness is a separate cache domain from the
+		// directory-wide read clock: the single-file stat path records
+		// statRead entries without ever setting read, so a directory can sit
+		// at read == 0 with live statRead entries. Invalidation must always
+		// drop statRead, otherwise ForgetPath cannot force a re-read. Skip the
+		// reset when there is nothing cached so a change-notification storm on
+		// an idle directory does not allocate a fresh map each time.
+		if len(dir.statRead) > 0 {
 			dir.resetStatRead(false)
 		}
 		dir.mu.Unlock()
@@ -574,6 +583,9 @@ func (d *Dir) AddVirtual(leaf string, size int64, isDir bool) {
 func (d *Dir) delObject(leaf string) {
 	d.mu.Lock()
 	delete(d.items, leaf)
+	// Drop any per-leaf stat freshness so a later stat cannot report the
+	// removed item as still-known (statRead must never outlive its item).
+	delete(d.statRead, leaf)
 	if d.virtual == nil {
 		d.virtual = make(map[string]vState)
 	}
@@ -669,7 +681,10 @@ func (d *Dir) _readDir() error {
 	// Atomic state update
 	pruners := d.vfs.pruners()
 	collectPrune := len(pruners) != 0
+	contentInvalidators := d.vfs.contentInvalidators()
+	collectContentInvalidation := len(contentInvalidators) != 0
 	var victims []Node
+	var contentInvalidations []contentInvalidationCheck
 	err = func() error {
 		d.mu.Lock()
 		defer d.mu.Unlock()
@@ -680,7 +695,7 @@ func (d *Dir) _readDir() error {
 		}
 
 		// Apply changes
-		victims, err = d._readDirFromEntries(entries, nil, time.Time{}, collectPrune)
+		victims, contentInvalidations, err = d._readDirFromEntries(entries, nil, time.Time{}, collectPrune, collectContentInvalidation)
 		if err != nil {
 			return err
 		}
@@ -695,6 +710,7 @@ func (d *Dir) _readDir() error {
 		return err
 	}
 
+	invalidateChangedContent(contentInvalidators, contentInvalidations)
 	if len(victims) > 0 {
 		for _, pruner := range pruners {
 			pruner.PruneInodes(victims)
@@ -706,8 +722,8 @@ func (d *Dir) _readDir() error {
 
 // update d.items for each dir in the DirTree below this one and
 // set the last read time - must be called with the lock held
-func (d *Dir) _readDirFromDirTree(dirTree dirtree.DirTree, when time.Time, collectPrune bool) (victims []Node, err error) {
-	return d._readDirFromEntries(dirTree[d.path], dirTree, when, collectPrune)
+func (d *Dir) _readDirFromDirTree(dirTree dirtree.DirTree, when time.Time, collectPrune, collectContentInvalidation bool) (victims []Node, contentInvalidations []contentInvalidationCheck, err error) {
+	return d._readDirFromEntries(dirTree[d.path], dirTree, when, collectPrune, collectContentInvalidation)
 }
 
 // Remove the virtual directory entry leaf
@@ -851,17 +867,17 @@ func (mv manageVirtuals) end(d *Dir, collectPrune bool) (victims []Node) {
 	return victims
 }
 
-func (d *Dir) _processEntry(entry fs.DirEntry, mv manageVirtuals, dirTree dirtree.DirTree, when time.Time, collectPrune bool) (victims []Node, err error) {
+func (d *Dir) _processEntry(entry fs.DirEntry, mv manageVirtuals, dirTree dirtree.DirTree, when time.Time, collectPrune, collectContentInvalidation bool) (victims []Node, contentInvalidations []contentInvalidationCheck, err error) {
 	entryName := path.Base(entry.Remote())
 	if entryName == "." || entryName == ".." {
-		return nil, nil
+		return nil, nil, nil
 	}
 	if d.vfs.Opt.Links {
 		entryName, _ = strings.CutSuffix(entryName, fs.LinkSuffix)
 	}
 
 	if mv != nil && mv.add(d, entryName) {
-		return nil, nil
+		return nil, nil, nil
 	}
 
 	node := d.items[entryName]
@@ -872,7 +888,10 @@ func (d *Dir) _processEntry(entry fs.DirEntry, mv manageVirtuals, dirTree dirtre
 		obj := item
 		// Reuse old file value if it exists
 		if file, ok := node.(*File); node != nil && ok {
-			file.setObjectNoUpdate(obj)
+			contentInvalidation := file.setObjectNoUpdate(obj)
+			if collectContentInvalidation && (contentInvalidation.wasLink || contentInvalidation.isLink) {
+				contentInvalidations = append(contentInvalidations, contentInvalidation)
+			}
 		} else {
 			node = newFile(d, d.path, obj, entryName)
 		}
@@ -890,7 +909,7 @@ func (d *Dir) _processEntry(entry fs.DirEntry, mv manageVirtuals, dirTree dirtre
 		dir.resetStatRead(true)
 
 		if dirTree != nil {
-			victims, err = dir._readDirFromDirTree(dirTree, when, collectPrune)
+			victims, contentInvalidations, err = dir._readDirFromDirTree(dirTree, when, collectPrune, collectContentInvalidation)
 			if err != nil {
 				dir.read = time.Time{}
 			} else {
@@ -901,30 +920,31 @@ func (d *Dir) _processEntry(entry fs.DirEntry, mv manageVirtuals, dirTree dirtre
 
 		dir.mu.Unlock()
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 
 	default:
-		return nil, fmt.Errorf("unknown type: %T", item)
+		return nil, nil, fmt.Errorf("unknown type: %T", item)
 	}
 
 	d.items[entryName] = node
-	return victims, nil
+	return victims, contentInvalidations, nil
 }
 
 // update d.items and if dirTree is not nil update each dir in the DirTree below this one and
 // set the last read time - must be called with the lock held
-func (d *Dir) _readDirFromEntries(entries fs.DirEntries, dirTree dirtree.DirTree, when time.Time, collectPrune bool) (victims []Node, err error) {
+func (d *Dir) _readDirFromEntries(entries fs.DirEntries, dirTree dirtree.DirTree, when time.Time, collectPrune, collectContentInvalidation bool) (victims []Node, contentInvalidations []contentInvalidationCheck, err error) {
 	mv := d._newManageVirtuals()
 	for _, entry := range entries {
-		entryVictims, err := d._processEntry(entry, mv, dirTree, when, collectPrune)
+		entryVictims, entryContentInvalidations, err := d._processEntry(entry, mv, dirTree, when, collectPrune, collectContentInvalidation)
 		if err != nil {
-			return nil, fmt.Errorf("%s: processing entry: %s: %v", d.path, path.Base(entry.Remote()), err)
+			return nil, nil, fmt.Errorf("%s: processing entry: %s: %v", d.path, path.Base(entry.Remote()), err)
 		}
 		victims = append(victims, entryVictims...)
+		contentInvalidations = append(contentInvalidations, entryContentInvalidations...)
 	}
 	victims = append(victims, mv.end(d, collectPrune)...)
-	return victims, nil
+	return victims, contentInvalidations, nil
 }
 
 // readDirTree forces a refresh of the complete directory tree
@@ -940,14 +960,17 @@ func (d *Dir) readDirTree() error {
 	}
 	pruners := d.vfs.pruners()
 	collectPrune := len(pruners) != 0
+	contentInvalidators := d.vfs.contentInvalidators()
+	collectContentInvalidation := len(contentInvalidators) != 0
 	var victims []Node
+	var contentInvalidations []contentInvalidationCheck
 	err = func() error {
 		d.mu.Lock()
 		defer d.mu.Unlock()
 
 		d.read = time.Time{}
 		d.resetStatRead(false)
-		victims, err = d._readDirFromDirTree(dt, when, collectPrune)
+		victims, contentInvalidations, err = d._readDirFromDirTree(dt, when, collectPrune, collectContentInvalidation)
 		if err != nil {
 			return err
 		}
@@ -960,6 +983,7 @@ func (d *Dir) readDirTree() error {
 		return err
 	}
 
+	invalidateChangedContent(contentInvalidators, contentInvalidations)
 	if len(victims) > 0 {
 		for _, pruner := range pruners {
 			pruner.PruneInodes(victims)
@@ -1048,7 +1072,10 @@ func (d *Dir) _stat(leaf string) bool {
 	if cached {
 		age := when.Sub(statTime)
 		stale := age > time.Duration(d.vfs.Opt.DirCacheTime)
-		if !stale {
+		// A fresh statRead entry is only trustworthy while its item is still
+		// present; if the item is gone, the timestamp is stale positive state
+		// and we must re-stat rather than report a false miss.
+		if _, present := d.items[leaf]; !stale && present {
 			d.mu.RUnlock()
 			return true
 		}
@@ -1104,42 +1131,53 @@ func (d *Dir) _stat(leaf string) bool {
 
 	when = time.Now()
 
+	contentInvalidators := d.vfs.contentInvalidators()
+	collectContentInvalidation := len(contentInvalidators) != 0
+	var contentInvalidations []contentInvalidationCheck
+
 	// Atomic state update
-	d.mu.Lock()
-	defer d.mu.Unlock()
+	ok = func() bool {
+		d.mu.Lock()
+		defer d.mu.Unlock()
 
-	// Double-check staleness to prevent duplicate work
-	if _, stale := d._age(when); !stale {
-		return true
-	}
+		// Double-check staleness to prevent duplicate work
+		if _, stale := d._age(when); !stale {
+			return true
+		}
 
-	entryName := path.Base(entry.Remote())
+		entryName := path.Base(entry.Remote())
 
-	// Double-check stat time for both requested and actual names
-	checkNames := []string{leaf}
-	if entryName != leaf {
-		checkNames = append(checkNames, entryName)
-	}
-	for _, name := range checkNames {
-		if statTime, ok := d.statRead[name]; ok {
-			age := when.Sub(statTime)
-			stale := age > time.Duration(vfsOptDirCacheTime)
-			if !stale {
-				return true
+		// Double-check stat time for both requested and actual names
+		checkNames := []string{leaf}
+		if entryName != leaf {
+			checkNames = append(checkNames, entryName)
+		}
+		for _, name := range checkNames {
+			if statTime, ok := d.statRead[name]; ok {
+				age := when.Sub(statTime)
+				stale := age > time.Duration(vfsOptDirCacheTime)
+				if _, present := d.items[name]; !stale && present {
+					return true
+				}
 			}
 		}
-	}
 
-	if _, err = d._processEntry(entry, nil, nil, when, false); err != nil {
-		fs.Errorf(dirPath, "processing entry: %q: %v", entryName, err)
+		if _, contentInvalidations, err = d._processEntry(entry, nil, nil, when, false, collectContentInvalidation); err != nil {
+			fs.Errorf(dirPath, "processing entry: %q: %v", entryName, err)
+			return false
+		}
+
+		// Update the stat time only if the entry has been added
+		if _, ok := d.items[entryName]; ok {
+			d.statRead[entryName] = when
+		}
+		return true
+	}()
+	if !ok {
 		return false
 	}
 
-	// Update the stat time only if the entry has been added
-	if _, ok := d.items[entryName]; ok {
-		d.statRead[entryName] = when
-	}
-
+	invalidateChangedContent(contentInvalidators, contentInvalidations)
 	return true
 }
 
