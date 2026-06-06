@@ -184,20 +184,21 @@ var (
 
 // VFS represents the top level filing system
 type VFS struct {
-	f           fs.Fs
-	ctx         context.Context
-	root        *Dir
-	Opt         vfscommon.Options
-	cache       *vfscache.Cache
-	cancel      context.CancelFunc
-	cancelCache context.CancelFunc
-	usageMu     sync.Mutex
-	usageTime   time.Time
-	usage       *fs.Usage
-	pollMu      sync.Mutex
-	pollChan    chan time.Duration
-	inUse       atomic.Int32 // count of number of opens
-	prunerStore atomic.Pointer[[]prunerEntry]
+	f                       fs.Fs
+	ctx                     context.Context
+	root                    *Dir
+	Opt                     vfscommon.Options
+	cache                   *vfscache.Cache
+	cancel                  context.CancelFunc
+	cancelCache             context.CancelFunc
+	usageMu                 sync.Mutex
+	usageTime               time.Time
+	usage                   *fs.Usage
+	pollMu                  sync.Mutex
+	pollChan                chan time.Duration
+	inUse                   atomic.Int32 // count of number of opens
+	prunerStore             atomic.Pointer[[]prunerEntry]
+	contentInvalidatorStore atomic.Pointer[[]contentInvalidatorEntry]
 }
 
 // Keep track of active VFS keyed on fs.ConfigString(f)
