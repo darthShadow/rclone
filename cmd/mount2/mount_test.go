@@ -13,6 +13,7 @@ import (
 
 	fusefs "github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
+	_ "github.com/rclone/rclone/backend/local"
 	"github.com/rclone/rclone/cmd/mountlib"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fstest/mockfs"
@@ -410,6 +411,328 @@ func TestNotifySupport(t *testing.T) {
 			require.Equal(t, test.wantPrune, prune, "prune")
 			require.Equal(t, test.wantContent, content, "content")
 		})
+	}
+}
+
+type foreignInodeNode struct {
+	fusefs.Inode
+}
+
+var _ fusefs.InodeEmbedder = (*foreignInodeNode)(nil)
+
+func TestNodeLookupChildFallback(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		setup     func(*mount2NodeFixture) *Node
+		leaf      string
+		wantName  string
+		wantErrno syscall.Errno
+	}{
+		{
+			name:     "success via dir.Stat",
+			setup:    func(f *mount2NodeFixture) *Node { return f.root },
+			leaf:     "file1",
+			wantName: "file1",
+		},
+		{
+			name: "vfsDir nil fallback",
+			setup: func(f *mount2NodeFixture) *Node {
+				f.root.vfsDir.Store(nil)
+				return f.root
+			},
+			leaf:     "file1",
+			wantName: "file1",
+		},
+		{
+			name: "type assert miss leaves nil dir fallback",
+			setup: func(f *mount2NodeFixture) *Node {
+				return f.node["file1"]
+			},
+			wantName: "file1",
+		},
+		{
+			name:      "error translation",
+			setup:     func(f *mount2NodeFixture) *Node { return f.root },
+			leaf:      "missing",
+			wantErrno: syscall.ENOENT,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fixture := newMount2NodeFixture(t, "file1")
+			node := tc.setup(fixture)
+			got, errno := node.lookupChild(tc.leaf)
+			require.Equal(t, tc.wantErrno, errno, "errno")
+			if tc.wantErrno != 0 {
+				assert.Nil(t, got)
+				return
+			}
+			require.NotNil(t, got)
+			assert.Equal(t, tc.wantName, got.Name())
+		})
+	}
+}
+
+func TestNodeLookupSelfFallback(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		setup           func(*testing.T, *mount2NodeFixture) *Node
+		wantName        string
+		wantErrno       syscall.Errno
+		wantErrFallback bool
+	}{
+		{
+			name:     "root VFS Stat path",
+			setup:    func(t *testing.T, f *mount2NodeFixture) *Node { return f.root },
+			wantName: "/",
+		},
+		{
+			name:     "success via parent lookupChild",
+			setup:    func(t *testing.T, f *mount2NodeFixture) *Node { return f.node["file1"] },
+			wantName: "file1",
+		},
+		{
+			name: "parent nil fallback",
+			setup: func(t *testing.T, f *mount2NodeFixture) *Node {
+				child := f.node["file1"]
+				ok, _ := f.root.EmbeddedInode().RmChild("file1")
+				require.True(t, ok, "detach file1 child")
+				_, parent := child.EmbeddedInode().Parent()
+				require.Nil(t, parent, "detached child parent")
+				require.NotSame(t, f.fsys.root, child, "detached child should not be root")
+				return child
+			},
+			wantErrFallback: true,
+		},
+		{
+			name: "parent non Node fallback",
+			setup: func(t *testing.T, f *mount2NodeFixture) *Node {
+				foreign := &foreignInodeNode{}
+				foreignInode := f.root.NewInode(f.ctx, foreign, fusefs.StableAttr{Mode: fuse.S_IFDIR | 0755})
+				require.True(t, f.root.EmbeddedInode().AddChild("foreign", foreignInode, false))
+				vfsNode, err := f.dir.Stat("file1")
+				require.NoError(t, err)
+				child := newNode(f.fsys, vfsNode)
+				var out fuse.EntryOut
+				f.fsys.setEntryOut(vfsNode, &out)
+				childInode := foreign.NewInode(f.ctx, child, fusefs.StableAttr{Mode: out.Attr.Mode})
+				require.True(t, foreignInode.AddChild("file1", childInode, false))
+				return child
+			},
+			wantErrFallback: true,
+		},
+		{
+			name: "parent vfsDir nil chained fallback",
+			setup: func(t *testing.T, f *mount2NodeFixture) *Node {
+				f.root.vfsDir.Store(nil)
+				return f.node["file1"]
+			},
+			wantName: "file1",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fixture := newMount2NodeFixture(t, "file1")
+			got, errno := tc.setup(t, fixture).lookupSelf()
+			if tc.wantErrFallback {
+				require.NotEqual(t, syscall.Errno(0), errno, "errno")
+				assert.Nil(t, got)
+				return
+			}
+			require.Equal(t, tc.wantErrno, errno, "errno")
+			if tc.wantErrno != 0 {
+				assert.Nil(t, got)
+				return
+			}
+			require.NotNil(t, got)
+			assert.Equal(t, tc.wantName, got.Name())
+		})
+	}
+}
+
+type mount2LocalFixture struct {
+	backing  string
+	mount    string
+	counting *countingStatFs
+	mnt      *mountlib.MountPoint
+}
+
+func newMountedLocalFixture(t *testing.T, files map[string]string) *mount2LocalFixture {
+	t.Helper()
+	ctx := context.Background()
+	backing := t.TempDir()
+	for name, contents := range files {
+		fullPath := filepath.Join(backing, filepath.FromSlash(name))
+		require.NoError(t, os.MkdirAll(filepath.Dir(fullPath), 0777))
+		require.NoError(t, os.WriteFile(fullPath, []byte(contents), 0666))
+	}
+
+	baseFs, err := fs.NewFs(ctx, backing)
+	require.NoError(t, err)
+	countingFs := &countingStatFs{Fs: baseFs}
+
+	mountPoint := t.TempDir()
+	mountOpt := mountlib.Opt
+	mountOpt.AttrTimeout = fs.Duration(50 * time.Millisecond)
+	vfsOpt := vfscommon.Opt
+	vfsOpt.DirCacheTime = fs.Duration(50 * time.Millisecond)
+
+	mnt := mountlib.NewMountPoint(mount, mountPoint, countingFs, &mountOpt, &vfsOpt)
+	mounted := false
+	t.Cleanup(func() {
+		if mounted {
+			require.NoError(t, mnt.Unmount())
+		}
+	})
+	_, err = mnt.Mount()
+	require.NoError(t, err)
+	mounted = true
+
+	return &mount2LocalFixture{
+		backing:  backing,
+		mount:    mountPoint,
+		counting: countingFs,
+		mnt:      mnt,
+	}
+}
+
+func requireDirNames(t *testing.T, dir string) map[string]struct{} {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	require.NoError(t, err)
+	names := make(map[string]struct{}, len(entries))
+	for _, entry := range entries {
+		names[entry.Name()] = struct{}{}
+	}
+	return names
+}
+
+func requireEventuallyNotExist(t *testing.T, filePath string) {
+	t.Helper()
+	deadline := time.Now().Add(500 * time.Millisecond)
+	var err error
+	for {
+		_, err = os.Stat(filePath)
+		if os.IsNotExist(err) {
+			return
+		}
+		if time.Now().After(deadline) {
+			require.True(t, os.IsNotExist(err), "path %q error = %v", filePath, err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func forgetMountedRoot(t *testing.T, f *mount2LocalFixture) {
+	t.Helper()
+	root, err := f.mnt.VFS.Root()
+	require.NoError(t, err)
+	root.ForgetAll()
+}
+
+func TestMount2LookupRenameRace(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		run  func(*testing.T, *mount2LocalFixture)
+	}{
+		{
+			name: "CHILD rename mid Lookup",
+			run: func(t *testing.T, f *mount2LocalFixture) {
+				require.NoError(t, os.Rename(filepath.Join(f.backing, "file1"), filepath.Join(f.backing, "file1_renamed")))
+				forgetMountedRoot(t, f)
+				requireEventuallyNotExist(t, filepath.Join(f.mount, "file1"))
+				_, newErr := os.Stat(filepath.Join(f.mount, "file1_renamed"))
+				require.NoError(t, newErr)
+			},
+		},
+		{
+			name: "SELF rename mid Getattr",
+			run: func(t *testing.T, f *mount2LocalFixture) {
+				file, err := os.Open(filepath.Join(f.mount, "file1"))
+				require.NoError(t, err)
+				defer func() { require.NoError(t, file.Close()) }()
+				require.NoError(t, os.Rename(filepath.Join(f.backing, "file1"), filepath.Join(f.backing, "file1_renamed")))
+				_, statErr := file.Stat()
+				assert.NoError(t, statErr)
+			},
+		},
+		{
+			name: "parent rename mid Lookup",
+			run: func(t *testing.T, f *mount2LocalFixture) {
+				require.NoError(t, os.Rename(filepath.Join(f.backing, "dir1"), filepath.Join(f.backing, "dir2")))
+				forgetMountedRoot(t, f)
+				requireEventuallyNotExist(t, filepath.Join(f.mount, "dir1", "file1"))
+				_, newErr := os.Stat(filepath.Join(f.mount, "dir2", "file1"))
+				require.NoError(t, newErr)
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.run(t, newMountedLocalFixture(t, map[string]string{
+				"file1":      "file1",
+				"dir1/file1": "nested",
+			}))
+		})
+	}
+}
+
+func TestMount2OpendirHandleStaleness(t *testing.T) {
+	fixture := newMount2NodeFixture(t, "file1", "file2", "file3")
+	fh, _, errno := fixture.root.OpendirHandle(fixture.ctx, 0)
+	require.Equal(t, syscall.Errno(0), errno, "OpendirHandle errno")
+	dirHandle, ok := fh.(*mount2DirHandle)
+	require.True(t, ok, "handle is %T", fh)
+	defer dirHandle.Releasedir(fixture.ctx, 0)
+
+	snapshotHasFile2 := false
+	for _, entry := range dirHandle.entries {
+		snapshotHasFile2 = snapshotHasFile2 || entry.Name == "file2"
+	}
+	require.True(t, snapshotHasFile2, "opened handle snapshot should contain file2")
+
+	fixture.dir.DelVirtual("file2")
+
+	var out fuse.EntryOut
+	_, errno = dirHandle.Lookup(fixture.ctx, "file2", &out)
+	require.Equal(t, syscall.ENOENT, errno, "handle Lookup should reflect external removal")
+}
+
+func TestMount2OpendirHandleVirtualEntries(t *testing.T) {
+	fixture := newMountedLocalFixture(t, map[string]string{
+		"file1": "file1",
+	})
+	require.NoError(t, fixture.mnt.VFS.AddVirtual("virtual-file", 12, false))
+
+	names := requireDirNames(t, fixture.mount)
+	require.Contains(t, names, "virtual-file")
+	_, err := os.Stat(filepath.Join(fixture.mount, "virtual-file"))
+	assert.NoError(t, err)
+}
+
+func TestMount2OpendirHandleConcurrent(t *testing.T) {
+	fixture := newMountedLocalFixture(t, map[string]string{
+		"dir/file1": "file1",
+		"dir/file2": "file2",
+		"dir/file3": "file3",
+	})
+
+	var wg sync.WaitGroup
+	errs := make(chan error, 12)
+	for range 4 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range 3 {
+				names := requireDirNames(t, filepath.Join(fixture.mount, "dir"))
+				if _, ok := names["file1"]; !ok {
+					errs <- syscall.ENOENT
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		assert.NoError(t, err)
 	}
 }
 
