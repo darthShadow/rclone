@@ -6,6 +6,7 @@ import (
 	"context"
 	"os"
 	"path"
+	"sync/atomic"
 	"syscall"
 
 	fusefs "github.com/hanwen/go-fuse/v2/fs"
@@ -27,6 +28,27 @@ References:
 type Node struct {
 	fsys *FS
 	fusefs.Inode
+	// vfsDir caches parent-namespace directory identity, not directory state.
+	// The general rule prohibits a second long-lived vfs.Node pointer on *Node
+	// because stored nodes with Path, IsDir, Open, DirEntry, or other state
+	// can become stale under external mutation.
+	//
+	// This field is the constraint exception: it stores a *vfs.Dir identity
+	// only so lookup helpers can pass that identity to dir.Stat(name). It does
+	// not cache or trust leaf state. Dir.Stat(name) reads the VFS directory
+	// items map, which can reuse cached statRead entries within DirCacheTime;
+	// the call does not recompute strictly external updates per invocation.
+	// Same-VFS mutations, including virtual entries and Dir.rename, update VFS
+	// state directly; DirCacheTime bounds strictly external mutations.
+	//
+	// The field is consistent with the rule's intent even though *vfs.Dir
+	// implements vfs.Node. It does not store child vfs.Node state, metadata,
+	// open handles, or directory entries on *Node. The leaf-state staleness
+	// floor under external mutation does not apply to this identity-only
+	// pointer. A parent rename race can result in dir.Stat resolving against
+	// the pre-rename namespace; operations resolve through the kernel parent
+	// identity supplied for their inode.
+	vfsDir atomic.Pointer[vfs.Dir]
 }
 
 // Node types must be InodeEmbedders
@@ -38,12 +60,14 @@ var _ fusefs.InodeEmbedder = (*Node)(nil)
 func newNode(fsys *FS, vfsNode vfs.Node) (node *Node) {
 	// Check the vfsNode to see if it has a fuse Node cached
 	// We must return the same fuse nodes for vfs Nodes
-	node, ok := vfsNode.Aux(fsys).(*Node)
-	if ok {
+	if node, ok := vfsNode.Aux(fsys).(*Node); ok {
 		return node
 	}
 	node = &Node{
 		fsys: fsys,
+	}
+	if dir, ok := vfsNode.(*vfs.Dir); ok {
+		node.vfsDir.Store(dir)
 	}
 	actual, _ := vfsNode.LoadOrStoreAux(fsys, node)
 	if actualNode, ok := actual.(*Node); ok {
@@ -98,6 +122,49 @@ func (n *Node) lookupDir(leaf string) (*vfs.Dir, syscall.Errno) {
 	return dir, 0
 }
 
+// lookupChild resolves name relative to n as the parent directory. It uses
+// the parent directory identity cached in n.vfsDir to avoid a root-walk, then
+// lets VFS Dir.Stat own freshness and synchronization for the child lookup.
+//
+// If the directory identity is unavailable, lookupChild falls back to the
+// path-based VFS.Stat shape so callers keep the same behavior with only the
+// optimization disabled for that operation.
+//
+// Rename races are bounded to one operation: a parent or child rename can be
+// observed through the directory identity current for this call, and later
+// calls resolve through the kernel's current parent identity.
+func (n *Node) lookupChild(name string) (vfs.Node, syscall.Errno) {
+	dir := n.vfsDir.Load()
+	if dir == nil {
+		return n.lookupNode(name)
+	}
+	vfsNode, err := dir.Stat(name)
+	return vfsNode, translateError(err)
+}
+
+// lookupSelf resolves the vfs.Node represented by n from its parent's
+// directory identity when possible. Root keeps the existing VFS.Stat("/")
+// shape, which returns the VFS root without walking path segments.
+//
+// Parent recovery failures are structural fallbacks, not errors: detached
+// parent windows and foreign inode operations use the path-based VFS.Stat
+// resolution that the caller used before this helper.
+func (n *Node) lookupSelf() (vfs.Node, syscall.Errno) {
+	if n.fsys != nil && n.fsys.root == n {
+		vfsNode, err := n.VFS().Stat("/")
+		return vfsNode, translateError(err)
+	}
+	name, parentInode := n.EmbeddedInode().Parent()
+	if parentInode == nil {
+		return n.lookupNode("")
+	}
+	parent, ok := parentInode.Operations().(*Node)
+	if !ok || parent == nil {
+		return n.lookupNode("")
+	}
+	return parent.lookupChild(name)
+}
+
 // Statfs implements statistics for the filesystem that holds this
 // Inode. If not defined, the `out` argument will zeroed with an OK
 // result.  This is because OSX filesystems must Statfs, or the mount
@@ -131,7 +198,7 @@ var _ = (fusefs.NodeStatfser)((*Node)(nil))
 // with the Options.NullPermissions setting. If blksize is unset, 4096
 // is assumed, and the 'blocks' field is set accordingly.
 func (n *Node) Getattr(ctx context.Context, f fusefs.FileHandle, out *fuse.AttrOut) syscall.Errno {
-	vfsNode, errno := n.lookupNode("")
+	vfsNode, errno := n.lookupSelf()
 	if errno != 0 {
 		return errno
 	}
@@ -145,7 +212,7 @@ var _ = (fusefs.NodeGetattrer)((*Node)(nil))
 func (n *Node) Setattr(ctx context.Context, f fusefs.FileHandle, in *fuse.SetAttrIn, out *fuse.AttrOut) (errno syscall.Errno) {
 	defer log.Trace(n, "in=%v", in)("out=%#v, errno=%v", &out, &errno)
 	var err error
-	vfsNode, errno := n.lookupNode("")
+	vfsNode, errno := n.lookupSelf()
 	if errno != 0 {
 		return errno
 	}
@@ -178,7 +245,7 @@ func (n *Node) Open(ctx context.Context, flags uint32) (fh fusefs.FileHandle, fu
 	defer log.Trace(n, "flags=%#o", flags)("errno=%v", &errno)
 	// fuse flags are based off syscall flags as are os flags, so
 	// should be compatible
-	vfsNode, errno := n.lookupNode("")
+	vfsNode, errno := n.lookupSelf()
 	if errno != 0 {
 		return nil, 0, errno
 	}
@@ -223,7 +290,7 @@ var _ = (fusefs.NodeOpener)((*Node)(nil))
 // populate their fuse.EntryOut arguments.
 func (n *Node) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (inode *fusefs.Inode, errno syscall.Errno) {
 	defer log.Trace(n, "name=%q", name)("inode=%v, attr=%v, errno=%v", &inode, &out, &errno)
-	vfsNode, errno := n.lookupNode(name)
+	vfsNode, errno := n.lookupChild(name)
 	if errno != 0 {
 		return nil, errno
 	}
@@ -236,6 +303,7 @@ func (n *Node) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (ino
 }
 
 var _ = (fusefs.NodeLookuper)((*Node)(nil))
+var _ = (fusefs.NodeOpendirHandler)((*Node)(nil))
 
 // Opendir opens a directory Inode for reading its
 // contents. The actual reading is driven from Readdir, so
@@ -282,24 +350,14 @@ func (n *Node) Readdir(ctx context.Context) (ds fusefs.DirStream, errno syscall.
 	if errno != 0 {
 		return nil, errno
 	}
-	items, err := vfs.MapReadDir[fuse.DirEntry](vfsDir, func(n vfs.Node) (fuse.DirEntry, error) {
-		return fuse.DirEntry{
-			// Mode is the file's mode. Only the high bits (e.g. S_IFDIR)
-			// are considered.
-			Mode: getMode(n),
-
-			// Name is the basename of the file in the directory.
-			Name: n.Name(),
-
-			// Ino is the inode number.
-			Ino: 0, // FIXME
-		}, nil
-	}, 2)
+	items, err := vfs.MapReadDir[fuse.DirEntry](vfsDir, vfsNodeToDirEntry, 2)
 	if err != nil {
 		return nil, translateError(err)
 	}
 
-	// go-fuse emits "." and ".." as dirents, including inode values, skips only their readdirplus child lookup, and panics if they enter the real node tree.
+	// go-fuse emits "." and ".." as dirents with inode values and skips their
+	// readdirplus child lookup. Adding either to the real node tree triggers a
+	// recovered panic, logs its stack trace, and returns EIO.
 	items[0] = fuse.DirEntry{
 		Mode: fuse.S_IFDIR,
 		Name: ".",
@@ -365,7 +423,7 @@ func (n *Node) Create(ctx context.Context, name string, flags uint32, mode uint3
 	// }
 
 	// Find the created node
-	vfsNode, errno := n.lookupNode(name)
+	vfsNode, errno := n.lookupChild(name)
 	if errno != 0 {
 		return nil, nil, 0, errno
 	}
@@ -416,7 +474,7 @@ var _ = (fusefs.NodeMknoder)((*Node)(nil))
 // FS tree automatically. Default is to return EROFS.
 func (n *Node) Unlink(ctx context.Context, name string) (errno syscall.Errno) {
 	defer log.Trace(n, "name=%q", name)("errno=%v", &errno)
-	vfsNode, errno := n.lookupNode(name)
+	vfsNode, errno := n.lookupChild(name)
 	if errno != 0 {
 		return errno
 	}
@@ -429,7 +487,7 @@ var _ = (fusefs.NodeUnlinker)((*Node)(nil))
 // Default is to return EROFS.
 func (n *Node) Rmdir(ctx context.Context, name string) (errno syscall.Errno) {
 	defer log.Trace(n, "name=%q", name)("errno=%v", &errno)
-	vfsNode, errno := n.lookupNode(name)
+	vfsNode, errno := n.lookupChild(name)
 	if errno != 0 {
 		return errno
 	}
