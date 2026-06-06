@@ -246,6 +246,58 @@ func TestDirReadDirPrunesRemovedCachedEntries(t *testing.T) {
 	assert.Equal(t, "dir/file1", calls[0][0].Path())
 }
 
+func TestDirReadDirInvalidatesChangedSymlinkContent(t *testing.T) {
+	for _, tc := range []struct {
+		name             string
+		nextTarget       string
+		nextModTime      time.Time
+		wantInvalidation bool
+	}{
+		{name: "changed", nextTarget: "target-2", nextModTime: t2, wantInvalidation: true},
+		{name: "unchanged", nextTarget: "target-1", nextModTime: t1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			opt := vfscommon.Opt
+			opt.Links = true
+			opt.FastFingerprint = true
+			r, vfs := newTestVFSOpt(t, &opt)
+
+			r.WriteObject(context.Background(), "dir/link"+fs.LinkSuffix, "target-1", t1)
+			node, err := vfs.Stat("dir")
+			require.NoError(t, err)
+			dir := node.(*Dir)
+			_, err = dir.ReadDirAll()
+			require.NoError(t, err)
+
+			link := requireDirFile(t, dir, "link")
+			require.True(t, link.IsSymlink())
+
+			owner1, owner2 := new(int), new(int)
+			invalidator1, invalidator2 := &recordingContentInvalidator{}, &recordingContentInvalidator{}
+			vfs.SetContentInvalidator(owner1, invalidator1)
+			vfs.SetContentInvalidator(owner2, invalidator2)
+			r.WriteObject(context.Background(), "dir/link"+fs.LinkSuffix, tc.nextTarget, tc.nextModTime)
+
+			require.NoError(t, dir.readDir())
+
+			calls := invalidator1.callsSnapshot()
+			require.Equal(t, calls, invalidator2.callsSnapshot())
+			if tc.wantInvalidation {
+				require.Equal(t, []*File{link}, calls)
+			} else {
+				require.Empty(t, calls)
+			}
+
+			vfs.SetContentInvalidator(owner1, nil)
+			r.WriteObject(context.Background(), "dir/link"+fs.LinkSuffix, "target-3", t3)
+			require.NoError(t, dir.readDir())
+
+			require.Equal(t, calls, invalidator1.callsSnapshot())
+			require.Equal(t, append(calls, link), invalidator2.callsSnapshot())
+		})
+	}
+}
+
 func TestDirForgetAllSkipsPrunerWhenVirtual(t *testing.T) {
 	_, vfs, dir, _ := dirCreate(t)
 
@@ -1126,4 +1178,39 @@ func TestDirRenameParentEntries(t *testing.T) {
 	<-done
 
 	assert.Equal(t, before, slices.Sorted(maps.Keys(root.items)))
+}
+
+type linksTestStater struct {
+	fs.Fs
+	calls int
+}
+
+func (f *linksTestStater) Stat(ctx context.Context, dir, leaf string) (fs.DirEntry, error) {
+	f.calls++
+	return f.Fs.(fs.Stater).Stat(ctx, dir, leaf)
+}
+
+func TestDirLinksInvalidNameStat(t *testing.T) {
+	for _, leaf := range []string{fs.LinkSuffix, "." + fs.LinkSuffix, ".." + fs.LinkSuffix} {
+		t.Run(leaf, func(t *testing.T) {
+			r := fstest.NewRun(t)
+			if _, ok := r.Fremote.(fs.Stater); !ok {
+				t.Skip("backend does not implement fs.Stater")
+			}
+			r.WriteObject(context.Background(), leaf, "target", t1)
+			wrapped := &linksTestStater{Fs: r.Fremote}
+			opt := vfscommon.Opt
+			opt.Links = true
+			v := New(context.Background(), wrapped, &opt)
+			t.Cleanup(func() { cleanupVFS(t, v) })
+			root, err := v.Root()
+			require.NoError(t, err)
+			assert.True(t, root._stat(leaf))
+			assert.Equal(t, 1, wrapped.calls)
+			root.mu.RLock()
+			assert.Empty(t, root.items, "invalid translated names must not enter the directory cache")
+			assert.True(t, root.read.IsZero(), "single-file stat must not list the directory")
+			root.mu.RUnlock()
+		})
+	}
 }

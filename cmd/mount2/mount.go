@@ -54,18 +54,19 @@ func mountOptions(fsys *FS, f fs.Fs, opt *mountlib.Options) (mountOpts *fuse.Mou
 	}
 
 	mountOpts = &fuse.MountOptions{
-		AllowOther:         fsys.opt.AllowOther,
-		FsName:             opt.DeviceName,
-		Name:               "rclone",
-		DisableXAttrs:      true,
-		Debug:              fsys.opt.DebugFUSE,
-		MaxReadAhead:       effectiveReadAhead,
-		MaxWrite:           effectiveMaxWrite,
-		DisableReadDirPlus: false,
-		IDMappedMount:      opt.AllowIDMap,
-		MaxStackDepth:      fsys.opt.MaxStackDepth,
-		ExtraCapabilities:  fuse.CAP_ASYNC_DIO,
-		SyncRead:           !opt.AsyncRead,
+		AllowOther:           fsys.opt.AllowOther,
+		FsName:               opt.DeviceName,
+		Name:                 "rclone",
+		DisableXAttrs:        true,
+		Debug:                fsys.opt.DebugFUSE,
+		MaxReadAhead:         effectiveReadAhead,
+		MaxWrite:             effectiveMaxWrite,
+		DisableReadDirPlus:   false,
+		IDMappedMount:        opt.AllowIDMap,
+		MaxStackDepth:        fsys.opt.MaxStackDepth,
+		ExtraCapabilities:    fuse.CAP_ASYNC_DIO,
+		SyncRead:             !opt.AsyncRead,
+		EnableSymlinkCaching: fsys.VFS.Opt.Links,
 		// Lift the kernel async-request cap above go-fuse's default of 12 so
 		// high-fanout reads aren't throttled by FUSE backing-dev congestion.
 		// The congestion threshold follows the kernel-FUSE convention of
@@ -434,13 +435,14 @@ func mount(VFS *vfs.VFS, mountpoint string, opt *mountlib.Options) (<-chan error
 	if err != nil {
 		return nil, nil, "", err
 	}
+	opts.RootStableAttr = &fusefs.StableAttr{Ino: root.vfsDir.Load().Inode()}
 
 	rawFS := fusefs.NewNodeFS(root, &opts)
 	server, err := fuse.NewServer(rawFS, mountpoint, &opts.MountOptions)
 	if err != nil {
 		return nil, nil, "", err
 	}
-	prune, _ := notifySupport(server.KernelSettings(), VFS.Opt.Links)
+	prune, content := notifySupport(server.KernelSettings(), VFS.Opt.Links)
 	registeredPruner := false
 	if prune {
 		VFS.SetPruner(fsys, fsys)
@@ -449,11 +451,27 @@ func mount(VFS *vfs.VFS, mountpoint string, opt *mountlib.Options) (<-chan error
 	} else {
 		fs.Infof(f, "NotifyPrune unsupported: VFS pruner not registered")
 	}
+	registeredContentInvalidator := false
+	switch {
+	case !VFS.Opt.Links:
+	case server.KernelSettings().Flags64()&fuse.CAP_CACHE_SYMLINKS == 0:
+		fs.Infof(f, "Symlink caching unsupported: VFS content invalidator not registered")
+	case !content:
+		fs.Infof(f, "NotifyContent unsupported: VFS content invalidator not registered")
+	default:
+		VFS.SetContentInvalidator(fsys, fsys)
+		registeredContentInvalidator = true
+		fs.Infof(f, "Symlink caching supported: registered VFS content invalidator")
+	}
+
 	var unregisterOnce sync.Once
 	unregister := func() {
 		unregisterOnce.Do(func() {
 			if registeredPruner {
 				VFS.SetPruner(fsys, nil)
+			}
+			if registeredContentInvalidator {
+				VFS.SetContentInvalidator(fsys, nil)
 			}
 		})
 	}
