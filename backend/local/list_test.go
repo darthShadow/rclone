@@ -221,6 +221,46 @@ func TestStat_EncodedLeafUsesStandardRemoteForFilter(t *testing.T) {
 	assert.Equal(t, remoteLeaf, entry.Remote())
 }
 
+func TestList_EntriesUseContainedLocalPaths(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	fRaw, err := NewFs(ctx, "local", root, configmap.Simple{"encoding": "Slash"})
+	require.NoError(t, err)
+	f, ok := fRaw.(*Fs)
+	require.True(t, ok)
+	t.Cleanup(func() {
+		f.statScheduler.Close()
+	})
+
+	const ordinaryName = "ordinary.txt"
+	adversarialName := encoder.OS.ToStandardName("..")
+	writeTestFile(t, root, ordinaryName)
+	writeTestFile(t, root, adversarialName)
+
+	_, err = f.localPath(adversarialName)
+	require.ErrorIs(t, err, errPathEscapes, "the adversarial on-disk name must escape if reused directly as a remote")
+
+	entries, err := f.List(ctx, "")
+	require.NoError(t, err)
+	require.Len(t, entries, 2)
+
+	gotPaths := make(map[string]bool, len(entries))
+	for _, entry := range entries {
+		obj, ok := entry.(*Object)
+		require.Truef(t, ok, "listed entry %q has unexpected type %T", entry.Remote(), entry)
+
+		containedPath, err := f.localPath(obj.Remote())
+		require.NoErrorf(t, err, "listed remote %q does not resolve inside root %q", obj.Remote(), root)
+		assert.Equalf(t, containedPath, obj.path, "listed remote %q resolves to a different local path", obj.Remote())
+		gotPaths[obj.path] = true
+	}
+
+	assert.Equal(t, map[string]bool{
+		filepath.Join(root, ordinaryName):    true,
+		filepath.Join(root, adversarialName): true,
+	}, gotPaths)
+}
+
 func TestListCachedFileInfos_FilteredBatchUsesSharedScheduler(t *testing.T) {
 	f, root := newTestLocalFs(t)
 	for i := 0; i < statSchedulerDefaultMicroBatchSize+4; i++ {
