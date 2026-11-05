@@ -119,7 +119,7 @@ func (h *mount2DirHandle) Lookup(ctx context.Context, name string, out *fuse.Ent
 	h.parent.fsys.setEntryOut(vfsNode, out)
 
 	child := newNode(h.parent.fsys, vfsNode)
-	return h.parent.EmbeddedInode().NewInode(ctx, child, fusefs.StableAttr{Mode: out.Attr.Mode, Ino: vfsNode.Inode()}), 0
+	return h.parent.EmbeddedInode().NewInode(ctx, child, child.stableAttr(out.Attr.Mode, vfsNode.Inode())), 0
 }
 
 // Releasedir drops all per-open directory state.

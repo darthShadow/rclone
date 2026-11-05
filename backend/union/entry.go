@@ -22,6 +22,16 @@ type Object struct {
 	writebackMu sync.Mutex
 }
 
+// EntryIdentity returns the wrapped file's identity only for a single candidate, or 0 if unknown.
+func (o *Object) EntryIdentity() uint64 {
+	if len(o.co) == 1 {
+		if entry, ok := o.Object.Object.(fs.EntryIdentifier); ok {
+			return entry.EntryIdentity()
+		}
+	}
+	return 0
+}
+
 // Directory describes a union Directory
 //
 // This is a wrapped object contains all candidates
@@ -291,6 +301,7 @@ func (d *Directory) SetModTime(ctx context.Context, t time.Time) error {
 
 // Check the interfaces are satisfied
 var (
-	_ fs.FullObject    = (*Object)(nil)
-	_ fs.FullDirectory = (*Directory)(nil)
+	_ fs.FullObject      = (*Object)(nil)
+	_ fs.EntryIdentifier = (*Object)(nil)
+	_ fs.FullDirectory   = (*Directory)(nil)
 )

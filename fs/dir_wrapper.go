@@ -49,6 +49,14 @@ func (d *DirWrapper) SetRemote(remote string) *DirWrapper {
 	return d
 }
 
+// EntryIdentity returns the wrapped directory's identity, or 0 if unknown.
+func (d *DirWrapper) EntryIdentity() uint64 {
+	if entry, ok := d.Directory.(EntryIdentifier); ok {
+		return entry.EntryIdentity()
+	}
+	return 0
+}
+
 // Metadata returns metadata for an DirEntry
 //
 // It should return nil if there is no Metadata
@@ -92,7 +100,8 @@ func (d *DirWrapper) SetModTime(ctx context.Context, t time.Time) error {
 
 // Check interfaces
 var (
-	_ DirEntry      = (*DirWrapper)(nil)
-	_ Directory     = (*DirWrapper)(nil)
-	_ FullDirectory = (*DirWrapper)(nil)
+	_ DirEntry        = (*DirWrapper)(nil)
+	_ Directory       = (*DirWrapper)(nil)
+	_ FullDirectory   = (*DirWrapper)(nil)
+	_ EntryIdentifier = (*DirWrapper)(nil)
 )

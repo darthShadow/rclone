@@ -74,7 +74,7 @@ func newDir(vfs *VFS, f fs.Fs, parent *Dir, fsDir fs.Directory) *Dir {
 		entry:    fsDir,
 		path:     fsDir.Remote(),
 		modTime:  fsDir.ModTime(vfs.ctx),
-		inode:    newInode(),
+		inode:    vfs.dirInode(fsDir),
 		items:    make(map[string]Node),
 		statRead: make(map[string]time.Time),
 	}
@@ -1440,7 +1440,7 @@ func (d *Dir) Mkdir(name string) (*Dir, error) {
 		return nil, err
 	}
 	// fs.Debugf(path, "Dir.Mkdir")
-	var fsDir *fs.Dir
+	var fsDir fs.Directory
 	if do := d.Fs().Features().MkdirMetadata; do != nil && !d.vfs.Opt.SkipMetadata {
 		fsDirectory, err := do(d.vfs.ctx, path, fs.Metadata{
 			"uid":  fmt.Sprintf("%d", d.vfs.Opt.UID),
@@ -1451,7 +1451,7 @@ func (d *Dir) Mkdir(name string) (*Dir, error) {
 			fs.Errorf(d, "Dir.Mkdir failed to create directory with metadata: %v", err)
 			return nil, err
 		}
-		fsDir = fs.NewDirCopy(d.vfs.ctx, fsDirectory)
+		fsDir = fsDirectory
 	} else {
 		err = d.Fs().Mkdir(d.vfs.ctx, path)
 		if err != nil {
@@ -1461,6 +1461,11 @@ func (d *Dir) Mkdir(name string) (*Dir, error) {
 		fsDir = fs.NewDir(path, time.Now())
 	}
 	dir := newDir(d.vfs, d.f, d, fsDir)
+	if d.vfs.entryIdentity(fsDir) == 0 {
+		// A path-only number would be shared with a directory renamed away
+		// from path, so use a temporary one until a listing rebuilds the node.
+		dir.inode = inodePrefix("").inode(path, inodeKindDir, createdInodeCount.Add(1))
+	}
 	d.addObject(dir)
 	if err = d.SetModTime(time.Now()); err != nil {
 		fs.Errorf(d, "Dir.Mkdir failed to set modtime on parent dir: %v", err)

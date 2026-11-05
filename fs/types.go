@@ -169,6 +169,22 @@ type IDer interface {
 	ID() string
 }
 
+// EntryIdentifier is an optional interface for DirEntry
+type EntryIdentifier interface {
+	// EntryIdentity returns a number identifying the file or directory
+	// behind this entry, or 0 if it is not known.
+	//
+	// The number stays the same while the entry at this remote path is
+	// the same underlying item, including after in-place content
+	// updates, and changes when the item is replaced. It is only
+	// compared between entries for the same remote path, so it need not
+	// be unique across paths. It must not do any I/O and must be safe
+	// to call concurrently with other reads; a wrapper may report a
+	// different entry's identity after an update or open changes the
+	// entry it wraps.
+	EntryIdentity() uint64
+}
+
 // ParentIDer is an optional interface for Object
 type ParentIDer interface {
 	// ParentID returns the ID of the parent directory if known or nil if not

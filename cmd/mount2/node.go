@@ -27,6 +27,7 @@ References:
 // Node represents a directory or file
 type Node struct {
 	fsys *FS
+	gen  uint64
 	fusefs.Inode
 	// vfsDir caches parent-namespace directory identity, not directory state.
 	// The general rule prohibits a second long-lived vfs.Node pointer on *Node
@@ -65,6 +66,7 @@ func newNode(fsys *FS, vfsNode vfs.Node) (node *Node) {
 	}
 	node = &Node{
 		fsys: fsys,
+		gen:  fsys.gen.Add(1),
 	}
 	if dir, ok := vfsNode.(*vfs.Dir); ok {
 		node.vfsDir.Store(dir)
@@ -75,6 +77,10 @@ func newNode(fsys *FS, vfsNode vfs.Node) (node *Node) {
 	}
 	fs.Errorf(vfsNode, "Unexpected auxiliary value type %T for FUSE node", actual)
 	return node
+}
+
+func (n *Node) stableAttr(mode uint32, ino uint64) fusefs.StableAttr {
+	return fusefs.StableAttr{Mode: mode, Ino: ino, Gen: n.gen}
 }
 
 // Path returns the path of the node relative to the root
@@ -299,7 +305,7 @@ func (n *Node) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (ino
 
 	newNode := newNode(n.fsys, vfsNode)
 
-	return n.NewInode(ctx, newNode, fusefs.StableAttr{Mode: out.Attr.Mode, Ino: vfsNode.Inode()}), 0
+	return n.NewInode(ctx, newNode, newNode.stableAttr(out.Attr.Mode, vfsNode.Inode())), 0
 }
 
 var _ = (fusefs.NodeLookuper)((*Node)(nil))
@@ -388,7 +394,7 @@ func (n *Node) Mkdir(ctx context.Context, name string, mode uint32, out *fuse.En
 	}
 	newNode := newNode(n.fsys, newDir)
 	n.fsys.setEntryOut(newDir, out)
-	newInode := n.NewInode(ctx, newNode, fusefs.StableAttr{Mode: out.Attr.Mode, Ino: newDir.Inode()})
+	newInode := n.NewInode(ctx, newNode, newNode.stableAttr(out.Attr.Mode, newDir.Inode()))
 	return newInode, 0
 }
 
@@ -430,7 +436,7 @@ func (n *Node) Create(ctx context.Context, name string, flags uint32, mode uint3
 	n.fsys.setEntryOut(vfsNode, out)
 	newNode := newNode(n.fsys, vfsNode)
 	fs.Debugf(nil, "attr=%#v", out.Attr)
-	newInode := n.NewInode(ctx, newNode, fusefs.StableAttr{Mode: out.Attr.Mode, Ino: vfsNode.Inode()})
+	newInode := n.NewInode(ctx, newNode, newNode.stableAttr(out.Attr.Mode, vfsNode.Inode()))
 	return newInode, fh, 0, 0
 }
 
@@ -579,7 +585,7 @@ func (n *Node) Symlink(ctx context.Context, target, name string, out *fuse.Entry
 
 	n.fsys.setEntryOut(vfsNode, out)
 	newNode := newNode(n.fsys, vfsNode)
-	newInode := n.NewInode(ctx, newNode, fusefs.StableAttr{Mode: out.Attr.Mode, Ino: vfsNode.Inode()})
+	newInode := n.NewInode(ctx, newNode, newNode.stableAttr(out.Attr.Mode, vfsNode.Inode()))
 
 	return newInode, 0
 }

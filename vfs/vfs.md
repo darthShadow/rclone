@@ -487,3 +487,37 @@ total 1048578
 If the file has no metadata it will be returned as `{}` and if there
 is an error reading the metadata the error will be returned as
 `{"error":"error string"}`.
+
+### VFS File & Directory Identity
+
+The VFS makes the inode number of each file and directory from its
+path and, where the backend reports one, the identity of the
+underlying file or directory. For example the local backend reports
+the device and inode number, the S3 backend reports a hash of the
+ETag, the crypt backend passes on the identity of the entry it wraps
+and the union backend passes on the identity of a file found on only
+one upstream.
+An unchanged file keeps its inode number after the directory cache
+expires, and a file which is replaced at the same path gets a new one
+when the VFS next rebuilds its entry (for example after the directory
+cache is cleaned up, or after a restart) on backends which report an identity.
+
+A file or directory created through the VFS gets a temporary inode
+number until the VFS next rebuilds its entry, so that it never shares
+an inode number with one which was renamed away from the same path. A
+directory created on a backend which sets metadata on new directories
+keeps the identity the backend reports, unless `--vfs-skip-metadata`
+is set. On backends which report no identity, a file renamed away from
+a path can still share its inode number with a new file which appears
+at that path, until the VFS rebuilds the renamed file's entry.
+
+If a backend reports a new identity for an unchanged file, the VFS
+shows that file with a new inode number. This happens with the local
+backend on file systems whose inode numbers are not persistent (e.g.
+vfat, exfat and some FUSE file systems), and with an S3 provider which
+returns a different ETag for an unchanged object. Use `--vfs-no-entry-identity`
+on such remotes. The VFS then makes inode numbers from the path alone,
+so a file which is replaced at the same path keeps its inode number.
+
+Changing this flag changes the inode numbers of files on backends
+which report an identity.

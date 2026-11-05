@@ -181,6 +181,11 @@ var OptionsInfo = fs.Options{{
 	Default: "",
 	Help:    "Set the extension to read metadata from.",
 	Groups:  "VFS",
+}, {
+	Name:    "vfs_no_entry_identity",
+	Default: false,
+	Help:    "Don't use the identity the backend reports for files and directories in inode numbers (use the path only)",
+	Groups:  "VFS",
 }}
 
 func init() {
@@ -223,6 +228,7 @@ type Options struct {
 	HandleCaching      fs.Duration   `config:"vfs_handle_caching"`     // time to keep handle alive after last close
 	MetadataExtension  string        `config:"vfs_metadata_extension"` // if set respond to files with this extension with metadata
 	SkipMetadata       bool          `config:"vfs_skip_metadata"`      // VFS will skip setting the metadata on the underlying files & directories
+	NoEntryIdentity    bool          `config:"vfs_no_entry_identity"`  // make inode numbers from the path only
 }
 
 // Opt is the default options modified by the environment variables and command line flags

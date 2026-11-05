@@ -1258,6 +1258,14 @@ func (o *Object) ID() string {
 	return do.ID()
 }
 
+// EntryIdentity returns the wrapped file's identity, or 0 if unknown.
+func (o *Object) EntryIdentity() uint64 {
+	if entry, ok := o.Object.(fs.EntryIdentifier); ok {
+		return entry.EntryIdentity()
+	}
+	return 0
+}
+
 // SetTier performs changing storage tier of the Object if
 // multiple storage classes supported
 func (o *Object) SetTier(tier string) error {
@@ -1341,4 +1349,5 @@ var (
 	_ fs.Shutdowner      = (*Fs)(nil)
 	_ fs.FullObjectInfo  = (*ObjectInfo)(nil)
 	_ fs.FullObject      = (*Object)(nil)
+	_ fs.EntryIdentifier = (*Object)(nil)
 )

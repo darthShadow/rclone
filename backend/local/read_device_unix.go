@@ -24,3 +24,23 @@ func readDevice(fi os.FileInfo, oneFileSystem bool) uint64 {
 	}
 	return uint64(statT.Dev) // nolint: unconvert
 }
+
+// readIdentity returns the device and inode identity, or 0 if unavailable.
+func readIdentity(fi os.FileInfo) uint64 {
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return 0
+	}
+	return localIdentity(uint64(st.Dev), uint64(st.Ino)) // nolint: unconvert
+}
+
+func localIdentity(dev, ino uint64) uint64 {
+	if ino == 0 {
+		return 0
+	}
+	id := ino ^ dev*0x9e3779b97f4a7c15
+	if id == 0 {
+		return 1
+	}
+	return id
+}

@@ -6,6 +6,7 @@ package mount2
 
 import (
 	"os"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -25,6 +26,7 @@ type FS struct {
 	f    fs.Fs
 	opt  *mountlib.Options
 	root *Node
+	gen  atomic.Uint64
 }
 
 // NewFS creates a pathfs.FileSystem from the fs.Fs passed in

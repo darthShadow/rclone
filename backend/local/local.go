@@ -506,12 +506,12 @@ type Object struct {
 	remote string // The remote path (encoded path)
 	path   string // The local path (OS path)
 	// When using these items the fs.objectMetaMu must be held
-	size    int64 // file metadata - always present
-	mode    os.FileMode
-	modTime time.Time
-	hashes  map[hash.Type]string // Hashes
-	// these are read only and don't need the mutex held
-	translatedLink bool // Is this object a translated link
+	size           int64 // file metadata - always present
+	mode           os.FileMode
+	translatedLink bool // read only: Is this object a translated link
+	modTime        time.Time
+	hashes         map[hash.Type]string // Hashes
+	ident          atomic.Uint64        // accessed atomically without fs.objectMetaMu
 }
 
 // Directory represents a local filesystem directory
@@ -2190,6 +2190,7 @@ func (o *Object) setMetadataNoLock(info os.FileInfo) {
 	if o.fs.opt.NoCheckUpdated && !o.modTime.IsZero() {
 		return
 	}
+	o.ident.Store(readIdentity(info))
 	o.size = info.Size()
 	o.modTime = readTime(o.fs.opt.TimeType, info)
 	o.mode = info.Mode()
@@ -2378,6 +2379,11 @@ func (d *Directory) Hash() {
 	// Does nothing
 }
 
+// EntryIdentity returns the cached identity of the file, or 0 if unknown.
+func (o *Object) EntryIdentity() uint64 {
+	return o.ident.Load()
+}
+
 // Check the interfaces are satisfied
 var (
 	_ fs.Fs              = &Fs{}
@@ -2395,4 +2401,6 @@ var (
 	_ fs.Directory       = &Directory{}
 	_ fs.SetModTimer     = &Directory{}
 	_ fs.SetMetadataer   = &Directory{}
+	_ fs.EntryIdentifier = &Object{}
+	_ fs.EntryIdentifier = &Directory{}
 )
