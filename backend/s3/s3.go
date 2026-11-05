@@ -24,6 +24,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -1186,6 +1187,7 @@ type Object struct {
 	meta         map[string]string // The object metadata if known - may be nil - with lower case keys
 	mimeType     string            // MimeType of object - may be ""
 	versionID    *string           // If present this points to an object version
+	ident        atomic.Uint64
 
 	// Metadata as pointers to strings as they often won't be present
 	storageClass       *string // e.g. GLACIER
@@ -2074,6 +2076,7 @@ func (f *Fs) newObjectWithInfo(ctx context.Context, remote string, info *types.O
 			o.lastModified = *info.LastModified
 		}
 		o.setMD5FromEtag(deref(info.ETag))
+		o.ident.Store(s3Identity(deref(info.ETag)))
 		o.bytes = deref(info.Size)
 		o.storageClass = stringClone(string(info.StorageClass))
 		o.versionID = stringClonePointer(versionID)
@@ -4224,6 +4227,32 @@ func mapToS3Metadata(meta map[string]string) map[string]string {
 	return meta
 }
 
+func s3Identity(etag string) uint64 {
+	for len(etag) > 0 && etag[0] == '"' {
+		etag = etag[1:]
+	}
+	for len(etag) > 0 && etag[len(etag)-1] == '"' {
+		etag = etag[:len(etag)-1]
+	}
+	if etag == "" {
+		return 0
+	}
+	h := uint64(14695981039346656037)
+	for i := 0; i < len(etag); i++ {
+		h ^= uint64(etag[i])
+		h *= 1099511628211
+	}
+	if h == 0 {
+		h = 1
+	}
+	return h
+}
+
+// EntryIdentity returns the cached ETag identity, or 0 if unknown.
+func (o *Object) EntryIdentity() uint64 {
+	return o.ident.Load()
+}
+
 func (o *Object) setMetaData(resp *s3.HeadObjectOutput) {
 	// Ignore missing Content-Length assuming it is 0
 	// Some versions of ceph do this due their apache proxies
@@ -4231,6 +4260,7 @@ func (o *Object) setMetaData(resp *s3.HeadObjectOutput) {
 		o.bytes = *resp.ContentLength
 	}
 	o.setMD5FromEtag(deref(resp.ETag))
+	o.ident.Store(s3Identity(deref(resp.ETag)))
 	o.meta = s3MetadataToMap(resp.Metadata)
 	// Read MD5 from metadata if present
 	if md5sumBase64, ok := o.meta[metaMD5Hash]; ok {
@@ -5563,4 +5593,5 @@ var (
 	_ fs.GetTierer       = &Object{}
 	_ fs.SetTierer       = &Object{}
 	_ fs.Metadataer      = &Object{}
+	_ fs.EntryIdentifier = &Object{}
 )

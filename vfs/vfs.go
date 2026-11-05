@@ -59,6 +59,10 @@ func Help() string {
 type Node interface {
 	os.FileInfo
 	IsFile() bool
+	// Inode returns a deterministic hash of the path, kind and backend identity.
+	// It is stable across cache forgetting and restarts, and unique with high
+	// probability rather than by guarantee. A file or directory created through
+	// the VFS has a temporary number until its node is rebuilt.
 	Inode() uint64
 	SetModTime(modTime time.Time) error
 	Sync() error
@@ -519,13 +523,6 @@ func (vfs *VFS) WaitForWriters(timeout time.Duration) {
 func (vfs *VFS) Root() (*Dir, error) {
 	// fs.Debugf(vfs.f, "Root()")
 	return vfs.root, nil
-}
-
-var inodeCount atomic.Uint64
-
-// newInode creates a new unique inode number
-func newInode() (inode uint64) {
-	return inodeCount.Add(1)
 }
 
 // Stat finds the Node by path starting from the root

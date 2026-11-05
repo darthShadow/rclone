@@ -72,12 +72,18 @@ type File struct {
 //
 // o may be nil
 func newFile(d *Dir, dPath string, o fs.Object, leaf string) *File {
+	var id uint64
+	if o == nil {
+		id = createdInodeCount.Add(1)
+	} else {
+		id = d.vfs.entryIdentity(o)
+	}
 	f := &File{
 		d:     d,
 		dPath: dPath,
 		o:     o,
 		leaf:  leaf,
-		inode: newInode(),
+		inode: inodePrefix(dPath).inode(leaf, inodeKindFile, id),
 		ctx:   d.vfs.ctx,
 	}
 	if o != nil {
