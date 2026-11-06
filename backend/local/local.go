@@ -1420,6 +1420,16 @@ func (f *Fs) Stat(ctx context.Context, dir string, leaf string) (entry fs.DirEnt
 	}
 	fi, fierr := f.getStatScheduler().SubmitOne(ctx, leafPath, true)
 	if fierr != nil {
+		// The listing normalizes on-disk names to NFC but leaf is looked up as
+		// given, so a miss does not prove that the listing lacks the entry.
+		if f.opt.UTFNorm && errors.Is(fierr, os.ErrNotExist) {
+			return nil, fmt.Errorf("%q: entry %q not found by name, a normalized listing may hold it: %w", dir, leafPath, fs.ErrorNotImplemented)
+		}
+		// The listing reports a symlink "name" as "name.rclonelink" when
+		// translating links, but only the raw leaf is looked up here.
+		if f.opt.TranslateSymlinks && strings.HasSuffix(leaf, fs.LinkSuffix) && errors.Is(fierr, os.ErrNotExist) {
+			return nil, fmt.Errorf("%q: entry %q not found by name, a translated link listing may hold it: %w", dir, leafPath, fs.ErrorNotImplemented)
+		}
 		return nil, fmt.Errorf("%q: fetching info about directory entry %q: %w", dir, leafPath, fierr)
 	}
 

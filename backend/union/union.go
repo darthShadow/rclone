@@ -911,22 +911,31 @@ func (f *Fs) searchEntries(entries ...upstream.Entry) (upstream.Entry, error) {
 }
 
 func (f *Fs) mergeDirEntries(entriesList [][]upstream.Entry) (fs.DirEntries, error) {
-	entryMap := make(map[string][]upstream.Entry)
+	total := 0
+	for _, en := range entriesList {
+		total += len(en)
+	}
+	caseInsensitive := f.Features().CaseInsensitive
+	entryMap := make(map[string][]upstream.Entry, total)
 	for _, en := range entriesList {
 		if en == nil {
 			continue
 		}
 		for _, entry := range en {
 			remote := entry.Remote()
-			if f.Features().CaseInsensitive {
+			if caseInsensitive {
 				remote = strings.ToLower(remote)
 			}
-			entryMap[remote] = append(entryMap[remote], entry)
+			if candidates, found := entryMap[remote]; found {
+				entryMap[remote] = append(candidates, entry)
+				continue
+			}
+			entryMap[remote] = []upstream.Entry{entry}
 		}
 	}
-	var entries fs.DirEntries
-	for entryPath := range entryMap {
-		e, err := f.wrapEntries(entryMap[entryPath]...)
+	entries := make(fs.DirEntries, 0, len(entryMap))
+	for _, candidates := range entryMap {
+		e, err := f.wrapEntries(candidates...)
 		if err != nil {
 			return nil, err
 		}

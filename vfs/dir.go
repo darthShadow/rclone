@@ -1055,23 +1055,58 @@ func (d *Dir) statMetadata(leaf, baseLeaf string) (metaNode Node, err error) {
 	return f, nil
 }
 
+// isDefiniteMiss returns true if every leaf of the error tree is a
+// not-found error.
+//
+// It walks wrapped errors and errors.Join style multi-errors, so a single
+// other error, such as fs.ErrorNotImplemented, makes the miss uncertain.
+func isDefiniteMiss(err error) bool {
+	switch x := err.(type) {
+	case interface{ Unwrap() []error }:
+		if errs := x.Unwrap(); len(errs) > 0 {
+			for _, e := range errs {
+				if !isDefiniteMiss(e) {
+					return false
+				}
+			}
+			return true
+		}
+	case interface{ Unwrap() error }:
+		if inner := x.Unwrap(); inner != nil {
+			return isDefiniteMiss(inner)
+		}
+	}
+	return errors.Is(err, fs.ErrorObjectNotFound) ||
+		errors.Is(err, fs.ErrorDirNotFound) ||
+		errors.Is(err, os.ErrNotExist)
+}
+
 // stat a single item in the directory via the stat-er interface
 //
 // returns false if not found.
 func (d *Dir) _stat(leaf string) bool {
+	ok, _ := d._statMiss(leaf)
+	return ok
+}
+
+// _statMiss stats a single item in the directory via the stat-er interface
+//
+// returns false if not found. missing is true only if the backend's Stat
+// proved that leaf does not exist, see isDefiniteMiss.
+func (d *Dir) _statMiss(leaf string) (found, missing bool) {
 	when := time.Now()
 
 	// Quick staleness check
 	d.mu.RLock()
 	if _, stale := d._age(when); !stale {
 		d.mu.RUnlock()
-		return true
+		return true, false
 	}
 
 	stater, ok := d.f.(fs.Stater)
 	if !ok {
 		d.mu.RUnlock()
-		return false
+		return false, false
 	}
 
 	// Use statRead to cache the stat time and avoid doing it again
@@ -1084,7 +1119,7 @@ func (d *Dir) _stat(leaf string) bool {
 		// and we must re-stat rather than report a false miss.
 		if _, present := d.items[leaf]; !stale && present {
 			d.mu.RUnlock()
-			return true
+			return true, false
 		}
 	}
 
@@ -1099,14 +1134,14 @@ func (d *Dir) _stat(leaf string) bool {
 	if err != nil {
 		switch {
 		case errors.Is(err, ENOENT) || errors.Is(err, os.ErrNotExist):
-			return false
+			return false, isDefiniteMiss(err)
 		case errors.Is(err, fs.ErrorObjectNotFound):
-			return false
+			return false, isDefiniteMiss(err)
 		case errors.Is(err, fs.ErrorNotImplemented):
-			return false
+			return false, isDefiniteMiss(err)
 		default:
 			fs.Errorf(dirPath, "stat error: %q: %v", leaf, err)
-			return false
+			return false, isDefiniteMiss(err)
 		}
 	}
 
@@ -1114,25 +1149,25 @@ func (d *Dir) _stat(leaf string) bool {
 	excluded, err := fi.DirContainsExcludeFile(vfsCtx, d.f, dirPath)
 	if err != nil {
 		fs.Errorf(dirPath, "stat filter error: %q: %v", leaf, err)
-		return false
+		return false, false
 	}
 	if excluded {
-		return false
+		return false, false
 	}
 
 	switch item := entry.(type) {
 	case fs.Object:
 		if !fi.IncludeObject(vfsCtx, item) {
-			return false
+			return false, false
 		}
 	case fs.Directory:
 		include, err := fi.IncludeDirectory(vfsCtx, d.f)(item.Remote())
 		if err != nil {
 			fs.Errorf(dirPath, "stat filter error: %q: %v", leaf, err)
-			return false
+			return false, false
 		}
 		if !include {
-			return false
+			return false, false
 		}
 	}
 
@@ -1181,11 +1216,11 @@ func (d *Dir) _stat(leaf string) bool {
 		return true
 	}()
 	if !ok {
-		return false
+		return false, false
 	}
 
 	invalidateChangedContent(contentInvalidators, contentInvalidations)
-	return true
+	return true, false
 }
 
 // stat a single item in the directory
@@ -1194,13 +1229,35 @@ func (d *Dir) _stat(leaf string) bool {
 // returns a custom error if directory on a case-insensitive file system
 // contains files with names that differ only by case.
 func (d *Dir) stat(leaf string) (Node, error) {
-	ok := d._stat(leaf)
+	ci := fs.GetConfig(d.vfs.ctx)
+	normUnicode := !ci.NoUnicodeNormalization
+	normCase := ci.IgnoreCaseSync || d.vfs.Opt.CaseInsensitive
+
+	ok, missing := d._statMiss(leaf)
 
 	if !ok {
-		// Fallback to full directory read
-		err := d._readDir()
-		if err != nil {
-			return nil, err
+		// A definite not-found from Stat means the listing could only find
+		// leaf under another name. That happens when names are normalized,
+		// matched case-insensitively or renamed by --vfs-links. A leaf already
+		// in d.items is left to the listing so that a stale node is dropped.
+		//
+		// Skipping the listing has two costs. A proven miss returns ENOENT
+		// even if listing the directory would have failed. The directory is
+		// not refreshed either, so later lookups in it Stat each name instead
+		// of sharing one listing.
+		skipList := false
+		if missing && !normUnicode && !normCase && !d.vfs.Opt.Links {
+			d.mu.RLock()
+			_, cached := d.items[leaf]
+			d.mu.RUnlock()
+			skipList = !cached
+		}
+		if !skipList {
+			// Fallback to full directory read
+			err := d._readDir()
+			if err != nil {
+				return nil, err
+			}
 		}
 	}
 
@@ -1221,9 +1278,6 @@ func (d *Dir) stat(leaf string) (Node, error) {
 		}
 	}
 
-	ci := fs.GetConfig(d.vfs.ctx)
-	normUnicode := !ci.NoUnicodeNormalization
-	normCase := ci.IgnoreCaseSync || d.vfs.Opt.CaseInsensitive
 	if !ok && (normUnicode || normCase) {
 		leafNormalized := operations.ToNormal(leaf, normUnicode, normCase) // this handles both case and unicode normalization
 		d.mu.Lock()
