@@ -54,6 +54,9 @@ type Cache struct {
 	writeback  *writeback.WriteBack // holds Items for writeback
 	avFn       AddVirtualFn         // if set, can be called to add dir entries
 
+	dirtyMu sync.RWMutex       // protects dirty - a leaf lock, taken after Item.mu
+	dirty   map[dirtyKey]*Item // dirty items by name - an index for DirtyItemAt, kept by Item._setDirty, load, _remove and setDetached, and by Cache.moveDirty
+
 	mu            sync.Mutex       // protects the following variables
 	cond          sync.Cond        // cond lock for synchronous cache cleaning
 	item          map[string]*Item // files/directories in the cache
@@ -64,6 +67,20 @@ type Cache struct {
 	kickerMu      sync.Mutex       // mutex for cleanerKicked
 	kick          chan struct{}    // channel for kicking clear to start
 
+}
+
+// dirtyKey is the name of an item split at its last slash so it can be
+// built from a directory and a leaf without allocating
+type dirtyKey struct {
+	dir, leaf string
+}
+
+// splitName returns the dirtyKey for name, which should be cleaned
+func splitName(name string) dirtyKey {
+	if i := strings.LastIndexByte(name, '/'); i >= 0 {
+		return dirtyKey{dir: name[:i], leaf: name[i+1:]}
+	}
+	return dirtyKey{leaf: name}
 }
 
 // AddVirtualFn if registered by the WithAddVirtual method, can be
@@ -126,6 +143,7 @@ func New(ctx context.Context, fremote fs.Fs, opt *vfscommon.Options, avFn AddVir
 		root:       dataOSPath,
 		metaRoot:   metaOSPath,
 		item:       make(map[string]*Item),
+		dirty:      make(map[dirtyKey]*Item),
 		errItems:   make(map[string]error),
 		hashType:   hashType,
 		hashOption: hashOption,
@@ -325,6 +343,10 @@ func (c *Cache) put(name string, item *Item) (oldItem *Item) {
 	oldItem = c.item[name]
 	if oldItem != item {
 		c.item[name] = item
+		if oldItem != nil {
+			oldItem.setDetached(true)
+		}
+		item.setDetached(false)
 	} else {
 		oldItem = nil
 	}
@@ -351,14 +373,55 @@ func (c *Cache) InUse(name string) bool {
 //
 // name should be a remote path not an osPath
 func (c *Cache) DirtyItem(name string) (item *Item) {
-	name = clean(name)
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	item = c.item[name]
+	key := splitName(clean(name))
+	return c.DirtyItemAt(key.dir, key.leaf)
+}
+
+// DirtyItemAt is DirtyItem for the item called dir/leaf, where dir is
+// "" or a cleaned path with no trailing slash and leaf has no slash.
+//
+// It takes neither c.mu nor Item.mu unless an item with that name has
+// been dirty, and does not allocate.
+func (c *Cache) DirtyItemAt(dir, leaf string) (item *Item) {
+	c.dirtyMu.RLock()
+	item = c.dirty[dirtyKey{dir: dir, leaf: leaf}]
+	c.dirtyMu.RUnlock()
 	if item != nil && !item.IsDirty() {
 		item = nil
 	}
 	return item
+}
+
+// setDirty records in the dirty index whether item, called name, is dirty
+//
+// It may be called with Item.mu held.
+func (c *Cache) setDirty(name string, item *Item, dirty bool) {
+	key := splitName(name)
+	c.dirtyMu.Lock()
+	if dirty {
+		c.dirty[key] = item
+	} else if c.dirty[key] == item {
+		delete(c.dirty, key)
+	}
+	c.dirtyMu.Unlock()
+}
+
+// moveDirty moves the dirty index entry of item from name to newName
+//
+// It follows the move of the item in c.item so it must be called with
+// c.mu held. The index decides whether the item is dirty, not a sample
+// of its flag, because the item may turn dirty under newName before
+// this runs.
+func (c *Cache) moveDirty(name, newName string, item *Item) {
+	oldKey, newKey := splitName(name), splitName(newName)
+	c.dirtyMu.Lock()
+	if c.dirty[oldKey] == item {
+		delete(c.dirty, oldKey)
+		c.dirty[newKey] = item
+	} else if c.dirty[newKey] != item {
+		delete(c.dirty, newKey)
+	}
+	c.dirtyMu.Unlock()
 }
 
 // get gets a file name from the cache or creates a new one
@@ -444,8 +507,12 @@ func (c *Cache) Rename(name string, newName string, newObj fs.Object) (err error
 	// Move the item in the cache
 	c.mu.Lock()
 	if item, ok := c.item[name]; ok {
+		if replaced := c.item[newName]; replaced != nil && replaced != item {
+			replaced.setDetached(true)
+		}
 		c.item[newName] = item
 		delete(c.item, name)
+		c.moveDirty(name, newName, item)
 	}
 	c.mu.Unlock()
 
@@ -506,6 +573,7 @@ func (c *Cache) Remove(name string) (wasWriting bool) {
 	item := c.item[name]
 	if item != nil {
 		delete(c.item, name)
+		item.setDetached(true)
 	}
 	c.mu.Unlock()
 	if item == nil {

@@ -68,6 +68,7 @@ type Item struct {
 	writeBackID     writeback.Handle         // id of any writebacks in progress
 	pendingAccesses int                      // number of threads - cache reset not allowed if not zero
 	modified        bool                     // set if the file has been modified since the last Open
+	detached        bool                     // set if the cache no longer holds the item under its name
 	beingReset      bool                     // cache cleaner is resetting the cache file, access not allowed
 	graceTimer      *time.Timer              // timer for delayed close after grace period
 	closing         chan struct{}            // non-nil while a grace-period close is tearing the handle down, closed when done
@@ -204,6 +205,7 @@ func (item *Item) load() (exists bool, err error) {
 	if err != nil {
 		return true, fmt.Errorf("vfs cache item: corrupt metadata: %w", err)
 	}
+	item.c.setDirty(item.name, item, item.info.Dirty)
 	return true, nil
 }
 
@@ -252,8 +254,8 @@ func (item *Item) _truncate(size int64) (err error) {
 			// If the metadata has info but the file doesn't
 			// not exist then it has been externally removed
 			fs.Errorf(item.name, "vfs cache: detected external removal of cache file")
-			item.info.Rs = nil      // show we have no blocks cached
-			item.info.Dirty = false // file can't be dirty if it doesn't exist
+			item.info.Rs = nil    // show we have no blocks cached
+			item._setDirty(false) // file can't be dirty if it doesn't exist
 			item._removeMeta("cache file externally deleted")
 			fd, err = file.OpenFile(osPath, os.O_CREATE|os.O_WRONLY, 0600)
 		}
@@ -439,7 +441,7 @@ func (item *Item) _dirty() {
 		item.mu.Lock()
 	}
 	if !item.info.Dirty {
-		item.info.Dirty = true
+		item._setDirty(true)
 		err := item._save()
 		if err != nil {
 			fs.Errorf(item.name, "vfs cache: failed to save item info: %v", err)
@@ -461,6 +463,25 @@ func (item *Item) IsDirty() bool {
 	item.mu.Lock()
 	defer item.mu.Unlock()
 	return item.info.Dirty
+}
+
+// _setDirty sets the dirty flag and records it in the cache's dirty index
+//
+// call with lock held
+func (item *Item) _setDirty(dirty bool) {
+	item.info.Dirty = dirty
+	item.c.setDirty(item.name, item, dirty && !item.detached)
+}
+
+// setDetached records whether the cache has taken the item out from
+// under its name, and so keeps it out of the dirty index.
+//
+// Call it with Item.mu unlocked.
+func (item *Item) setDetached(detached bool) {
+	item.mu.Lock()
+	defer item.mu.Unlock()
+	item.detached = detached
+	item.c.setDirty(item.name, item, item.info.Dirty && !detached)
 }
 
 // Create the cache file and store the metadata on disk
@@ -566,7 +587,7 @@ func (item *Item) open(o fs.Object) (err error) {
 		// The backing file is gone, so any ranges are invalid.
 		item.info.Rs = nil
 		// It also can't be dirty if the data no longer exists.
-		item.info.Dirty = false
+		item._setDirty(false)
 		if item.fd != nil {
 			_ = item.fd.Close()
 			item.fd = nil
@@ -605,13 +626,15 @@ func (item *Item) open(o fs.Object) (err error) {
 	// item in at a time.
 	oldItem := item.c.put(item.name, item) // LOCKING in Cache method
 	if oldItem != nil {
+		// Unlock before put, which locks oldItem.mu again to clear its detached mark
 		oldItem.mu.Lock()
-		if oldItem.opens != 0 {
+		oldOpen := oldItem.opens != 0
+		oldItem.mu.Unlock()
+		if oldOpen {
 			// Put the item back and return an error
 			item.c.put(item.name, oldItem) // LOCKING in Cache method
 			err = fmt.Errorf("internal error: item %q already open in the cache", item.name)
 		}
-		oldItem.mu.Unlock()
 	}
 
 	// Relock the Item.mu for the return
@@ -701,7 +724,7 @@ func (item *Item) _store(ctx context.Context, storeFn StoreFn) (err error) {
 	}
 
 	// Show item is clean and is eligible for cache removal
-	item.info.Dirty = false
+	item._setDirty(false)
 	err = item._save()
 	if err != nil {
 		fs.Errorf(item.name, "vfs cache: failed to write metadata file: %v", err)
@@ -1015,6 +1038,7 @@ func (item *Item) _remove(reason string) (wasWriting bool) {
 	wasWriting = item.c.writeback.Remove(item.writeBackID)
 	item.mu.Lock()
 	item.info.clean()
+	item.c.setDirty(item.name, item, false)
 	item._removeFile(reason)
 	item._removeMeta(reason)
 	return wasWriting

@@ -18,6 +18,7 @@ import (
 	"github.com/rclone/rclone/fs/log"
 	"github.com/rclone/rclone/fs/operations"
 	"github.com/rclone/rclone/lib/join"
+	"github.com/rclone/rclone/vfs/vfscache"
 	"github.com/rclone/rclone/vfs/vfscommon"
 )
 
@@ -185,6 +186,20 @@ func (f *File) _cachePath() string {
 		leaf += fs.LinkSuffix
 	}
 	return join.PathJoin(dPath, leaf)
+}
+
+// _dirtyItem returns the item for the file if it is dirty in the cache
+// or nil if not. It builds no path for the lookup.
+// use when lock is held
+func (f *File) _dirtyItem() *vfscache.Item {
+	if f.d.vfs.Opt.CacheMode < vfscommon.CacheModeMinimal {
+		return nil
+	}
+	leaf := f.leaf
+	if f.isLink {
+		leaf += fs.LinkSuffix
+	}
+	return f.d.vfs.cache.DirtyItemAt(f.dPath, leaf)
 }
 
 // CachePath returns the full path of the file with the fs.LinkSuffix if appropriate
@@ -409,14 +424,15 @@ func (f *File) ModTime() (modTime time.Time) {
 		return f._roundModTime(pendingModTime)
 	}
 	// Read the modtime from a dirty item if it exists
-	if f.d.vfs.Opt.CacheMode >= vfscommon.CacheModeMinimal {
-		if item := f.d.vfs.cache.DirtyItem(f._cachePath()); item != nil {
-			modTime, err := item.GetModTime()
-			if err != nil {
-				fs.Errorf(f._path(), "ModTime: Item GetModTime failed: %v", err)
-			} else {
-				return f._roundModTime(modTime)
-			}
+	f.mu.RLock()
+	item := f._dirtyItem()
+	f.mu.RUnlock()
+	if item != nil {
+		modTime, err := item.GetModTime()
+		if err != nil {
+			fs.Errorf(f.Path(), "ModTime: Item GetModTime failed: %v", err)
+		} else {
+			return f._roundModTime(modTime)
 		}
 	}
 	if virtualModTime != nil && !virtualModTime.IsZero() {
@@ -443,14 +459,12 @@ func (f *File) Size() int64 {
 	defer f.mu.RUnlock()
 
 	// Read the size from a dirty item if it exists
-	if f.d.vfs.Opt.CacheMode >= vfscommon.CacheModeMinimal {
-		if item := f.d.vfs.cache.DirtyItem(f._cachePath()); item != nil {
-			size, err := item.GetSize()
-			if err != nil {
-				fs.Errorf(f._path(), "Size: Item GetSize failed: %v", err)
-			} else {
-				return size
-			}
+	if item := f._dirtyItem(); item != nil {
+		size, err := item.GetSize()
+		if err != nil {
+			fs.Errorf(f._path(), "Size: Item GetSize failed: %v", err)
+		} else {
+			return size
 		}
 	}
 

@@ -235,12 +235,19 @@ func (trs timeRanges) total() (total time.Duration) {
 //
 // Needs to be protected by mutex.
 func (s *StatsInfo) _totalDuration() time.Duration {
+	return s._totalDurationAt(time.Now())
+}
+
+// _totalDurationAt is _totalDuration with the end of the active
+// transfers taken as now.
+//
+// Needs to be protected by mutex.
+func (s *StatsInfo) _totalDurationAt(now time.Time) time.Duration {
 	// copy of s.oldTimeRanges with extra room for the current transfers
 	timeRanges := make(timeRanges, len(s.oldTimeRanges), len(s.oldTimeRanges)+len(s.startedTransfers))
 	copy(timeRanges, s.oldTimeRanges)
 
 	// Extract time ranges of all transfers.
-	now := time.Now()
 	for i := range s.startedTransfers {
 		start, end := s.startedTransfers[i].TimeRange()
 		if end.IsZero() {
@@ -740,6 +747,7 @@ func (s *StatsInfo) ResetCounters() {
 	s.renames = 0
 	s.listed = 0
 	s.startedTransfers = nil
+	s.oldTimeRanges = nil
 	s.oldDuration = 0
 
 	// Only restart the average loop if it was running. Otherwise
@@ -921,24 +929,37 @@ func (s *StatsInfo) AddTransfer(transfer *Transfer) {
 func (s *StatsInfo) _removeTransfer(transfer *Transfer, i int) {
 	now := time.Now()
 
-	// add finished transfer onto old time ranges
 	start, end := transfer.TimeRange()
 	if end.IsZero() {
 		end = now
 	}
-	s.oldTimeRanges = append(s.oldTimeRanges, timeRange{start, end})
-	s.oldTimeRanges.merge()
 
 	// remove the found entry
 	s.startedTransfers = slices.Delete(s.startedTransfers, i, i+1)
 
-	// Find youngest active transfer
+	// Find the oldest remaining transfer, and the oldest one that is
+	// still running.
 	oldestStart := now
-	for i := range s.startedTransfers {
-		start, _ := s.startedTransfers[i].TimeRange()
-		if start.Before(oldestStart) {
-			oldestStart = start
+	var runningStart time.Time
+	for _, tr := range s.startedTransfers {
+		trStart, trEnd := tr.TimeRange()
+		if trStart.Before(oldestStart) {
+			oldestStart = trStart
 		}
+		if trEnd.IsZero() && (runningStart.IsZero() || trStart.Before(runningStart)) {
+			runningStart = trStart
+		}
+	}
+
+	// A running transfer which started before this one covers its
+	// time range, both now and in the range it adds when it is
+	// removed, so there is no need to keep a range for this one. A
+	// running transfer which started at the same instant is not enough:
+	// dropping the range then lets an older range ending at that instant
+	// be culled earlier, which changes the sum over stats groups.
+	if runningStart.IsZero() || !runningStart.Before(start) {
+		s.oldTimeRanges = append(s.oldTimeRanges, timeRange{start, end})
+		s.oldTimeRanges.merge()
 	}
 
 	// remove old entries older than that
