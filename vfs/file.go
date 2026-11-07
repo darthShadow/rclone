@@ -309,13 +309,21 @@ func (f *File) rename(ctx context.Context, destDir *Dir, newName string) error {
 		// Update the node with the new details
 		fs.Debugf(f.Path(), "Updating file with %v %p", newObject, f)
 		// f.rename(destDir, newObject)
+		linkFlipped := false
 		f.mu.Lock()
 		if newObject != nil {
+			wasLink := f.isLink
 			f.o = newObject
 			f._setIsLink()
+			linkFlipped = f.isLink != wasLink
 		}
 		f.pendingRenameFun = nil
 		f.mu.Unlock()
+		// The link flag is part of the parent's listing. Release File.mu
+		// before taking Dir.mu, as addObject takes them in the other order.
+		if linkFlipped {
+			d.bumpGeneration()
+		}
 		return nil
 	}
 
@@ -572,7 +580,9 @@ func (f *File) setSize(n int64) {
 func (f *File) setObject(o fs.Object) {
 	f.mu.Lock()
 	f.o = o
+	wasLink := f.isLink
 	f._setIsLink()
+	linkFlipped := f.isLink != wasLink
 	if do, ok := f.o.(fs.SetMetadataer); ok && !f.d.vfs.Opt.SkipMetadata {
 		err := do.SetMetadata(f.ctx, fs.Metadata{
 			"uid":  fmt.Sprintf("%d", f.d.vfs.Opt.UID),
@@ -589,6 +599,9 @@ func (f *File) setObject(o fs.Object) {
 
 	// Release File.mu before calling Dir method
 	d.addObject(f)
+	if linkFlipped {
+		d.bumpGeneration()
+	}
 }
 
 // Update the object but don't update the directory cache - for use by

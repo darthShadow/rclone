@@ -1214,3 +1214,295 @@ func TestDirLinksInvalidNameStat(t *testing.T) {
 		})
 	}
 }
+
+// peekDirGeneration returns the generation of dir without listing it
+func peekDirGeneration(dir *Dir) uint64 {
+	dir.mu.RLock()
+	defer dir.mu.RUnlock()
+	return dir.generation
+}
+
+// skipIfNoRename skips the test if the remote can't rename files
+func skipIfNoRename(t *testing.T, r *fstest.Run) {
+	t.Helper()
+	features := r.Fremote.Features()
+	if features.Move == nil && features.Copy == nil {
+		t.Skip("can't rename files")
+	}
+}
+
+// requireDirGenerationChanged runs f and checks it changes the generation of dir
+func requireDirGenerationChanged(t *testing.T, dir *Dir, what string, f func()) {
+	t.Helper()
+	before := peekDirGeneration(dir)
+	f()
+	require.NotEqual(t, before, peekDirGeneration(dir), "generation should change: %s", what)
+}
+
+// requireDirGenerationUnchanged runs f and checks it leaves the generation of dir alone
+func requireDirGenerationUnchanged(t *testing.T, dir *Dir, what string, f func()) {
+	t.Helper()
+	before := peekDirGeneration(dir)
+	f()
+	require.Equal(t, before, peekDirGeneration(dir), "generation should not change: %s", what)
+}
+
+func TestDirGenerationStable(t *testing.T) {
+	_, _, dir, _ := dirCreate(t)
+
+	g1, err := dir.Generation()
+	require.NoError(t, err)
+	g2, err := dir.Generation()
+	require.NoError(t, err)
+	assert.Equal(t, g1, g2)
+
+	require.NoError(t, dir.readDir())
+	g3, err := dir.Generation()
+	require.NoError(t, err)
+	assert.Equal(t, g1, g3)
+
+	names, g4, err := MapReadDirGeneration(dir, func(leaf string, _ Node) (string, error) { return leaf, nil }, 0)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"file1"}, names)
+	assert.Equal(t, g3, g4)
+}
+
+func TestDirGenerationVirtual(t *testing.T) {
+	_, _, dir, _ := dirCreate(t)
+	require.NoError(t, dir.readDir())
+
+	requireDirGenerationChanged(t, dir, "AddVirtual of a new name", func() {
+		dir.AddVirtual("new", 1, false)
+	})
+	requireDirGenerationUnchanged(t, dir, "AddVirtual of an existing name", func() {
+		dir.AddVirtual("new", 1, false)
+	})
+	requireDirGenerationChanged(t, dir, "DelVirtual of a present name", func() {
+		dir.DelVirtual("new")
+	})
+	dir.mu.RLock()
+	node := dir.items["file1"]
+	dir.mu.RUnlock()
+	require.NotNil(t, node)
+	requireDirGenerationUnchanged(t, dir, "addObject of the node already stored", func() {
+		dir.addObject(node)
+	})
+}
+
+func TestDirGenerationLinkFlip(t *testing.T) {
+	opt := vfscommon.Opt
+	opt.Links = true
+	r, vfs := newTestVFSOpt(t, &opt)
+	ctx := context.Background()
+
+	r.WriteObject(ctx, "dir/x"+fs.LinkSuffix, "target", t1)
+	node, err := vfs.Stat("dir")
+	require.NoError(t, err)
+	dir := node.(*Dir)
+	require.NoError(t, dir.readDir())
+
+	// Replace the link with a regular file of the same name
+	obj, err := r.Fremote.NewObject(ctx, "dir/x"+fs.LinkSuffix)
+	require.NoError(t, err)
+	require.NoError(t, obj.Remove(ctx))
+	r.WriteObject(ctx, "dir/x", "regular", t1)
+	requireDirGenerationChanged(t, dir, "link replaced by a regular file", func() {
+		require.NoError(t, dir.readDir())
+	})
+
+	// Overwrite the regular file with a new size
+	r.WriteObject(ctx, "dir/x", "regular with a new size", t2)
+	requireDirGenerationUnchanged(t, dir, "same name, same type, new size", func() {
+		require.NoError(t, dir.readDir())
+	})
+}
+
+func TestDirGenerationRename(t *testing.T) {
+	r, vfs, dir, _ := dirCreate(t)
+	skipIfNoRename(t, r)
+	ctx := context.Background()
+
+	r.WriteObject(ctx, "dir/file3", "file3 contents!", t1)
+	root, err := vfs.Root()
+	require.NoError(t, err)
+	dir2, err := root.Mkdir("dir2")
+	require.NoError(t, err)
+	require.NoError(t, dir.readDir())
+	require.NoError(t, dir2.readDir())
+
+	dirBefore, dir2Before := peekDirGeneration(dir), peekDirGeneration(dir2)
+	require.NoError(t, dir.Rename("file1", "file2", dir2))
+	require.NotEqual(t, dirBefore, peekDirGeneration(dir), "source parent should change")
+	require.NotEqual(t, dir2Before, peekDirGeneration(dir2), "destination parent should change")
+
+	// Rename onto an existing name
+	dirBefore, dir2Before = peekDirGeneration(dir), peekDirGeneration(dir2)
+	require.NoError(t, dir.Rename("file3", "file2", dir2))
+	require.NotEqual(t, dirBefore, peekDirGeneration(dir), "source parent should change")
+	require.NotEqual(t, dir2Before, peekDirGeneration(dir2), "destination should change when a name is replaced")
+}
+
+func TestDirGenerationForgetAll(t *testing.T) {
+	_, _, dir, _ := dirCreate(t)
+	require.NoError(t, dir.readDir())
+	require.NotEmpty(t, dir.items)
+
+	requireDirGenerationChanged(t, dir, "ForgetAll with items", func() {
+		dir.ForgetAll()
+	})
+	assert.Empty(t, dir.items)
+
+	// With a virtual entry nothing is cleared
+	require.NoError(t, dir.readDir())
+	dir.AddVirtual("virtual", 1, false)
+	requireDirGenerationUnchanged(t, dir, "ForgetAll with a virtual entry", func() {
+		dir.ForgetAll()
+	})
+	assert.Len(t, dir.items, 2)
+}
+
+func TestDirGenerationRemoved(t *testing.T) {
+	r, _, dir, _ := dirCreate(t)
+	ctx := context.Background()
+	r.WriteObject(ctx, "dir/file2", "file2 contents", t1)
+	require.NoError(t, dir.readDir())
+
+	obj, err := r.Fremote.NewObject(ctx, "dir/file1")
+	require.NoError(t, err)
+	require.NoError(t, obj.Remove(ctx))
+	requireDirGenerationChanged(t, dir, "object removed from the backend", func() {
+		require.NoError(t, dir.readDir())
+	})
+}
+
+func TestDirGenerationStat(t *testing.T) {
+	r, _, dir, _ := dirCreate(t)
+	if _, ok := r.Fremote.(fs.Stater); !ok {
+		t.Skip("backend does not implement fs.Stater")
+	}
+	ctx := context.Background()
+
+	// The directory is stale so a stat goes to the backend
+	r.WriteObject(ctx, "dir/new", "new contents", t1)
+	requireDirGenerationChanged(t, dir, "Stat of a name written to the backend", func() {
+		_, err := dir.Stat("new")
+		require.NoError(t, err)
+	})
+
+	// List the directory, make it stale again, and stat a missing name
+	require.NoError(t, dir.readDir())
+	dir.mu.Lock()
+	dir.read = time.Time{}
+	dir.mu.Unlock()
+	requireDirGenerationUnchanged(t, dir, "Stat of a name absent from the backend", func() {
+		_, err := dir.Stat("absent")
+		assert.Equal(t, ENOENT, err)
+	})
+}
+
+func TestDirGenerationRebuiltDir(t *testing.T) {
+	_, vfs, dir, _ := dirCreate(t)
+	root, err := vfs.Root()
+	require.NoError(t, err)
+	before := peekDirGeneration(dir)
+
+	root.ForgetAll()
+	node, err := vfs.Stat("dir")
+	require.NoError(t, err)
+	rebuilt := node.(*Dir)
+	require.NotSame(t, dir, rebuilt)
+	assert.NotEqual(t, before, peekDirGeneration(rebuilt), "a rebuilt Dir should not repeat a generation")
+}
+
+// A rename writes f.leaf before the backend move. The published name
+// is the map key, so a listing must not show it, and it must not
+// change the generation.
+func TestDirGenerationRenameInProgress(t *testing.T) {
+	r, vfs := newTestVFS(t)
+	ctx := context.Background()
+	r.WriteObject(ctx, "dir/a", "a contents", t1)
+	r.WriteObject(ctx, "dir/m", "m contents", t1)
+	node, err := vfs.Stat("dir")
+	require.NoError(t, err)
+	dir := node.(*Dir)
+	require.NoError(t, dir.readDir())
+
+	leaves := func(convert func(leaf string, node Node) (string, error)) ([]string, uint64) {
+		t.Helper()
+		names, generation, err := MapReadDirGeneration(dir, convert, 0)
+		require.NoError(t, err)
+		slices.Sort(names)
+		return names, generation
+	}
+	byKey := func(leaf string, _ Node) (string, error) { return leaf, nil }
+
+	_, before := leaves(byKey)
+
+	dir.mu.RLock()
+	f := dir.items["a"].(*File)
+	dir.mu.RUnlock()
+	f.mu.Lock()
+	f.leaf = "z"
+	f.mu.Unlock()
+
+	names, after := leaves(byKey)
+	assert.Equal(t, []string{"a", "m"}, names)
+	assert.Equal(t, before, after)
+
+	byName, err := MapReadDir(dir, func(n Node) (string, error) { return n.Name(), nil }, 0)
+	require.NoError(t, err)
+	slices.Sort(byName)
+	assert.Equal(t, []string{"m", "z"}, byName)
+}
+
+func TestDirGenerationDelayedRename(t *testing.T) {
+	opt := vfscommon.Opt
+	opt.Links = true
+	r, vfs := newTestVFSOpt(t, &opt)
+	skipIfNoRename(t, r)
+	ctx := context.Background()
+
+	r.WriteObject(ctx, "dir/file1", "file1 contents", t1)
+	node, err := vfs.Stat("dir")
+	require.NoError(t, err)
+	dir := node.(*Dir)
+	require.NoError(t, dir.readDir())
+
+	// With the cache off the rename waits until the writer closes
+	fd, err := vfs.OpenFile("dir/x", os.O_WRONLY|os.O_CREATE, 0666)
+	require.NoError(t, err)
+	_, err = fd.Write([]byte("x contents"))
+	require.NoError(t, err)
+	require.NoError(t, dir.Rename("x", "y"+fs.LinkSuffix, dir))
+
+	requireDirGenerationChanged(t, dir, "delayed rename to a link name runs on close", func() {
+		require.NoError(t, fd.Close())
+	})
+}
+
+func TestDirGenerationUploadLinkFlip(t *testing.T) {
+	opt := vfscommon.Opt
+	opt.Links = true
+	opt.CacheMode = vfscommon.CacheModeWrites
+	opt.WriteBack = 0
+	r, vfs := newTestVFSOpt(t, &opt)
+	skipIfNoRename(t, r)
+	ctx := context.Background()
+
+	r.WriteObject(ctx, "dir/file1", "file1 contents", t1)
+	node, err := vfs.Stat("dir")
+	require.NoError(t, err)
+	dir := node.(*Dir)
+	require.NoError(t, dir.readDir())
+
+	// With the write cache the rename runs at once, before any object exists
+	fd, err := vfs.OpenFile("dir/x", os.O_WRONLY|os.O_CREATE, 0666)
+	require.NoError(t, err)
+	_, err = fd.Write([]byte("x contents"))
+	require.NoError(t, err)
+	require.NoError(t, dir.Rename("x", "y"+fs.LinkSuffix, dir))
+
+	requireDirGenerationChanged(t, dir, "upload of a link name sets the link flag", func() {
+		require.NoError(t, fd.Close())
+	})
+}

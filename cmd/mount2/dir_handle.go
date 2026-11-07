@@ -4,6 +4,7 @@ package mount2
 
 import (
 	"context"
+	"sync"
 	"syscall"
 
 	fusefs "github.com/hanwen/go-fuse/v2/fs"
@@ -23,6 +24,21 @@ type mount2DirHandle struct {
 	dir     *vfs.Dir
 	entries []fuse.DirEntry
 	index   int
+	caching bool // opened with FOPEN_CACHE_DIR; counted in parent.dir.caching
+}
+
+// dirKey identifies the listing the kernel directory cache may hold.
+type dirKey struct {
+	generation uint64 // vfs.Dir listing generation; 0 means not set
+	parentIno  uint64 // inode ".." lists
+}
+
+// dirState is the kernel directory cache state of a directory Node.
+type dirState struct {
+	mu      sync.Mutex      // protects the following
+	key     dirKey          // listing the kernel cache may hold or is being filled from
+	caching int             // open handles returned with FOPEN_CACHE_DIR
+	snap    []fuse.DirEntry // shared entries for key; nil until captured
 }
 
 var _ fusefs.FileHandle = (*mount2DirHandle)(nil)
@@ -40,9 +56,24 @@ func vfsNodeToDirEntry(n vfs.Node) (fuse.DirEntry, error) {
 	}, nil
 }
 
+// vfsLeafToDirEntry converts a VFS node to a FUSE directory entry named by its
+// published leaf, which differs from n.Name() while a rename is running or
+// after one failed.
+func vfsLeafToDirEntry(leaf string, n vfs.Node) (fuse.DirEntry, error) {
+	return fuse.DirEntry{
+		Mode: getMode(n),
+		Name: leaf,
+		Ino:  n.Inode(),
+	}, nil
+}
+
+// kernelDirCacheFlags tell the kernel to read and fill its directory cache.
+const kernelDirCacheFlags = fuse.FOPEN_CACHE_DIR | fuse.FOPEN_KEEP_CACHE
+
 // OpendirHandle implements fusefs.NodeOpendirHandler. It resolves the current
-// VFS directory once and returns a per-open stream handle without enabling
-// kernel directory caching.
+// VFS directory once and returns a per-open stream handle. With the kernel
+// directory cache on, it returns the flags that let the kernel reuse an
+// unchanged listing.
 func (n *Node) OpendirHandle(ctx context.Context, flags uint32) (fusefs.FileHandle, uint32, syscall.Errno) {
 	vfsNode, errno := n.lookupSelf()
 	if errno != 0 {
@@ -53,10 +84,26 @@ func (n *Node) OpendirHandle(ctx context.Context, flags uint32) (fusefs.FileHand
 		return nil, 0, syscall.ENOTDIR
 	}
 
+	if n.fsys.dirCache {
+		return n.opendirCached(dir)
+	}
+
 	entries, err := vfs.MapReadDir[fuse.DirEntry](dir, vfsNodeToDirEntry, 2)
 	if err != nil {
 		return nil, 0, translateError(err)
 	}
+	n.fillDotEntries(dir, entries)
+
+	return &mount2DirHandle{
+		parent:  n,
+		dir:     dir,
+		entries: entries,
+	}, 0, 0
+}
+
+// fillDotEntries sets "." and ".." in entries[0:2] and the contiguous 1-based
+// offsets of all entries.
+func (n *Node) fillDotEntries(dir *vfs.Dir, entries []fuse.DirEntry) {
 	// go-fuse emits "." and ".." as dirents with inode values and skips their
 	// readdirplus child lookup. Adding either to the real node tree triggers a
 	// recovered panic, logs its stack trace, and returns EIO.
@@ -73,12 +120,93 @@ func (n *Node) OpendirHandle(ctx context.Context, flags uint32) (fusefs.FileHand
 	for i := range entries {
 		entries[i].Off = uint64(i + 1)
 	}
+}
+
+// privateEntries lists dir for a handle that bypasses the shared snapshot. It
+// names entries by their published leaf, as the snapshot does.
+func (n *Node) privateEntries(dir *vfs.Dir) ([]fuse.DirEntry, syscall.Errno) {
+	entries, _, err := vfs.MapReadDirGeneration(dir, vfsLeafToDirEntry, 2)
+	if err != nil {
+		return nil, translateError(err)
+	}
+	n.fillDotEntries(dir, entries)
+	return entries, 0
+}
+
+// opendirCached opens dir with the kernel directory cache on.
+//
+// The kernel keeps the pages of one listing per directory inode. A listing is
+// identified by dirKey. Handles that fill the cache share one snapshot, so
+// they all emit the same names at the same offsets. The first open that sees a
+// new key with no caching handle open drops the pages with NotifyContent
+// before it replies. An open that sees a new key while a caching handle is
+// open gets FOPEN_KEEP_CACHE alone: it leaves the pages in place and lists
+// privately.
+//
+// Lock order: go-fuse file mutex, dirState.mu, vfs.Dir.mu.
+func (n *Node) opendirCached(dir *vfs.Dir) (fusefs.FileHandle, uint32, syscall.Errno) {
+	generation, err := dir.Generation()
+	if err != nil {
+		return nil, 0, translateError(err)
+	}
+	key := dirKey{generation: generation, parentIno: n.parentDirEntryInode()}
+	state := n.dir
+
+	state.mu.Lock()
+	switch {
+	case state.key.generation == 0:
+		// No caching handle of this Node has filled pages.
+		state.key = key
+	case key != state.key && state.caching > 0:
+		state.mu.Unlock()
+		return n.opendirPrivate(dir)
+	case key != state.key:
+		// ENOENT means the kernel holds no inode, so it holds no pages.
+		if errno := n.EmbeddedInode().NotifyContent(0, 0); errno != 0 && errno != syscall.ENOENT {
+			state.mu.Unlock()
+			return n.opendirPrivate(dir)
+		}
+		state.key = key
+		state.snap = nil
+	}
+	if state.snap == nil {
+		snap, g2, err := vfs.MapReadDirGeneration(dir, vfsLeafToDirEntry, 2)
+		if err != nil {
+			state.mu.Unlock()
+			return nil, 0, translateError(err)
+		}
+		n.fillDotEntries(dir, snap)
+		if g2 != key.generation {
+			// The listing changed after Generation. No caching handle exists,
+			// so the pages of the new listing start empty.
+			state.key = dirKey{generation: g2, parentIno: key.parentIno}
+		}
+		state.snap = snap
+	}
+	state.caching++
+	snap := state.snap
+	state.mu.Unlock()
 
 	return &mount2DirHandle{
 		parent:  n,
 		dir:     dir,
+		entries: snap,
+		caching: true,
+	}, kernelDirCacheFlags, 0
+}
+
+// opendirPrivate returns a handle over private entries that keeps the kernel
+// pages and does not read or fill them.
+func (n *Node) opendirPrivate(dir *vfs.Dir) (fusefs.FileHandle, uint32, syscall.Errno) {
+	entries, errno := n.privateEntries(dir)
+	if errno != 0 {
+		return nil, 0, errno
+	}
+	return &mount2DirHandle{
+		parent:  n,
+		dir:     dir,
 		entries: entries,
-	}, 0, 0
+	}, fuse.FOPEN_KEEP_CACHE, 0
 }
 
 // Readdirent returns the next entry from the per-open directory stream.
@@ -124,6 +252,13 @@ func (h *mount2DirHandle) Lookup(ctx context.Context, name string, out *fuse.Ent
 
 // Releasedir drops all per-open directory state.
 func (h *mount2DirHandle) Releasedir(ctx context.Context, releaseFlags uint32) {
+	// The shared snapshot stays with the Node until the listing changes.
+	if h.caching && h.parent != nil {
+		h.parent.dir.mu.Lock()
+		h.parent.dir.caching--
+		h.parent.dir.mu.Unlock()
+	}
+	h.caching = false
 	h.parent = nil
 	h.dir = nil
 	h.entries = nil

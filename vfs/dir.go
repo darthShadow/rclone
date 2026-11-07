@@ -43,6 +43,8 @@ type Dir struct {
 	virtual  map[string]vState    // virtual directory entries - may be nil
 	statRead map[string]time.Time // time directory entry last stat-ed
 
+	generation uint64 // listing generation, see Generation
+
 	modTimeMu sync.Mutex // protects the following
 	modTime   time.Time
 
@@ -77,12 +79,31 @@ func newDir(vfs *VFS, f fs.Fs, parent *Dir, fsDir fs.Directory) *Dir {
 		inode:    vfs.dirInode(fsDir),
 		items:    make(map[string]Node),
 		statRead: make(map[string]time.Time),
+
+		generation: vfs.dirGeneration.Add(1),
 	}
 	// Set timer up like this to avoid race of d.cacheCleanup being called
 	// before d.cleanupTimer is assigned to
 	d.cleanupTimer = time.AfterFunc(time.Hour, d.cacheCleanup)
 	d.cleanupTimer.Reset(time.Duration(vfs.Opt.DirCacheTime * 2))
 	return d
+}
+
+// _bumpGeneration gives the directory a new listing generation. The
+// generation comes from the VFS so a rebuilt Dir never repeats a value.
+//
+// must be called with the Dir lock held for writing
+func (d *Dir) _bumpGeneration() {
+	d.generation = d.vfs.dirGeneration.Add(1)
+}
+
+// bumpGeneration gives the directory a new listing generation.
+//
+// must be called without the Dir lock held
+func (d *Dir) bumpGeneration() {
+	d.mu.Lock()
+	d._bumpGeneration()
+	d.mu.Unlock()
 }
 
 // resetStatRead clears the per-entry stat cache.
@@ -279,6 +300,9 @@ func (d *Dir) clearAndCollect(collectPrune bool) (victims []Node, hasVirtual boo
 	if !hasVirtual {
 		if collectPrune {
 			victims = collectPruneVictims(d.items)
+		}
+		if len(d.items) > 0 {
+			d._bumpGeneration()
 		}
 		d.read = time.Time{}
 		d.items = make(map[string]Node)
@@ -524,6 +548,9 @@ func name(p string) string {
 func (d *Dir) addObject(node Node) {
 	d.mu.Lock()
 	leaf := node.Name()
+	if d.items[leaf] != node {
+		d._bumpGeneration()
+	}
 	d.items[leaf] = node
 	if d.virtual == nil {
 		d.virtual = make(map[string]vState)
@@ -587,6 +614,9 @@ func (d *Dir) AddVirtual(leaf string, size int64, isDir bool) {
 // from a remote directory listing.
 func (d *Dir) delObject(leaf string) {
 	d.mu.Lock()
+	if _, found := d.items[leaf]; found {
+		d._bumpGeneration()
+	}
 	delete(d.items, leaf)
 	// Drop any per-leaf stat freshness so a later stat cannot report the
 	// removed item as still-known (statRead must never outlive its item).
@@ -839,6 +869,7 @@ func (mv manageVirtuals) add(d *Dir, name string) bool {
 //
 // must be called with the Dir lock held
 func (mv manageVirtuals) end(d *Dir, collectPrune bool) (victims []Node) {
+	deleted := false
 	// delete unused d.items
 	for name := range d.items {
 		if _, ok := mv[name]; !ok {
@@ -855,8 +886,12 @@ func (mv manageVirtuals) end(d *Dir, collectPrune bool) (victims []Node) {
 					}
 				}
 				delete(d.items, name)
+				deleted = true
 			}
 		}
+	}
+	if deleted {
+		d._bumpGeneration()
 	}
 	// delete unused d.virtual~s
 	for name, virtualState := range d.virtual {
@@ -888,6 +923,7 @@ func (d *Dir) _processEntry(entry fs.DirEntry, mv manageVirtuals, dirTree dirtre
 	}
 
 	node := d.items[entryName]
+	oldNode := node
 
 	switch item := entry.(type) {
 
@@ -896,6 +932,9 @@ func (d *Dir) _processEntry(entry fs.DirEntry, mv manageVirtuals, dirTree dirtre
 		// Reuse old file value if it exists
 		if file, ok := node.(*File); node != nil && ok {
 			contentInvalidation := file.setObjectNoUpdate(obj)
+			if contentInvalidation.wasLink != contentInvalidation.isLink {
+				d._bumpGeneration()
+			}
 			if collectContentInvalidation && (contentInvalidation.wasLink || contentInvalidation.isLink) {
 				contentInvalidations = append(contentInvalidations, contentInvalidation)
 			}
@@ -934,6 +973,9 @@ func (d *Dir) _processEntry(entry fs.DirEntry, mv manageVirtuals, dirTree dirtre
 		return nil, nil, fmt.Errorf("unknown type: %T", item)
 	}
 
+	if node != oldNode {
+		d._bumpGeneration()
+	}
 	d.items[entryName] = node
 	return victims, contentInvalidations, nil
 }
@@ -1720,12 +1762,33 @@ func (d *Dir) Truncate(size int64) error {
 	return ENOSYS
 }
 
-// MapReadDir applies a conversion function to all nodes returned from a readdir of the directory
-// and returns a slice of results
-func MapReadDir[T any](d *Dir, convertNode func(Node) (T, error), existingItemCount int) (items []T, err error) {
+// Generation returns the listing generation of the directory after
+// bringing the listing up to date as ReadDirAll does.
+//
+// The generation is unique within the VFS. It changes when a name is
+// added or removed, when the node behind a name changes, or when a
+// name's file type changes. Size and modification time changes do not
+// change it.
+func (d *Dir) Generation() (uint64, error) {
+	err := d._readDir()
+	if err != nil {
+		return 0, err
+	}
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return d.generation, nil
+}
+
+// MapReadDirGeneration applies a conversion function to all nodes
+// returned from a readdir of the directory and returns a slice of
+// results with the listing generation they were read at.
+//
+// leaf is the published name. It can differ from node.Name() while a
+// rename is in progress or after a failed rename.
+func MapReadDirGeneration[T any](d *Dir, convert func(leaf string, node Node) (T, error), existingItemCount int) (items []T, generation uint64, err error) {
 	err = d._readDir()
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 
 	d.mu.Lock()
@@ -1733,13 +1796,20 @@ func MapReadDir[T any](d *Dir, convertNode func(Node) (T, error), existingItemCo
 
 	items = make([]T, existingItemCount, existingItemCount+len(d.items))
 
-	for _, item := range d.items {
-		itemT, err := convertNode(item)
+	for leaf, item := range d.items {
+		itemT, err := convert(leaf, item)
 		if err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 		items = append(items, itemT)
 	}
 
-	return items, nil
+	return items, d.generation, nil
+}
+
+// MapReadDir applies a conversion function to all nodes returned from a readdir of the directory
+// and returns a slice of results
+func MapReadDir[T any](d *Dir, convertNode func(Node) (T, error), existingItemCount int) (items []T, err error) {
+	items, _, err = MapReadDirGeneration(d, func(_ string, n Node) (T, error) { return convertNode(n) }, existingItemCount)
+	return items, err
 }

@@ -464,6 +464,18 @@ then there is no chance of corruption.
 
 This is the same as setting the attr_timeout option in mount.fuse.
 
+### Kernel directory cache
+
+On Linux, `rclone mount2` lets the kernel cache a directory listing while its names are unchanged; `--kernel-dir-cache=false` turns this off.
+
+It is off when `--dir-cache-time` is 0 or less.
+
+After a cached listing, the attributes of its entries refresh only after `--attr-timeout`.
+
+If the directory is deleted between `opendir` and the first read, the read can fail.
+
+While a rename runs, and after a rename fails, the listing shows the old name, which is the name a lookup finds.
+
 ### Filters
 
 Note that all the rclone filters can be used to select a subset of the

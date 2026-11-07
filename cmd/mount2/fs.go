@@ -27,6 +27,9 @@ type FS struct {
 	opt  *mountlib.Options
 	root *Node
 	gen  atomic.Uint64
+	// dirCache is true when directory listings may use the kernel
+	// directory cache. mount() sets it before the server starts serving.
+	dirCache bool
 }
 
 // NewFS creates a pathfs.FileSystem from the fs.Fs passed in
