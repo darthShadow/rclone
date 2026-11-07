@@ -203,6 +203,7 @@ type VFS struct {
 	inUse                   atomic.Int32 // count of number of opens
 	prunerStore             atomic.Pointer[[]prunerEntry]
 	contentInvalidatorStore atomic.Pointer[[]contentInvalidatorEntry]
+	dirGeneration           atomic.Uint64 // source of Dir listing generations
 }
 
 // Keep track of active VFS keyed on fs.ConfigString(f)

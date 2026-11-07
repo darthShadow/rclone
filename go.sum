@@ -180,8 +180,8 @@ github.com/creasty/defaults v1.8.0/go.mod h1:iGzKe6pbEHnpMPtfDXZEr0NVxWnPTjb1bbD
 github.com/cronokirby/saferith v0.33.0/go.mod h1:QKJhjoqUtBsXCAVEjw38mFqoi7DebT7kthcD7UzbnoA=
 github.com/cronokirby/saferith v0.33.1-0.20250226174546-1f11f94ce488 h1:tLWBZgPg6TV67oe76W4p+aUQEWIa52wbcuiz8GFd3vo=
 github.com/cronokirby/saferith v0.33.1-0.20250226174546-1f11f94ce488/go.mod h1:QKJhjoqUtBsXCAVEjw38mFqoi7DebT7kthcD7UzbnoA=
-github.com/darthShadow/go-fuse/v2 v2.0.0-20261106103743-2b66e11a2a71 h1:zRtRghS35UFxx/XcZwhOzvDniWBMVhTrUKmxbuSorNo=
-github.com/darthShadow/go-fuse/v2 v2.0.0-20261106103743-2b66e11a2a71/go.mod h1:TYhCsfg32u/ve4V9Z2tjOHtnFmsZvrE6BP5lgAwa6XM=
+github.com/darthShadow/go-fuse/v2 v2.0.0-20261107092100-4f340c2ee802 h1:xxhOtdvFRJf5CiL5aSqSObi9+Xa7FYtoLRK5nGeIjy4=
+github.com/darthShadow/go-fuse/v2 v2.0.0-20261107092100-4f340c2ee802/go.mod h1:TYhCsfg32u/ve4V9Z2tjOHtnFmsZvrE6BP5lgAwa6XM=
 github.com/davecgh/go-spew v1.1.0/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/diskfs/go-diskfs v1.9.4 h1:0j2d7eG4IjyxL6+ChWbDPocdBCF6HQ4HBWU2WDYWVnc=

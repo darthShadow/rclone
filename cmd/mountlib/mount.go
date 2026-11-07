@@ -99,6 +99,11 @@ var OptionsInfo = fs.Options{{
 	Help:    "Allow id-mapped mounts (Linux 6.12+, mount2 only)",
 	Groups:  "Mount",
 }, {
+	Name:    "kernel_dir_cache",
+	Default: true,
+	Help:    "Cache unchanged directory listings in the kernel (Linux 4.20+, mount2 only)",
+	Groups:  "Mount",
+}, {
 	Name:    "async_read",
 	Default: true,
 	Help:    "Use asynchronous reads (not supported on Windows)",
@@ -195,6 +200,7 @@ type Options struct {
 	AllowRoot          bool          `config:"allow_root"`
 	AllowOther         bool          `config:"allow_other"`
 	AllowIDMap         bool          `config:"allow_idmap"`
+	KernelDirCache     bool          `config:"kernel_dir_cache"`
 	DefaultPermissions bool          `config:"default_permissions"`
 	WritebackCache     bool          `config:"write_back_cache"`
 	Daemon             bool          `config:"daemon"`

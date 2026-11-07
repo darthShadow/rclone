@@ -216,9 +216,19 @@ type mount2NodeFixture struct {
 	callbacks *recordingServerCallbacks
 }
 
+// inodeNotifyCall is one InodeNotify call recorded by recordingServerCallbacks.
+type inodeNotifyCall struct {
+	node   uint64
+	off    int64
+	length int64
+}
+
+// recordingServerCallbacks records InodeNotify calls and answers them with
+// inodeStatus, which is fuse.OK until a test sets it.
 type recordingServerCallbacks struct {
-	mu         sync.Mutex
-	inodeCalls int
+	mu          sync.Mutex
+	inodeCalls  []inodeNotifyCall
+	inodeStatus fuse.Status
 }
 
 var _ fusefs.ServerCallbacks = (*recordingServerCallbacks)(nil)
@@ -231,11 +241,11 @@ func (*recordingServerCallbacks) EntryNotify(uint64, string) fuse.Status {
 	return fuse.OK
 }
 
-func (c *recordingServerCallbacks) InodeNotify(uint64, int64, int64) fuse.Status {
+func (c *recordingServerCallbacks) InodeNotify(node uint64, off, length int64) fuse.Status {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.inodeCalls++
-	return fuse.OK
+	c.inodeCalls = append(c.inodeCalls, inodeNotifyCall{node: node, off: off, length: length})
+	return c.inodeStatus
 }
 
 func (*recordingServerCallbacks) InodeRetrieveCache(uint64, int64, []byte) (int, fuse.Status) {
@@ -249,7 +259,19 @@ func (*recordingServerCallbacks) InodeNotifyStoreCache(uint64, int64, []byte) fu
 func (c *recordingServerCallbacks) inodeCallCount() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.inodeCalls
+	return len(c.inodeCalls)
+}
+
+func (c *recordingServerCallbacks) recordedInodeCalls() []inodeNotifyCall {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]inodeNotifyCall(nil), c.inodeCalls...)
+}
+
+func (c *recordingServerCallbacks) setInodeStatus(status fuse.Status) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.inodeStatus = status
 }
 
 func newMount2NodeFixture(t *testing.T, names ...string) *mount2NodeFixture {
@@ -262,6 +284,14 @@ func newMount2NodeFixture(t *testing.T, names ...string) *mount2NodeFixture {
 	for _, name := range names {
 		base.AddObject(mockobject.New(name).WithContent([]byte(name), mockobject.SeekModeRegular))
 	}
+	return newMount2NodeFixtureFs(t, base, names...)
+}
+
+// newMount2NodeFixtureFs is newMount2NodeFixture over base, which must
+// already hold the objects called names.
+func newMount2NodeFixtureFs(t *testing.T, base fs.Fs, names ...string) *mount2NodeFixture {
+	t.Helper()
+	ctx := context.Background()
 
 	vfsOpt := vfscommon.Opt
 	VFS := vfs.New(ctx, base, &vfsOpt)
@@ -735,7 +765,9 @@ type mount2LocalFixture struct {
 	mnt      *mountlib.MountPoint
 }
 
-func newMountedLocalFixture(t *testing.T, files map[string]string) *mount2LocalFixture {
+// newMountedLocalFixture mounts a local directory holding files. Each adjust
+// runs on the mount and VFS options before the mount is made.
+func newMountedLocalFixture(t *testing.T, files map[string]string, adjust ...func(*mountlib.Options, *vfscommon.Options)) *mount2LocalFixture {
 	t.Helper()
 	ctx := context.Background()
 	backing := t.TempDir()
@@ -754,6 +786,9 @@ func newMountedLocalFixture(t *testing.T, files map[string]string) *mount2LocalF
 	mountOpt.AttrTimeout = fs.Duration(50 * time.Millisecond)
 	vfsOpt := vfscommon.Opt
 	vfsOpt.DirCacheTime = fs.Duration(50 * time.Millisecond)
+	for _, fn := range adjust {
+		fn(&mountOpt, &vfsOpt)
+	}
 
 	mnt := mountlib.NewMountPoint(mount, mountPoint, countingFs, &mountOpt, &vfsOpt)
 	mounted := false

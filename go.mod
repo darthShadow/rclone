@@ -287,4 +287,4 @@ require (
 	golang.org/x/term v0.47.0
 )
 
-replace github.com/hanwen/go-fuse/v2 => github.com/darthShadow/go-fuse/v2 v2.0.0-20261106103743-2b66e11a2a71
+replace github.com/hanwen/go-fuse/v2 => github.com/darthShadow/go-fuse/v2 v2.0.0-20261107092100-4f340c2ee802

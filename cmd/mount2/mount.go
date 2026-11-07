@@ -442,6 +442,11 @@ func mount(VFS *vfs.VFS, mountpoint string, opt *mountlib.Options) (<-chan error
 	if err != nil {
 		return nil, nil, "", err
 	}
+	// FOPEN_CACHE_DIR needs protocol 7.28 (Linux 4.20). At --dir-cache-time 0
+	// or less the VFS usually rebuilds a directory's listing between opens, so
+	// the cache would rarely hit.
+	// Set before Serve so no request sees the field change.
+	fsys.dirCache = opt.KernelDirCache && VFS.Opt.DirCacheTime > 0 && runtime.GOOS == "linux" && server.KernelSettings().SupportsVersion(7, 28)
 	prune, content := notifySupport(server.KernelSettings(), VFS.Opt.Links)
 	registeredPruner := false
 	if prune {

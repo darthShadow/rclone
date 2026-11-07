@@ -50,6 +50,11 @@ type Node struct {
 	// the pre-rename namespace; operations resolve through the kernel parent
 	// identity supplied for their inode.
 	vfsDir atomic.Pointer[vfs.Dir]
+
+	// dir holds the kernel directory cache state. It is set when the Node
+	// is built, for directories only and when --kernel-dir-cache is on, and
+	// is never written again.
+	dir *dirState
 }
 
 // Node types must be InodeEmbedders
@@ -70,6 +75,9 @@ func newNode(fsys *FS, vfsNode vfs.Node) (node *Node) {
 	}
 	if dir, ok := vfsNode.(*vfs.Dir); ok {
 		node.vfsDir.Store(dir)
+		if fsys.opt.KernelDirCache {
+			node.dir = &dirState{}
+		}
 	}
 	actual, _ := vfsNode.LoadOrStoreAux(fsys, node)
 	if actualNode, ok := actual.(*Node); ok {
