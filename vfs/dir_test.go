@@ -5,18 +5,23 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"maps"
 	"os"
 	"runtime"
 	"slices"
 	"sort"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 	"unsafe"
 
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/filter"
+	"github.com/rclone/rclone/fs/log"
 	"github.com/rclone/rclone/fs/operations"
+	"github.com/rclone/rclone/fs/rc"
 	"github.com/rclone/rclone/fstest"
 	"github.com/rclone/rclone/vfs/vfscommon"
 	"github.com/stretchr/testify/assert"
@@ -1505,4 +1510,424 @@ func TestDirGenerationUploadLinkFlip(t *testing.T) {
 	requireDirGenerationChanged(t, dir, "upload of a link name sets the link flag", func() {
 		require.NoError(t, fd.Close())
 	})
+}
+
+// dirNames returns the names in the listing of dir.
+func dirNames(t *testing.T, dir *Dir) []string {
+	t.Helper()
+	items, err := dir.ReadDirAll()
+	require.NoError(t, err)
+	names := make([]string, 0, len(items))
+	for _, item := range items {
+		names = append(names, item.Name())
+	}
+	return names
+}
+
+// A per-directory forget of a directory with a pending write must make
+// its listing stale and keep the pending entry.
+func TestDirForgetPathPendingWrite(t *testing.T) {
+	r, v, dir, _ := dirCreate(t)
+	v.Opt.DirCacheTime = fs.Duration(time.Hour)
+	_, err := dir.ReadDirAll()
+	require.NoError(t, err)
+	dir.AddVirtual("pending", 17, false)
+	r.WriteObject(context.Background(), "dir/external", "new", time.Now())
+	root, err := v.Root()
+	require.NoError(t, err)
+
+	root.ForgetPath("dir", fs.EntryDirectory)
+
+	names := dirNames(t, dir)
+	require.Contains(t, names, "external", "forget kept a stale listing beside a pending write")
+	require.Contains(t, names, "pending")
+}
+
+// A forget below a path that is not cached must make the nearest cached
+// ancestor stale, as its listing can hide the new hierarchy.
+func TestDirForgetPathNewHierarchy(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("NotCached", func(t *testing.T) {
+		r := fstest.NewRun(t)
+		r.WriteObject(ctx, "existing/file", "old", time.Now())
+		root := cNewRoot(t, r.Fremote, nil)
+		_, err := root.ReadDirAll()
+		require.NoError(t, err)
+		r.WriteObject(ctx, "links/batch/Title/file", "new", time.Now())
+
+		root.ForgetPath("links/batch/Title", fs.EntryDirectory)
+
+		require.Contains(t, dirNames(t, root), "links", "new hierarchy remains hidden behind a cached ancestor")
+	})
+
+	t.Run("ParentCached", func(t *testing.T) {
+		r := fstest.NewRun(t)
+		r.WriteObject(ctx, "a/b/file", "old", time.Now())
+		root := cNewRoot(t, r.Fremote, nil)
+		a, err := root.Stat("a")
+		require.NoError(t, err)
+		aDir := a.(*Dir)
+		b, err := aDir.Stat("b")
+		require.NoError(t, err)
+		bDir := b.(*Dir)
+		_, err = aDir.ReadDirAll()
+		require.NoError(t, err)
+		_, err = bDir.ReadDirAll()
+		require.NoError(t, err)
+		aDir.mu.RLock()
+		aRead := aDir.read
+		aDir.mu.RUnlock()
+		require.False(t, aRead.IsZero())
+
+		root.ForgetPath("a/b/c", fs.EntryDirectory)
+
+		bDir.mu.RLock()
+		bRead := bDir.read
+		bDir.mu.RUnlock()
+		aDir.mu.RLock()
+		aReadAfter := aDir.read
+		aDir.mu.RUnlock()
+		assert.True(t, bRead.IsZero(), "the cached parent is made stale")
+		assert.Equal(t, aRead, aReadAfter, "the ancestor above the cached parent is left alone")
+	})
+}
+
+// captureInfoLogs raises the log level to INFO, as fs.Infof logs nothing
+// at the default level, and returns a function that gives the log lines
+// written since. It restores the log level and output at the end of the
+// test.
+func captureInfoLogs(t *testing.T) (lines func() []string) {
+	var mu sync.Mutex
+	var captured []string
+	ci := fs.GetConfig(context.Background())
+	oldLevel := ci.LogLevel
+	ci.LogLevel = fs.LogLevelInfo
+	oldSlogLevel := log.Handler.SetLevel(slog.LevelInfo)
+	log.Handler.SetOutput(func(level slog.Level, text string) {
+		mu.Lock()
+		captured = append(captured, text)
+		mu.Unlock()
+	})
+	t.Cleanup(func() {
+		log.Handler.ResetOutput()
+		log.Handler.SetLevel(oldSlogLevel)
+		ci.LogLevel = oldLevel
+	})
+	return func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		return slices.Clone(captured)
+	}
+}
+
+// missLines returns the lines that report a directory cache miss.
+func missLines(lines []string) (out []string) {
+	for _, line := range lines {
+		if strings.Contains(line, "dir cache miss") {
+			out = append(out, line)
+		}
+	}
+	return out
+}
+
+// ageDir moves the last read time of dir back by age.
+func ageDir(dir *Dir, age time.Duration) {
+	dir.mu.Lock()
+	dir.read = dir.read.Add(-age)
+	dir.mu.Unlock()
+}
+
+// expireDir makes the listing of dir older than --dir-cache-time.
+func expireDir(dir *Dir) {
+	ageDir(dir, time.Duration(dir.vfs.Opt.DirCacheTime)+time.Minute)
+}
+
+// newDirStatsVFS makes a VFS with --vfs-dir-cache-stats set (or not) and a
+// warm listing of "dir", which holds "file1".
+func newDirStatsVFS(t *testing.T, stats bool) (r *fstest.Run, v *VFS, dir *Dir) {
+	opt := vfscommon.Opt
+	opt.DirCacheStats = stats
+	r, v = newTestVFSOpt(t, &opt)
+	r.WriteObject(context.Background(), "dir/file1", "file1 contents", t1)
+	node, err := v.Stat("dir")
+	require.NoError(t, err)
+	dir = node.(*Dir)
+	_, err = dir.ReadDirAll()
+	require.NoError(t, err)
+	return r, v, dir
+}
+
+func requireDirCacheCounts(t *testing.T, v *VFS, keeps, misses uint64) {
+	t.Helper()
+	assert.Equal(t, keeps, v.dirKeeps.Load(), "keeps")
+	assert.Equal(t, misses, v.dirMisses.Load(), "misses")
+}
+
+func TestDirCacheStatsOff(t *testing.T) {
+	lines := captureInfoLogs(t)
+	r, v, dir := newDirStatsVFS(t, false)
+	r.WriteObject(context.Background(), "dir/new", "new", t1)
+	expireDir(dir)
+
+	assert.Contains(t, dirNames(t, dir), "new")
+
+	_, found := v.Stats()["dirCache"]
+	assert.False(t, found, "vfs/stats has no dirCache key")
+	assert.Empty(t, missLines(lines()))
+}
+
+// gateListFs holds a List call after it has read the backend, so a
+// forget can land while _readDir is unlocked.
+type gateListFs struct {
+	fs.Fs
+	listed  chan struct{}
+	release chan struct{}
+	armed   bool
+}
+
+func (f *gateListFs) List(ctx context.Context, dir string) (fs.DirEntries, error) {
+	entries, err := f.Fs.List(ctx, dir)
+	if f.armed && dir == "dir" {
+		f.armed = false
+		close(f.listed)
+		<-f.release
+	}
+	return entries, err
+}
+
+func TestDirCacheStatsMissKeep(t *testing.T) {
+	t.Run("Miss", func(t *testing.T) {
+		lines := captureInfoLogs(t)
+		r, v, dir := newDirStatsVFS(t, true)
+		requireDirCacheCounts(t, v, 0, 0)
+		r.WriteObject(context.Background(), "dir/new", "new", t1)
+		expireDir(dir)
+
+		assert.Contains(t, dirNames(t, dir), "new")
+
+		requireDirCacheCounts(t, v, 0, 1)
+		miss := missLines(lines())
+		require.Len(t, miss, 1)
+		assert.Contains(t, miss[0], "dir: dir cache miss: listing changed after")
+	})
+
+	t.Run("Keep", func(t *testing.T) {
+		lines := captureInfoLogs(t)
+		_, v, dir := newDirStatsVFS(t, true)
+		expireDir(dir)
+
+		assert.Equal(t, []string{"file1"}, dirNames(t, dir))
+
+		requireDirCacheCounts(t, v, 1, 0)
+		assert.Empty(t, missLines(lines()))
+	})
+
+	t.Run("Forget", func(t *testing.T) {
+		r, v, dir := newDirStatsVFS(t, true)
+		r.WriteObject(context.Background(), "dir/new", "new", t1)
+		root, err := v.Root()
+		require.NoError(t, err)
+
+		root.ForgetPath("dir", fs.EntryDirectory)
+
+		assert.Contains(t, dirNames(t, dir), "new")
+		requireDirCacheCounts(t, v, 0, 0)
+	})
+
+	t.Run("Stats", func(t *testing.T) {
+		r, v, dir := newDirStatsVFS(t, true)
+		r.WriteObject(context.Background(), "dir/new", "new", t1)
+		expireDir(dir)
+		_ = dirNames(t, dir)
+		expireDir(dir)
+		_ = dirNames(t, dir)
+
+		dirCache, ok := v.Stats()["dirCache"].(rc.Params)
+		require.True(t, ok, "vfs/stats has a dirCache object")
+		assert.Equal(t, rc.Params{"keeps": uint64(1), "misses": uint64(1)}, dirCache)
+	})
+
+	// A forget that lands while the re-list reads the backend leaves
+	// neither a miss nor a keep.
+	t.Run("ForgetDuringRelist", func(t *testing.T) {
+		lines := captureInfoLogs(t)
+		r := fstest.NewRun(t)
+		ctx := context.Background()
+		r.WriteObject(ctx, "dir/old", "old", t1)
+		w := &gateListFs{Fs: r.Fremote, listed: make(chan struct{}), release: make(chan struct{})}
+		root := cNewRoot(t, w, func(ctx context.Context, ci *fs.ConfigInfo, opt *vfscommon.Options) context.Context {
+			opt.DirCacheStats = true
+			return ctx
+		})
+		node, err := root.Stat("dir")
+		require.NoError(t, err)
+		dir := node.(*Dir)
+		_ = dirNames(t, dir)
+		expireDir(dir)
+
+		w.armed = true
+		done := make(chan error, 1)
+		go func() { _, err := dir.ReadDirAll(); done <- err }()
+		<-w.listed
+		r.WriteObject(ctx, "dir/new", "new", t1)
+		root.ForgetPath("dir", fs.EntryDirectory)
+		close(w.release)
+		require.NoError(t, <-done)
+
+		requireDirCacheCounts(t, root.vfs, 0, 0)
+		assert.Empty(t, missLines(lines()))
+	})
+}
+
+func TestDirCacheStatsAfterCleanup(t *testing.T) {
+	// cleanup ages dir by age, then runs the cleanup timer's function
+	cleanup := func(dir *Dir, age time.Duration) {
+		ageDir(dir, age)
+		dir.cacheCleanup()
+	}
+	ttlAge := func(dir *Dir) time.Duration { return time.Duration(dir.vfs.Opt.DirCacheTime) + time.Minute }
+
+	t.Run("Miss", func(t *testing.T) {
+		lines := captureInfoLogs(t)
+		r, v, dir := newDirStatsVFS(t, true)
+		cleanup(dir, ttlAge(dir))
+		r.WriteObject(context.Background(), "dir/new", "new", t1)
+
+		assert.Contains(t, dirNames(t, dir), "new")
+
+		requireDirCacheCounts(t, v, 0, 1)
+		miss := missLines(lines())
+		require.Len(t, miss, 1)
+		assert.Contains(t, miss[0], "dir: dir cache miss: listing changed after")
+	})
+
+	t.Run("Keep", func(t *testing.T) {
+		_, v, dir := newDirStatsVFS(t, true)
+		cleanup(dir, ttlAge(dir))
+
+		assert.Equal(t, []string{"file1"}, dirNames(t, dir))
+
+		requireDirCacheCounts(t, v, 1, 0)
+	})
+
+	t.Run("Forget", func(t *testing.T) {
+		r, v, dir := newDirStatsVFS(t, true)
+		cleanup(dir, ttlAge(dir))
+		r.WriteObject(context.Background(), "dir/new", "new", t1)
+		root, err := v.Root()
+		require.NoError(t, err)
+
+		root.ForgetPath("dir", fs.EntryDirectory)
+
+		assert.Contains(t, dirNames(t, dir), "new")
+		requireDirCacheCounts(t, v, 0, 0)
+	})
+
+	t.Run("OlderThanWindow", func(t *testing.T) {
+		r, v, dir := newDirStatsVFS(t, true)
+		cleanup(dir, dirCacheStatsWindow+time.Minute)
+		r.WriteObject(context.Background(), "dir/new", "new", t1)
+
+		assert.Contains(t, dirNames(t, dir), "new")
+
+		requireDirCacheCounts(t, v, 0, 0)
+	})
+
+	// The first cleanup sweeps, so a record that ages past the window
+	// afterwards is still there and only the window check ignores it.
+	t.Run("RecordOlderThanWindow", func(t *testing.T) {
+		r, v, dir := newDirStatsVFS(t, true)
+		cleanup(dir, ttlAge(dir))
+		v.dirStatsMu.Lock()
+		record, found := v.dirStatsRecords["dir"]
+		require.True(t, found, "the cleanup left a record")
+		record.read = record.read.Add(-dirCacheStatsWindow)
+		v.dirStatsRecords["dir"] = record
+		v.dirStatsMu.Unlock()
+		r.WriteObject(context.Background(), "dir/new", "new", t1)
+
+		assert.Contains(t, dirNames(t, dir), "new")
+
+		requireDirCacheCounts(t, v, 0, 0)
+	})
+
+	// A listing already older than the window is not recorded, even when the
+	// sweep that would drop it has run recently.
+	t.Run("NotRecordedOlderThanWindow", func(t *testing.T) {
+		_, v, dir := newDirStatsVFS(t, true)
+		v.dirStatsMu.Lock()
+		v.dirStatsSwept = time.Now()
+		v.dirStatsMu.Unlock()
+
+		cleanup(dir, dirCacheStatsWindow+time.Minute)
+
+		v.dirStatsMu.Lock()
+		defer v.dirStatsMu.Unlock()
+		assert.Empty(t, v.dirStatsRecords)
+	})
+
+	// The sweep drops the records older than the window and keeps the rest.
+	t.Run("Sweep", func(t *testing.T) {
+		_, v, dir := newDirStatsVFS(t, true)
+		now := time.Now()
+		v.dirStatsMu.Lock()
+		v.dirStatsRecords = map[string]dirStatsRecord{
+			"old":    {read: now.Add(-dirCacheStatsWindow - time.Minute)},
+			"recent": {read: now},
+		}
+		v.dirStatsMu.Unlock()
+
+		cleanup(dir, ttlAge(dir))
+
+		v.dirStatsMu.Lock()
+		defer v.dirStatsMu.Unlock()
+		assert.NotContains(t, v.dirStatsRecords, "old")
+		assert.Contains(t, v.dirStatsRecords, "recent")
+		assert.Contains(t, v.dirStatsRecords, "dir")
+	})
+
+	t.Run("Children", func(t *testing.T) {
+		r, v, dir := newDirStatsVFS(t, true)
+		r.WriteObject(context.Background(), "dir/sub/file2", "file2 contents", t1)
+		root, err := v.Root()
+		require.NoError(t, err)
+		// A forget makes the next listing of dir see sub, and counts nothing
+		root.ForgetPath("dir", fs.EntryDirectory)
+		_ = dirNames(t, dir)
+		node, err := dir.Stat("sub")
+		require.NoError(t, err)
+		sub := node.(*Dir)
+		_ = dirNames(t, sub)
+		requireDirCacheCounts(t, v, 0, 0)
+
+		// Only dir is stale, but the cleanup drops sub with it
+		cleanup(dir, ttlAge(dir))
+		assert.Equal(t, []string{"file1", "sub"}, dirNames(t, dir))
+		node, err = dir.Stat("sub")
+		require.NoError(t, err)
+		assert.Equal(t, []string{"file2"}, dirNames(t, node.(*Dir)))
+
+		requireDirCacheCounts(t, v, 2, 0)
+	})
+
+	t.Run("Off", func(t *testing.T) {
+		lines := captureInfoLogs(t)
+		r, v, dir := newDirStatsVFS(t, false)
+		cleanup(dir, ttlAge(dir))
+		r.WriteObject(context.Background(), "dir/new", "new", t1)
+
+		assert.Contains(t, dirNames(t, dir), "new")
+
+		requireDirCacheCounts(t, v, 0, 0)
+		assert.Empty(t, missLines(lines()))
+		assert.Nil(t, v.dirStatsRecords)
+	})
+}
+
+// A file replaced by a directory of the same name changes the listing sum.
+func TestListingSumEntryType(t *testing.T) {
+	asFile := listingSum(map[string]Node{"name": &File{}})
+	asDir := listingSum(map[string]Node{"name": &Dir{}})
+	assert.NotEqual(t, asFile, asDir)
 }

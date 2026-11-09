@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
+	"maps"
 	"os"
 	"path"
 	"slices"
@@ -89,6 +91,16 @@ func newDir(vfs *VFS, f fs.Fs, parent *Dir, fsDir fs.Directory) *Dir {
 	return d
 }
 
+// dirCacheStatsWindow is how long after a listing was read that a re-list
+// after a cleanup forget still counts as a miss or a keep.
+const dirCacheStatsWindow = time.Hour
+
+// dirStatsRecord is what is kept of a listing the cleanup timer dropped.
+type dirStatsRecord struct {
+	read time.Time // read time of the dropped listing
+	sum  uint64    // listingSum of the dropped listing
+}
+
 // _bumpGeneration gives the directory a new listing generation. The
 // generation comes from the VFS so a rebuilt Dir never repeats a value.
 //
@@ -133,7 +145,93 @@ func (d *Dir) cacheCleanup() {
 	d.mu.Unlock()
 
 	if stale {
+		if d.vfs.Opt.DirCacheStats {
+			d.saveDirStats(when)
+		}
 		d.ForgetAll()
+	}
+}
+
+// listingSum returns a sum over items that does not depend on map order and
+// changes when a name is added, removed or changes entry type.
+func listingSum(items map[string]Node) (sum uint64) {
+	h := fnv.New64a()
+	for name, node := range items {
+		h.Reset()
+		_, _ = h.Write([]byte(name))
+		kind := byte('f')
+		if _, ok := node.(*Dir); ok {
+			kind = 'd'
+		}
+		_, _ = h.Write([]byte{kind})
+		sum += h.Sum64()
+	}
+	return sum
+}
+
+// saveDirStats keeps a record of the listing of d and of each directory
+// below it that has one no older than dirCacheStatsWindow, so a re-list after
+// the cleanup forget can still be counted. It drops the records that are
+// older than dirCacheStatsWindow, at most once per window.
+//
+// must be called without the Dir lock held
+func (d *Dir) saveDirStats(when time.Time) {
+	var records map[string]dirStatsRecord
+	d.walk(func(dir *Dir) {
+		// NB dir.mu is held by walk() here
+		if dir.read.IsZero() || when.Sub(dir.read) > dirCacheStatsWindow {
+			return
+		}
+		if records == nil {
+			records = make(map[string]dirStatsRecord)
+		}
+		records[dir.path] = dirStatsRecord{read: dir.read, sum: listingSum(dir.items)}
+	})
+
+	vfs := d.vfs
+	vfs.dirStatsMu.Lock()
+	defer vfs.dirStatsMu.Unlock()
+	if len(records) > 0 {
+		if vfs.dirStatsRecords == nil {
+			vfs.dirStatsRecords = make(map[string]dirStatsRecord, len(records))
+		}
+		maps.Copy(vfs.dirStatsRecords, records)
+	}
+	if when.Sub(vfs.dirStatsSwept) > dirCacheStatsWindow {
+		for path, record := range vfs.dirStatsRecords {
+			if when.Sub(record.read) > dirCacheStatsWindow {
+				delete(vfs.dirStatsRecords, path)
+			}
+		}
+		vfs.dirStatsSwept = when
+	}
+}
+
+// takeDirStats removes and returns the record for the directory at path.
+//
+// May be called with a Dir lock held.
+func (vfs *VFS) takeDirStats(path string) (record dirStatsRecord, found bool) {
+	vfs.dirStatsMu.Lock()
+	defer vfs.dirStatsMu.Unlock()
+	record, found = vfs.dirStatsRecords[path]
+	delete(vfs.dirStatsRecords, path)
+	return record, found
+}
+
+// cancelDirStats removes the records of the directory at path and of each of
+// its ancestors, as a forget there means a re-list is not a cache expiry.
+func (vfs *VFS) cancelDirStats(path string) {
+	vfs.dirStatsMu.Lock()
+	defer vfs.dirStatsMu.Unlock()
+	if len(vfs.dirStatsRecords) == 0 {
+		return
+	}
+	for {
+		delete(vfs.dirStatsRecords, path)
+		if path == "" {
+			return
+		}
+		path = vfscommon.FindParent(path)
 	}
 }
 
@@ -295,7 +393,8 @@ func (d *Dir) clearAndCollect(collectPrune bool) (victims []Node, hasVirtual boo
 	d._purgeVirtual()
 
 	// Don't clear directory entries if there are virtual entries in this
-	// directory or any children
+	// directory or any children, but still make the listing stale so the
+	// next access re-reads it around the virtual entries
 	hasVirtual = d.hasVirtual()
 	if !hasVirtual {
 		if collectPrune {
@@ -309,6 +408,8 @@ func (d *Dir) clearAndCollect(collectPrune bool) (victims []Node, hasVirtual boo
 		d.resetStatRead(false)
 		d.cleanupTimer.Stop()
 	} else {
+		d.read = time.Time{}
+		d.resetStatRead(false)
 		d.cleanupTimer.Reset(time.Duration(d.vfs.Opt.DirCacheTime * 2))
 	}
 	return victims, hasVirtual
@@ -353,10 +454,11 @@ func (d *Dir) forgetDirPath(relativePath string) {
 	dir.ForgetAll()
 }
 
-// invalidateDir invalidates the directory cache for absPath relative to the root
+// invalidateDir invalidates the directory cache for absPath relative to
+// the root. When absPath is not cached it invalidates the deepest cached
+// directory on the way to it, as that listing can hide a new hierarchy.
 func (d *Dir) invalidateDir(absPath string) {
-	node := d.vfs.root.cachedNode(absPath)
-	if dir, ok := node.(*Dir); ok {
+	if dir := d.vfs.root.cachedDirOrAncestor(absPath); dir != nil {
 		dir.mu.Lock()
 		if !dir.read.IsZero() {
 			fs.Debugf(dir.path, "invalidating directory cache")
@@ -401,8 +503,9 @@ func (d *Dir) changeNotify(relativePath string, entryType fs.EntryType) {
 
 // ForgetPath clears the cache for itself and all subdirectories if
 // they match the given path. The path is specified relative from the
-// directory it is called from. The cache of the parent directory is
-// marked as stale, but not cleared otherwise.
+// directory it is called from. The cache of the parent directory, or of
+// its nearest cached ancestor when the parent is not cached, is marked as
+// stale, but not cleared otherwise.
 // It is not possible to traverse the directory tree upwards, i.e.
 // you cannot clear the cache for the Dir's ancestors or siblings.
 func (d *Dir) ForgetPath(relativePath string, entryType fs.EntryType) {
@@ -410,6 +513,9 @@ func (d *Dir) ForgetPath(relativePath string, entryType fs.EntryType) {
 	d.mu.RLock()
 	absPath := join.PathJoin(d.path, relativePath)
 	d.mu.RUnlock()
+	if d.vfs.Opt.DirCacheStats {
+		d.vfs.cancelDirStats(absPath)
+	}
 	if absPath != "" {
 		d.invalidateDir(vfscommon.FindParent(absPath))
 	}
@@ -729,10 +835,38 @@ func (d *Dir) _readDir() error {
 			return nil
 		}
 
+		// Snapshot what the stats compare against here, under the lock
+		// that publishes the listing, so a forget or a local change
+		// during the unlocked I/O above can't look like a miss. A zero
+		// read time is a first listing or a listing after a forget, which
+		// count nothing, unless the cleanup timer left a record.
+		var (
+			counted    bool // the listing is compared with an earlier one
+			prevAge    time.Duration
+			generation uint64
+			record     dirStatsRecord
+			fromRecord bool
+		)
+		if vfsOpt.DirCacheStats {
+			if !d.read.IsZero() {
+				counted, prevAge, generation = true, when.Sub(d.read), d.generation
+			} else if rec, found := d.vfs.takeDirStats(d.path); found && when.Sub(rec.read) <= dirCacheStatsWindow {
+				counted, fromRecord, prevAge, record = true, true, when.Sub(rec.read), rec
+			}
+		}
+
 		// Apply changes
 		victims, contentInvalidations, err = d._readDirFromEntries(entries, nil, time.Time{}, collectPrune, collectContentInvalidation)
 		if err != nil {
 			return err
+		}
+
+		if counted {
+			changed := d.generation != generation
+			if fromRecord {
+				changed = listingSum(d.items) != record.sum
+			}
+			d._countRelist(prevAge, changed)
 		}
 
 		d.read = when
@@ -753,6 +887,19 @@ func (d *Dir) _readDir() error {
 	}
 
 	return nil
+}
+
+// _countRelist counts the re-list of an expired listing as a miss when the
+// listing changed and as a keep when it did not, and logs each miss.
+//
+// must be called with the Dir lock held
+func (d *Dir) _countRelist(age time.Duration, changed bool) {
+	if changed {
+		fs.Infof(d.path, "dir cache miss: listing changed after %v", age)
+		d.vfs.dirMisses.Add(1)
+	} else {
+		d.vfs.dirKeeps.Add(1)
+	}
 }
 
 // update d.items for each dir in the DirTree below this one and
@@ -1408,6 +1555,24 @@ func (d *Dir) cachedNode(relativePath string) Node {
 	}
 
 	return node
+}
+
+// cachedDirOrAncestor returns the deepest cached directory on relativePath
+func (d *Dir) cachedDirOrAncestor(relativePath string) *Dir {
+	dir := d
+	for _, s := range strings.Split(strings.Trim(relativePath, "/"), "/") {
+		if s == "" {
+			continue
+		}
+		dir.mu.RLock()
+		child, ok := dir.items[s].(*Dir)
+		dir.mu.RUnlock()
+		if !ok {
+			break
+		}
+		dir = child
+	}
+	return dir
 }
 
 // Stat looks up a specific entry in the receiver.

@@ -32,6 +32,11 @@ var OptionsInfo = fs.Options{{
 	Help:    "Time to cache directory entries for",
 	Groups:  "VFS",
 }, {
+	Name:    "vfs_dir_cache_stats",
+	Default: false,
+	Help:    "Count directory cache misses and keeps in vfs/stats and log each miss",
+	Groups:  "VFS",
+}, {
 	Name:    "vfs_refresh",
 	Default: false,
 	Help:    "Refreshes the directory cache recursively in the background on start",
@@ -201,6 +206,7 @@ type Options struct {
 	NoModTime          bool          `config:"no_modtime"`     // don't read mod times for files
 	DirCacheTime       fs.Duration   `config:"dir_cache_time"` // how long to consider directory listing cache valid
 	Refresh            bool          `config:"vfs_refresh"`    // refreshes the directory listing recursively on start
+	DirCacheStats      bool          `config:"vfs_dir_cache_stats"`
 	PollInterval       fs.Duration   `config:"poll_interval"`
 	Umask              FileMode      `config:"umask"`
 	UID                uint32        `config:"uid"`

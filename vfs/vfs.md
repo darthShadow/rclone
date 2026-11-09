@@ -51,6 +51,19 @@ Or individual files or directories:
 rclone rc vfs/forget file=path/to/file dir=path/to/dir
 ```
 
+To see how well the directory cache serves, use `--vfs-dir-cache-stats`.
+When a directory listing has expired and is read again, the VFS counts
+a miss if the names or entry types in the directory changed and a keep
+if they did not. `rclone rc vfs/stats` shows both counts under
+`dirCache`, and each miss is logged at INFO with the directory path and
+the age of the old listing. A directory that the cleanup timer dropped
+is also counted when it is listed again up to 1 hour after its last
+listing, but that comparison sees names and entry types only. A forget
+of a path, such as `vfs/forget dir=path`, resets the comparison for that
+directory and its parents, so their next listing counts nothing. The
+directories below that path are still counted, and so is every
+directory after a forget of the whole cache.
+
 ### VFS File Buffering
 
 The `--buffer-size` flag determines the amount of memory,

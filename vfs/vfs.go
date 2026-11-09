@@ -203,7 +203,12 @@ type VFS struct {
 	inUse                   atomic.Int32 // count of number of opens
 	prunerStore             atomic.Pointer[[]prunerEntry]
 	contentInvalidatorStore atomic.Pointer[[]contentInvalidatorEntry]
-	dirGeneration           atomic.Uint64 // source of Dir listing generations
+	dirGeneration           atomic.Uint64             // source of Dir listing generations
+	dirKeeps                atomic.Uint64             // expired listings that were unchanged, see Options.DirCacheStats
+	dirMisses               atomic.Uint64             // expired listings that had changed, see Options.DirCacheStats
+	dirStatsMu              sync.Mutex                // protects the following, always the innermost lock
+	dirStatsRecords         map[string]dirStatsRecord // listings dropped by the cleanup timer, by directory path
+	dirStatsSwept           time.Time                 // time of the last sweep of dirStatsRecords
 }
 
 // Keep track of active VFS keyed on fs.ConfigString(f)
@@ -353,6 +358,13 @@ func (vfs *VFS) Stats() (out rc.Params) {
 
 	if vfs.cache != nil {
 		out["diskCache"] = vfs.cache.Stats()
+	}
+
+	if vfs.Opt.DirCacheStats {
+		out["dirCache"] = rc.Params{
+			"keeps":  vfs.dirKeeps.Load(),
+			"misses": vfs.dirMisses.Load(),
+		}
 	}
 
 	return out
